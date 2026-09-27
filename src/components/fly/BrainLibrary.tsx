@@ -20,6 +20,7 @@ import {
   Download,
   FlaskConical,
   Gamepad2,
+  GraduationCap,
   LayoutGrid,
   Loader2,
   MoreHorizontal,
@@ -66,9 +67,12 @@ import {
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Toaster } from "@/components/ui/sonner";
+import { playSound } from "@/lib/sound";
 import { useBrainStore } from "@/lib/flybrain/store";
 import type { BrainSnapshot } from "@/lib/flybrain/types";
 import { cn } from "@/lib/utils";
+
+import { BrainReportCard } from "./BrainReportCard";
 
 export type BrainLibraryProps = Record<string, never>;
 
@@ -76,7 +80,8 @@ export type BrainLibraryProps = Record<string, never>;
 // types + small helpers
 // ---------------------------------------------------------------------------
 
-interface BrainRow {
+/** One row of the library table (also consumed by the report-card dialog). */
+export interface BrainRow {
   id: string;
   name: string;
   task: string;
@@ -121,7 +126,7 @@ const FILTERS: { value: TaskFilter; label: string; icon: typeof Gamepad2 }[] = [
   { value: "lab", label: "Lab", icon: FlaskConical },
 ];
 
-function taskMeta(task: string) {
+export function taskMeta(task: string) {
   return (
     TASK_META[task] ?? {
       label: task ? task.charAt(0).toUpperCase() + task.slice(1) : "Unknown",
@@ -132,7 +137,7 @@ function taskMeta(task: string) {
   );
 }
 
-function formatScore(task: string, score: number): string {
+export function formatScore(task: string, score: number): string {
   const num =
     Math.abs(score) >= 1000 ? `${(score / 1000).toFixed(1)}k` : `${Math.round(score * 10) / 10}`;
   if (task === "dino") return `${num} pts`;
@@ -140,13 +145,13 @@ function formatScore(task: string, score: number): string {
   return num;
 }
 
-function formatBytes(n: number): string {
+export function formatBytes(n: number): string {
   if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
   if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${n} B`;
 }
 
-function relativeDate(iso: string): string {
+export function relativeDate(iso: string): string {
   try {
     return formatDistanceToNow(new Date(iso), { addSuffix: true });
   } catch {
@@ -162,7 +167,7 @@ function sanitizeFileName(name: string): string {
   return clean || "brain";
 }
 
-async function fetchBrain(id: string): Promise<{ brain: BrainRow; snapshot: BrainSnapshot }> {
+export async function fetchBrain(id: string): Promise<{ brain: BrainRow; snapshot: BrainSnapshot }> {
   const res = await fetch(`/api/brains/${id}`, { cache: "no-store" });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -181,7 +186,7 @@ const SCROLLBAR =
 // task badge
 // ---------------------------------------------------------------------------
 
-function TaskBadge({ task }: { task: string }) {
+export function TaskBadge({ task }: { task: string }) {
   const meta = taskMeta(task);
   const Icon = meta.icon;
   return (
@@ -208,6 +213,8 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
   const [importOpen, setImportOpen] = useState(false);
   const [importing, setImporting] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  /** the brain whose report-card dialog is open (Task 10-b) */
+  const [reportRow, setReportRow] = useState<BrainRow | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -361,6 +368,13 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
     }
   };
 
+  // ----- report card (Task 10-b) ------------------------------------------
+
+  const handleOpenReport = (row: BrainRow) => {
+    playSound("click");
+    setReportRow(row);
+  };
+
   // ----- render helpers ---------------------------------------------------
 
   const showEmptyState = !loading && !error && visible.length === 0;
@@ -377,6 +391,21 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
       >
         {busyId === row.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
         Load
+      </Button>
+      <Button
+        variant="outline"
+        size={full ? "sm" : "icon"}
+        className={cn(
+          "h-11 shrink-0 border-teal-500/30 hover:border-teal-500/50 hover:bg-teal-500/10 hover:text-teal-600 dark:hover:text-teal-300",
+          full ? "flex-1 gap-1.5 px-4" : "w-11",
+        )}
+        disabled={busyId === row.id}
+        onClick={() => handleOpenReport(row)}
+        aria-label={`Open report card for ${row.name}`}
+        title="Report card"
+      >
+        <GraduationCap className="h-4 w-4" aria-hidden />
+        {full ? "Report card" : null}
       </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -793,6 +822,15 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* per-brain report card (Task 10-b) */}
+      <BrainReportCard
+        row={reportRow}
+        open={!!reportRow}
+        onOpenChange={(open) => {
+          if (!open) setReportRow(null);
+        }}
+      />
     </div>
   );
 }

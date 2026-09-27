@@ -28,6 +28,11 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { BrainActivityPanel } from "./BrainActivityPanel";
 import {
   BicycleTrainerCore,
@@ -36,6 +41,13 @@ import {
   type TrainerEvent,
 } from "./bicycle/trainer";
 import { DuskScene } from "./bicycle/scene";
+import {
+  buildLineageView,
+  nodeIdOf,
+  type LineageOrigin,
+  type LineageView,
+  type LineageViewNode,
+} from "./bicycle/lineage";
 import { useBrainStore } from "@/lib/flybrain/store";
 import { playSound } from "@/lib/sound";
 import type { BrainSnapshot } from "@/lib/flybrain/types";
@@ -58,6 +70,8 @@ import {
   Swords,
   ArrowLeft,
   X,
+  GitBranch,
+  ChevronDown,
 } from "lucide-react";
 import {
   Tooltip as UITooltip,
@@ -167,6 +181,238 @@ function StatChip({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Champion lineage ("family tree") rendering — mirrors the dino trainer's
+// tree (Task 9-b) with the bicycle's ROSE accent: main-line circles are rose,
+// sized/tinted by distance in metres; crossover parents merge in diagonally
+// from smaller amber side nodes; the champion wears a dashed emerald ring.
+// ---------------------------------------------------------------------------
+const L_SPACING = 72; // px between main-line generations
+const L_MAIN_Y = 52; // baseline of the main line
+const L_SIDE_DY = 38; // side-branch offset above/below the baseline
+const L_HEIGHT = 112;
+
+const fmtM = (v: number) => `${Math.round(v)} m`;
+
+function lineageOriginText(o: LineageOrigin): string {
+  return o === "crossover"
+    ? "crossover child"
+    : o === "clone"
+      ? "elite clone"
+      : "founding fly";
+}
+
+/** Compact hand-rolled SVG tree — no chart library. Oldest ancestor on the
+ *  left, current champion on the right. Every node carries a native <title>
+ *  tooltip ("Gen 6 · 27 m · crossover child"); the fixed viewBox scales with
+ *  the overflow-x-auto wrapper so it stays readable down to ~360 px. */
+function LineageTreeSvg({ view }: { view: LineageView }) {
+  const n = view.main.length;
+  const sideNodes = view.sides.filter(
+    (s): s is LineageViewNode => Boolean(s)
+  );
+  const maxScore = Math.max(
+    1,
+    ...view.main.map((m) => m.score),
+    ...sideNodes.map((s) => s.score)
+  );
+  const hasChip = view.hiddenGens > 0;
+  const chipText = `…${view.hiddenGens} more generation${view.hiddenGens === 1 ? "" : "s"}`;
+  const chipW = Math.max(58, 16 + chipText.length * 4.7);
+  const padL = hasChip ? 18 + chipW + 14 : 18;
+  const padR = 66; // room for the ★ champion label
+  const width = padL + (n - 1) * L_SPACING + padR;
+  const xs = view.main.map((_, i) => padL + i * L_SPACING);
+  const champIdx = n - 1;
+  const mainR = (score: number) =>
+    5 + 6 * Math.min(1, Math.max(0, score / maxScore));
+
+  return (
+    <svg
+      data-testid="bike-lineage-svg"
+      data-nodes={n}
+      data-sides={sideNodes.length}
+      data-hidden={view.hiddenGens}
+      data-champ-gen={view.champion.gen}
+      width={width}
+      height={L_HEIGHT}
+      viewBox={`0 0 ${width} ${L_HEIGHT}`}
+      role="img"
+      aria-label={`Champion family tree — ${view.breedGens} generations of breeding from gen ${view.rootGen} to gen ${view.champion.gen}`}
+      className="block"
+    >
+      {/* main-line baseline */}
+      <line
+        x1={xs[0]}
+        y1={L_MAIN_Y}
+        x2={xs[champIdx]}
+        y2={L_MAIN_Y}
+        stroke="rgba(251,113,133,0.28)"
+        strokeWidth={1.5}
+      />
+
+      {/* collapsed older ancestry chip */}
+      {hasChip && (
+        <g>
+          <title>{`Older ancestry collapsed — the full line goes back ${view.breedGens} generations to gen ${view.rootGen} (${fmtM(view.rootScore)})`}</title>
+          <rect
+            x={8}
+            y={L_MAIN_Y - 9}
+            width={chipW}
+            height={18}
+            rx={9}
+            fill="rgba(251,113,133,0.06)"
+            stroke="rgba(251,113,133,0.3)"
+            strokeWidth={1}
+          />
+          <text
+            x={8 + chipW / 2}
+            y={L_MAIN_Y + 3}
+            textAnchor="middle"
+            fontSize={8}
+            fill="#d6d3d1"
+            className="font-mono"
+          >
+            {chipText}
+          </text>
+          <line
+            x1={8 + chipW + 4}
+            y1={L_MAIN_Y}
+            x2={xs[0] - 10}
+            y2={L_MAIN_Y}
+            stroke="rgba(251,113,133,0.3)"
+            strokeWidth={1}
+            strokeDasharray="2 3"
+          />
+        </g>
+      )}
+
+      {/* crossover side branches — diagonal merges into the main line */}
+      {view.sides.map((side, i) => {
+        if (!side || i === 0) return null;
+        const up = i % 2 === 1;
+        const sx = (xs[i - 1] + xs[i]) / 2;
+        const sy = up ? L_MAIN_Y - L_SIDE_DY : L_MAIN_Y + L_SIDE_DY;
+        const childR = mainR(view.main[i].score);
+        const endY = up ? L_MAIN_Y - childR - 3 : L_MAIN_Y + childR + 3;
+        const cx = (sx + xs[i]) / 2;
+        const cy = up ? sy + 16 : sy - 16;
+        const sideR = 3.5 + 2.5 * Math.min(1, Math.max(0, side.score / maxScore));
+        return (
+          <g key={`s${side.id}`}>
+            <path
+              d={`M ${sx} ${sy} Q ${cx} ${cy} ${xs[i]} ${endY}`}
+              fill="none"
+              stroke="rgba(245,158,11,0.5)"
+              strokeWidth={1.2}
+            />
+            <circle
+              cx={sx}
+              cy={sy}
+              r={sideR}
+              fill="rgba(245,158,11,0.28)"
+              stroke="rgba(245,158,11,0.55)"
+              strokeWidth={1}
+              className="cursor-help"
+            >
+              <title>{`Gen ${side.gen} · ${fmtM(side.score)} · crossover parent`}</title>
+            </circle>
+          </g>
+        );
+      })}
+
+      {/* main-line nodes + generation ticks */}
+      {view.main.map((m, i) => {
+        const ratio = Math.min(1, Math.max(0, m.score / maxScore));
+        const r = 5 + 6 * ratio;
+        const isChamp = i === champIdx;
+        return (
+          <g key={m.id}>
+            <circle
+              cx={xs[i]}
+              cy={L_MAIN_Y}
+              r={r}
+              fill={`rgba(251,113,133,${(0.3 + 0.65 * ratio).toFixed(3)})`}
+              stroke="rgba(251,113,133,0.75)"
+              strokeWidth={1.2}
+              className="cursor-help"
+            >
+              <title>{`Gen ${m.gen} · ${fmtM(m.score)} · ${lineageOriginText(m.origin)}`}</title>
+            </circle>
+            {/* generation tick + label */}
+            <line
+              x1={xs[i]}
+              y1={L_MAIN_Y + 15}
+              x2={xs[i]}
+              y2={L_MAIN_Y + 19}
+              stroke="rgba(168,162,158,0.4)"
+              strokeWidth={1}
+              aria-hidden
+            />
+            <text
+              x={xs[i]}
+              y={L_MAIN_Y + 30}
+              textAnchor="middle"
+              fontSize={8.5}
+              fill="#a8a29e"
+              className="font-mono"
+            >
+              {m.gen}
+            </text>
+            {/* distance labels under the first + last (champion) nodes */}
+            {i === 0 && n > 1 && (
+              <text
+                x={xs[0]}
+                y={L_MAIN_Y + 43}
+                textAnchor="middle"
+                fontSize={8.5}
+                fill="#a8a29e"
+                className="font-mono"
+              >
+                {fmtM(m.score)}
+              </text>
+            )}
+            {isChamp && (
+              <>
+                <circle
+                  cx={xs[i]}
+                  cy={L_MAIN_Y}
+                  r={r + 3.5}
+                  fill="none"
+                  stroke="#34d399"
+                  strokeWidth={1.4}
+                  strokeDasharray="3 2.5"
+                />
+                <text
+                  x={xs[i]}
+                  y={L_MAIN_Y - 26}
+                  textAnchor="middle"
+                  fontSize={9}
+                  fontWeight={600}
+                  fill="#34d399"
+                  className="font-mono"
+                >
+                  ★ champion
+                </text>
+                <text
+                  x={xs[i]}
+                  y={L_MAIN_Y + 43}
+                  textAnchor="middle"
+                  fontSize={8.5}
+                  fill="#fda4af"
+                  className="font-mono"
+                >
+                  {fmtM(m.score)}
+                </text>
+              </>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
 export function BicycleTrainer() {
   const [core] = useState(() => new BicycleTrainerCore(5));
   const retinaCanvas = useRef<HTMLCanvasElement | null>(null);
@@ -193,6 +439,15 @@ export function BicycleTrainer() {
   /** session W/L tally — persists across challenges AND population resets */
   const tallyRef = useRef({ wins: 0, losses: 0, best: 0 });
   const tallyCountedRef = useRef(false);
+
+  // --- champion lineage (family tree) -------------------------------------
+  const [lineageOpen, setLineageOpen] = useState(false);
+  /** recomputed only when a new champion is crowned (keyed — the ~6 Hz flush
+   *  is a no-op for this state between crowns; the ≤20-node walk is cheap) */
+  const [lineage, setLineage] = useState<{ key: string; view: LineageView | null }>({
+    key: "none",
+    view: null,
+  });
 
   // ---- HUD polling (keeps React renders at ~6 Hz, the scene stays 60 fps)
   useEffect(() => {
@@ -234,6 +489,27 @@ export function BicycleTrainer() {
           setLeaderBrain((prev) => (prev === lead.brain ? prev : lead.brain));
         }
       }
+      // champion lineage: rebuild the family-tree view ONLY when a new
+      // champion is crowned (or the record resets) — never per tick
+      const champId = nodeIdOf(core.lineage, core.bestBrain);
+      const lKey =
+        champId > 0
+          ? `${core.lineage.version}:${champId}:${Math.floor(core.bestEverDistance)}`
+          : "none";
+      setLineage((prev) => {
+        if (prev.key === lKey) return prev; // Object-identical → no re-render
+        return {
+          key: lKey,
+          view:
+            champId > 0
+              ? buildLineageView(
+                  core.lineage,
+                  champId,
+                  Math.floor(core.bestEverDistance)
+                )
+              : null,
+        };
+      });
     }, 160);
     return () => clearInterval(iv);
   }, [core]);
@@ -477,6 +753,17 @@ export function BicycleTrainer() {
   const events = hud?.events ?? [];
   const history = hud?.history ?? [];
   const popApplied = (hud?.popSize ?? popQueued) === popQueued;
+
+  // one-line summary for the lineage card header
+  const lineageSummary = lineage.view
+    ? lineage.view.breedGens > 0
+      ? `${lineage.view.breedGens} generations of breeding — from gen ${lineage.view.rootGen}'s ${fmtM(
+          lineage.view.rootScore
+        )} to gen ${lineage.view.champion.gen}'s ${fmtM(lineage.view.champion.score)}`
+      : `The champion is an original fly — gen ${lineage.view.champion.gen}, ${fmtM(
+          lineage.view.champion.score
+        )}. Bred descendants will grow its family line.`
+    : "No champion yet — finish a generation to start the family line.";
 
   return (
     <section className="flex flex-col gap-4">
@@ -1224,6 +1511,85 @@ export function BicycleTrainer() {
             )}
           </div>
         </CardContent>
+      </Card>
+
+      {/* --- champion lineage (family tree) --- */}
+      <Card className="gap-0 py-0" data-testid="bike-lineage-card">
+        <Collapsible open={lineageOpen} onOpenChange={setLineageOpen}>
+          <CollapsibleTrigger asChild>
+            <button
+              type="button"
+              data-testid="bike-lineage-toggle"
+              aria-controls="bicycle-lineage-panel"
+              className="flex w-full items-center gap-3 px-6 py-4 text-left transition-colors hover:bg-muted/30"
+            >
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-rose-500/30 bg-rose-500/10 text-rose-400">
+                <GitBranch className="h-4 w-4" aria-hidden />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-2 text-sm font-semibold">
+                  Champion lineage
+                </span>
+                <span
+                  className="mt-1 block truncate text-xs text-muted-foreground"
+                  data-testid="bike-lineage-summary"
+                >
+                  {lineageSummary}
+                </span>
+              </span>
+              <ChevronDown
+                className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ${
+                  lineageOpen ? "rotate-180" : ""
+                }`}
+                aria-hidden
+              />
+            </button>
+          </CollapsibleTrigger>
+          <CollapsibleContent id="bicycle-lineage-panel">
+            <CardContent className="border-t border-border/60 px-4 pb-5 pt-4 sm:px-6">
+              {lineage.view ? (
+                <>
+                  <div className="overflow-x-auto pb-1 [&::-webkit-scrollbar]:h-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border">
+                    <LineageTreeSvg view={lineage.view} />
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11px] text-muted-foreground">
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className="h-2 w-2 rounded-full bg-rose-400/80"
+                        aria-hidden
+                      />
+                      main line
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className="h-2 w-2 rounded-full bg-amber-500/60"
+                        aria-hidden
+                      />
+                      crossover parent
+                    </span>
+                    <span className="flex items-center gap-1.5 text-emerald-300">
+                      <span aria-hidden>★</span>
+                      champion
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <div
+                  data-testid="bike-lineage-empty"
+                  className="flex h-[120px] items-center justify-center rounded-lg border border-dashed border-border px-4 text-center text-xs text-muted-foreground"
+                >
+                  No champion yet — finish a generation to start the family line.
+                </div>
+              )}
+              <p className="mt-2.5 text-[10px] leading-snug text-muted-foreground/70">
+                Breeding history of the all-time champion — elite clones inherit one parent,
+                crossover children merge two. Session memory only: the line resets with the
+                population (Reset or loading a brain starts a fresh family; challenges train
+                the champion but never branch it).
+              </p>
+            </CardContent>
+          </CollapsibleContent>
+        </Collapsible>
       </Card>
     </section>
   );

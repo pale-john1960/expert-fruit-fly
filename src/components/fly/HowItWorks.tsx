@@ -14,6 +14,12 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import {
+  DopamineLoopDiagram,
+  EvolutionLoopDiagram,
+  PipelineDiagram,
+  REGION_HEX,
+} from "./HowItWorksDiagrams";
+import {
   Bug,
   Eye,
   Zap,
@@ -72,13 +78,13 @@ function Analogy({ children }: { children: React.ReactNode }) {
 }
 
 const PIPELINE = [
-  { name: "Retina", count: "216", desc: "The eye — 24×9 pixels of the world, brightness only" },
-  { name: "Lamina", count: "216", desc: "First wiring — keeps what changes, ignores what stays still" },
-  { name: "Medulla", count: "192", desc: "Feature detectors — bright spots, dark spots, edges, motion" },
-  { name: "Lobula", count: "48", desc: "Spiking neurons — each watches one patch of the view" },
-  { name: "Kenyon cells", count: "240", desc: "The mushroom body — sparse code for “what is happening”" },
-  { name: "MBONs", count: "12", desc: "Memory outputs — appetitive (green) & aversive (rose) compartments" },
-  { name: "Motor", count: "2–4", desc: "Muscle commands — jump, duck, steer, pedal" },
+  { key: "retina", name: "Retina", count: "216", desc: "The eye — 24×9 pixels of the world, brightness only" },
+  { key: "lamina", name: "Lamina", count: "216", desc: "First wiring — keeps what changes, ignores what stays still" },
+  { key: "medulla", name: "Medulla", count: "192", desc: "Feature detectors — bright spots, dark spots, edges, motion" },
+  { key: "lobula", name: "Lobula", count: "48", desc: "Spiking neurons — each watches one patch of the view" },
+  { key: "kenyon", name: "Kenyon cells", count: "240", desc: "The mushroom body — sparse code for “what is happening”" },
+  { key: "mbon", name: "MBONs", count: "12", desc: "Memory outputs — appetitive (green) & aversive (rose) compartments" },
+  { key: "motor", name: "Motor", count: "2–4", desc: "Muscle commands — jump, duck, steer, pedal" },
 ];
 
 export function HowItWorks() {
@@ -101,7 +107,7 @@ export function HowItWorks() {
               <span className="text-foreground">connectome</span>. People then
               wired it into games and robots. This app is a{" "}
               <span className="text-foreground">browser-sized version of that idea</span>:
-              a 926-neuron fly brain, inspired by the real one, that you can watch
+              a 928-neuron fly brain, inspired by the real one, that you can watch
               think, teach with sugar and shocks, and train to play games.
             </p>
           </div>
@@ -123,18 +129,28 @@ export function HowItWorks() {
           <span className="text-foreground">leaky integrate-and-fire</span> model
           used in real connectome simulations.
         </p>
-        <div className="space-y-2">
-          {PIPELINE.map((r, i) => (
-            <div key={r.name} className="flex items-center gap-3">
-              <div className="flex w-40 shrink-0 items-center gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-2 text-xs font-medium">
-                <span className="text-muted-foreground">{i + 1}</span>
-                <span className="flex-1">{r.name}</span>
+        <PipelineDiagram />
+        <p className="text-xs text-muted-foreground">
+          Region by region — colors match the 3-D brain viewer:
+        </p>
+        <div className="grid gap-2 sm:grid-cols-2">
+          {PIPELINE.map((r) => (
+            <div
+              key={r.name}
+              className="flex items-start gap-2.5 rounded-lg border border-border bg-muted/40 p-2.5"
+            >
+              <span
+                aria-hidden="true"
+                className="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full"
+                style={{ backgroundColor: REGION_HEX[r.key] }}
+              />
+              <p className="text-xs leading-relaxed">
+                <span className="font-medium text-foreground">{r.name}</span>{" "}
                 <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
                   {r.count}
-                </Badge>
-              </div>
-              <ArrowRight className="hidden h-3.5 w-3.5 shrink-0 text-muted-foreground/50 sm:block" />
-              <p className="flex-1 text-xs leading-relaxed sm:text-sm">{r.desc}</p>
+                </Badge>{" "}
+                — {r.desc}
+              </p>
             </div>
           ))}
         </div>
@@ -178,6 +194,7 @@ export function HowItWorks() {
             &quot;how recently was this wire used&quot;)
           </div>
         </div>
+        <DopamineLoopDiagram />
         <p>
           This is the same trick the viral fly sims used — a{" "}
           <span className="text-foreground">3-factor learning rule</span>, and
@@ -214,6 +231,7 @@ export function HowItWorks() {
           much. So each trainer also runs a miniature{" "}
           <span className="text-foreground">evolution</span>:
         </p>
+        <EvolutionLoopDiagram />
         <div className="grid gap-2 sm:grid-cols-2">
           {[
             ["Repeat", "A population of flies (5–8) plays the same world simultaneously as translucent ghosts"],

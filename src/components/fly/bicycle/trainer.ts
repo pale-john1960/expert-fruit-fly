@@ -35,6 +35,15 @@ import {
   type StepResult,
 } from "./physics";
 import { buildRetina, RETINA_SIZE } from "./retina";
+import {
+  freshLineage,
+  nodeIdOf,
+  recordEvolution,
+  registerFounders,
+  rekeyToNode,
+  retireGeneration,
+  type LineageRecord,
+} from "./lineage";
 import { playSound } from "@/lib/sound";
 
 export interface TrainerEvent {
@@ -92,6 +101,10 @@ export interface ChallengeState {
   /** the parked training population (restored on endChallenge) */
   parkedRiders: Rider[];
   parkedLeaderIdx: number;
+  /** LINEAGE (additive): node id of the champion this challenge cloned
+   *  (0 = none) — lets endChallenge re-key its fold-back clone onto the
+   *  champion's EXISTING node; challenges never create lineage nodes */
+  championNodeId: number;
 }
 
 const PUNISH_FALL = -0.5;
@@ -146,7 +159,8 @@ function makeChallengeRider(
 
 function createChallenge(core: BicycleTrainerCore): ChallengeState {
   // champion clone — it keeps learning during challenges (lifetime dopamine)
-  const champion = (core.bestBrain ?? core.championBrain()).clone();
+  const source = core.bestBrain ?? core.championBrain();
+  const champion = source.clone();
   // one shared random draw → both riders get identical push-off conditions
   const phi0 = (Math.random() - 0.5) * 0.08;
   const v0 = 3.0 + Math.random() * 0.6;
@@ -169,6 +183,7 @@ function createChallenge(core: BicycleTrainerCore): ChallengeState {
     result: null,
     parkedRiders: [],
     parkedLeaderIdx: 0,
+    championNodeId: nodeIdOf(core.lineage, source),
   };
 }
 
@@ -216,6 +231,9 @@ export class BicycleTrainerCore {
   bestBrain: FlyBrain | null = null;
   /** "You vs the fly" challenge — null while normal training runs */
   challenge: ChallengeState | null = null;
+  /** champion lineage graph — session memory, resets with the population
+   *  (LINEAGE: additive observation record; the training loop never reads it) */
+  lineage: LineageRecord = freshLineage();
   history: GenRecord[] = [];
   events: TrainerEvent[] = [];
   leaderIdx = 0;
@@ -238,6 +256,10 @@ export class BicycleTrainerCore {
       { length: this.popSize },
       () => new FlyBrain(DEFAULT_ARCH_BICYCLE)
     );
+    // LINEAGE (additive): fresh population → fresh family line; every
+    // initial random brain is a founder
+    this.lineage = freshLineage();
+    registerFounders(this.lineage, this.trainingBrains, 1);
     this.generation = 1;
     this.bestEverDistance = 0;
     this.bestBrain = null;
@@ -400,6 +422,10 @@ export class BicycleTrainerCore {
       return;
     }
 
+    // LINEAGE (additive): this generation just ended — record each rider's
+    // final distance on its node (watch-best / challenge riders have none)
+    retireGeneration(this.lineage, this.riders);
+
     const fits = this.riders.map((r) => r.st.finalS);
     const best = Math.max(...fits);
     const avg = fits.reduce((a, b) => a + b, 0) / fits.length;
@@ -432,12 +458,16 @@ export class BicycleTrainerCore {
     const sorted = [...this.riders].sort((a, b) => b.st.finalS - a.st.finalS);
     const next: FlyBrain[] = [sorted[0].brain.clone()];
     if (this.popSize > 1) next.push(sorted[1].brain.clone());
+    // LINEAGE (additive): observes the tournament picks (2 per bred child,
+    // in call order) — no extra RNG draws, the recipe below is unchanged
+    const picks: FlyBrain[] = [];
     const tournament = (): FlyBrain => {
       let best: Rider | null = null;
       for (let i = 0; i < 3; i++) {
         const cand = sorted[Math.floor(Math.random() * sorted.length)];
         if (!best || cand.st.finalS > best.st.finalS) best = cand;
       }
+      picks.push(best!.brain);
       return best!.brain;
     };
     while (next.length < this.popSize) {
@@ -445,6 +475,15 @@ export class BicycleTrainerCore {
       child.mutate(MUTATE_RATE, this.mutationStrength);
       next.push(child);
     }
+    // LINEAGE (additive): record the new generation's parent links — elite
+    // clones inherit 1 parent, crossover children merge 2
+    recordEvolution(this.lineage, next, {
+      eliteBrains:
+        this.popSize > 1 ? [sorted[0].brain, sorted[1].brain] : [sorted[0].brain],
+      eliteCount: this.popSize > 1 ? 2 : 1,
+      picks,
+      childGen: this.generation + 1,
+    });
     this.trainingBrains = next;
   }
 
@@ -478,6 +517,9 @@ export class BicycleTrainerCore {
     const ch = this.challenge;
     if (!ch) return;
     this.bestBrain = ch.fly.brain.clone(); // challenges train the champion
+    // LINEAGE (additive): the fold-back clone inherits the champion's node —
+    // challenges train the champion but never create lineage nodes
+    rekeyToNode(this.lineage, this.bestBrain, ch.championNodeId);
     this.riders = ch.parkedRiders;
     this.leaderIdx = ch.parkedLeaderIdx;
     this.challenge = null;
@@ -665,6 +707,20 @@ export class BicycleTrainerCore {
     this.generation = snap.generation;
     this.bestEverDistance = snap.score;
     this.bestBrain = brain;
+    // LINEAGE (additive): adopted population — the loaded brain is the root
+    // founder (its ancestry is unknowable from a snapshot); every seeded
+    // clone shares that founder node, seeded with the snapshot's score
+    this.lineage = freshLineage();
+    registerFounders(this.lineage, this.trainingBrains, this.generation);
+    for (const b of this.trainingBrains) {
+      const node = this.lineage.nodes.get(nodeIdOf(this.lineage, b));
+      if (node) node.score = Math.max(node.score, this.bestEverDistance);
+    }
+    rekeyToNode(
+      this.lineage,
+      brain,
+      nodeIdOf(this.lineage, this.trainingBrains[0])
+    );
     this.history = [];
     this.watchBest = false;
     this.resetEpisode(this.trainingBrains);

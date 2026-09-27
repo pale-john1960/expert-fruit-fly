@@ -8,6 +8,10 @@ import { DinoTrainer } from "@/components/fly/DinoTrainer";
 import { BicycleTrainer } from "@/components/fly/BicycleTrainer";
 import { BrainLibrary } from "@/components/fly/BrainLibrary";
 import { HowItWorks } from "@/components/fly/HowItWorks";
+import {
+  ShortcutsSheet,
+  Kbd,
+} from "@/components/fly/ShortcutsSheet";
 import { useBrainStore } from "@/lib/flybrain/store";
 import {
   playSound,
@@ -23,6 +27,7 @@ import {
   Bug,
   Gamepad2,
   Github,
+  Keyboard,
   Library,
   Volume2,
   VolumeX,
@@ -236,21 +241,13 @@ const PILL_SPRING = {
   damping: 32,
 } as const;
 
-/** Tiny keyboard-key chip used in the footer shortcut hints. */
-function Kbd({ children }: { children: React.ReactNode }) {
-  return (
-    <kbd className="rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium text-foreground/80">
-      {children}
-    </kbd>
-  );
-}
-
 /* ------------------------------------------------------------------ */
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
 
 export default function Home() {
   const [tab, setTab] = useState("lab");
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const banner = useBrainStore((s) => s.banner);
   const clearBanner = useBrainStore((s) => s.clearBanner);
   const muted = useSoundMuted();
@@ -283,6 +280,9 @@ export default function Home() {
         }
       } else if (e.key === "m" || e.key === "M") {
         toggleSoundMuted();
+      } else if (e.key === "?") {
+        e.preventDefault(); // Firefox uses "/" for quick-find
+        setShortcutsOpen((v) => !v);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -309,6 +309,24 @@ export default function Home() {
             </div>
           </div>
           <div className="ml-auto flex items-center gap-1.5">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Keyboard shortcuts"
+                  aria-keyshortcuts="?"
+                  onClick={() => {
+                    setShortcutsOpen(true);
+                    playSound("click");
+                  }}
+                  className="h-9 w-9 px-0 text-muted-foreground hover:text-foreground"
+                >
+                  <Keyboard className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Shortcuts (?)</TooltipContent>
+            </Tooltip>
             <Popover>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -514,6 +532,7 @@ export default function Home() {
                   title={`Press ${i + 1}`}
                   className={cn(
                     "inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
                     hover,
                   )}
                 >
@@ -526,7 +545,8 @@ export default function Home() {
               ))}
             </div>
             <p className="flex items-center gap-1.5 leading-relaxed">
-              <Kbd>1</Kbd>–<Kbd>5</Kbd> switch rooms · <Kbd>M</Kbd> sound
+              <Kbd>1</Kbd>–<Kbd>5</Kbd> switch rooms · <Kbd>M</Kbd> sound ·{" "}
+              <Kbd>?</Kbd> shortcuts
             </p>
           </nav>
 
@@ -553,6 +573,11 @@ export default function Home() {
           </div>
         </div>
       </footer>
+      {/* Shortcuts help sheet ("?" or the header keyboard button) */}
+      <ShortcutsSheet
+        open={shortcutsOpen}
+        onOpenChange={setShortcutsOpen}
+      />
     </div>
   );
 }
