@@ -258,3 +258,66 @@ Stage Summary:
 - All features verified in-browser with zero console errors; engine constants untouched (locked engine preserved)
 - GitHub push still blocked: /home/z/my-project/upload/ remains empty (SSH key never arrived) — scripts/push-github.ts stays a safe no-op
 - Next-round candidates: bicycle steering-sensitivity presets (REWARD_PER_METER tuning), brain family-tree visualization, keyboard play mode (human vs fly), share/export of conditioning demo results
+
+---
+Task ID: 8-a
+Agent: full-stack-developer (human vs fly duel) — report reconstructed: the first 8-a session landed all the code (DinoTrainer.tsx, dino/game.ts) but died before reporting; this session audited it against the spec, fixed one gap, and re-verified everything fresh
+
+Task: "You vs the fly" duel mode — keyboard-playable head-to-head race, human dino avatar vs the champion fly brain in the SAME world
+
+Work Log:
+- Read worklog Tasks 1/2-b/7-c + DinoTrainer.tsx (1942 lines) + dino/game.ts in full; audited the landed duel implementation item-by-item against the spec (all present — details below)
+- game.ts (shared, no physics duplication): stepAvatarPhysics() extracted as the one per-avatar physics step (jump cooldown, gravity, airborne-duck fast-fall ×2.6, ground landing) used by BOTH training runners and duel avatars; DUEL_SURVIVOR_CAP_S=30; drawFly gained ringColor/labelColor overrides; hitObstacle() already per-avatar (returns the obstacle for death-cause reporting)
+- DinoTrainer.tsx duel mode: DuelSim lives at module level and is stepped by the SAME rAF loop — training is PARKED (not stopped), so the generation/world resume untouched on exit. createDuel clones sim.bestBrain into a fresh world (honors bird practice); stepDuel does shared world → 24×9 retina vision (world drawn WITHOUT avatars — the fly can't see you) → human keys + champion brain with its usual dopamine (clear +0.4, crash −0.3 — duels are extra lifetime learning, weights folded back into the champion on duel end/exit so rematches compound) → independent per-avatar collisions → both-dead or 30s survivor-cap end
+- Keys: window keydown/keyup mounted ONLY while dueling; ArrowUp/Space/W jump (edge-triggered, repeat ignored), ArrowDown/S duck held, airborne duck = fast-fall (same as flies); preventDefault stops page scroll; typing targets (input/textarea/contenteditable) ignored; blur clears a stuck duck. All in refs — zero re-renders; React mirrors a DuelHud slice at the existing 4Hz flush cadence
+- UI: HUD swaps GEN/alive chips for YOU (amber)/FLY (emerald) score badges with ✕ on death, "You N · Fly N" W/L + DUEL BEST chips, SPD kept, kbd hint row "↑ jump · ↓ duck"; result overlay with exact spec wording (you-win 🏆 / fly-win / tie) + Rematch + Back to training; "Duels also train the champion" caption; training controls disabled while dueling; exit repaints the offscreen canvas so no duel frame lingers. W/L tally persists across duels AND population resets. Sounds: jump 0.15, crash 0.25 (either avatar), milestone on new duel best, click on enter/rematch/exit
+- FIX THIS SESSION: the disabled "You vs the fly" button never showed its tooltip (browsers fire no pointer events on disabled buttons) — wrapped it in a span inside TooltipTrigger asChild; browser-verified the "Train a champion first, then challenge it" tooltip now appears
+- Verified in isolated session task-8a (window.__errs stayed [] the whole time): disabled tooltip text; regression Start+×10 30s → GEN 70, HI 00115, duck-defense chip, +0.4/−0.3 feed, no errors; duel start two avatars (pixel check: 22 emerald columns in the FLY band, 25 amber in the YOU band; VLM: "two fly avatars... YOU amber, FLY emerald dashed rings", no glitches); ArrowUp → 15 sampled airborne frames; held ArrowDown shortened airtime ~0.25s (fast-fall); all three outcomes with exact wording — fly wins "47 vs 45. Keep training!", you win (via a canvas-vision auto-player dispatching real KeyboardEvents) "🏆 You outsurvived the fly, 53 vs 50" with W/L chips "You 1 · Fly 2" + BEST 53, tie "Dead heat — 48 all. Rematch?"; Rematch fresh world; early exit mid-duel (both alive at 9:9) and post-result exit both restore training with GEN intact (113→138→192 across exits, score advancing); tally survived a population Reset; bun run lint exit 0; dev.log clean
+- Screenshots: /home/z/scratch/8a-{duel-start,duel-mid,duel-both-alive,duel-result,duel-you-win,back-to-training}.png (+ prior-session 8a-{duel-tie-result,duel-rematch-mid,duel-wl-chips}.png); helpers 8a-autoplay.js, 8a-vlm-check2.ts
+
+Stage Summary:
+- Duel mode complete and regression-clean: fair same-world race (both avatars collide at the same FLY_X lane; sprites offset ±14px only visually), champion keeps learning during duels and hands its weights back, three end states + 30s survivor cap, session W/L tally, full keyboard control with scroll protection, zero impact on the untouched training loop (turbo/duck-defense/bird-practice/save/resume/watch-best all re-verified working)
+- Gotchas for future agents: agent-browser eval persists top-level const across calls (wrap in IIFEs); agent-browser find can use a stale element list right after a mode switch — verify via eval/DOM; VLM needs zai.chat.completions.createVision (plain create rejects images, code 1210); root /agent-ctx is not writable — record at /home/z/agent-ctx/8a-full-stack-developer.md
+- Deviations: duel always runs at real-time ×1 (no turbo) since a human is playing; avatars collide in the SAME lane rather than physically side-by-side lanes — spec's "side by side" is honored visually (offset x ±14) while keeping the race perfectly fair; Play/Reset/Watch-best/Bird-practice are disabled while dueling (they'd fight the duel world), all fully functional outside duels
+
+---
+Task ID: 8-b
+Agent: full-stack-developer (neuron inspector) — entry reconstructed by lead: the agent's code landed completely (BrainLab.tsx + BrainVisualizer3D.tsx, lint clean) but it died before reporting, same failure mode as 7-c; the lead verified everything in-browser
+
+Task: Click-to-inspect neuron panel in Brain Lab — identity, live activity, and outgoing synapses (plastic via public weight matrices, fixed via sampled edges)
+
+Work Log:
+- BrainVisualizer3D.tsx: new optional props onNeuronSelect?(globalIdx | null) + selectedNeuron?(number | null); click-to-poke now ALSO fires onNeuronSelect(gi); empty-space click (non-drag) fires onNeuronSelect(null) via pointer-missed handler; pulsing emerald billboarded selection ring on the chosen cell
+- BrainLab.tsx: "Neuron inspector" Card (right column) — empty state, per-region friendly copy (retina="Light sensor — graded, no spikes", kenyon="…where memories form", etc.), live activity bar + SPIKED chip at the existing 11Hz UI cadence, outgoing-synapse table strongest-first:
+  • retina → deterministic 1:1 lamina map (weight 1, fixed)
+  • kenyon → full 12-row Kenyon→MBON column from brain.kenyonToMbon (plastic, valence badges, "where the fly's memories live" note)
+  • mbon → full mbonToMotor row (plastic)
+  • lobula → lobulaToMotor giant-fiber column (PLASTIC ±) + sampled fixed wiring into the mushroom body
+  • motor → incoming plastic instead; lamina/medulla → honest fallback when the cell isn't in the 520-edge sample
+  Weight bars emerald+/rose−, FIXED vs PLASTIC± badges, Poke +2.0 / Clear buttons (Poke reuses the identical injection path + pop animation)
+- Lead verification (session round8-lead): selected Retina #155 (1:1 wiring row rendered with explanatory note), Lamina #155/#137/#190, Lobula #23 (card shows 6 synapses: MB #64 +0.99 FIXED, MB #214 +0.96 FIXED, Motor #3 −0.12 / Motor #1 +0.11 / Motor #0 −0.05 / Motor #2 −0.01 PLASTIC±, giant-fiber note), Poke + Clear both work, empty-space deselect works, auto-rotate/Synapses toggles + conditioning demo unaffected, zero console errors (the releasePointerCapture errors observed during testing came from the LEAD's synthetic PointerEvents lacking real pointer IDs — a test-method artifact, not a product bug; real input never triggers it)
+- Lead gotcha for future agents: R3F onClick requires a real DOM 'click' event (synthetic pointerdown/up alone never fires it — dispatch MouseEvent('click') too); the default camera looks at the fly's FACE so retina sheets occlude deeper regions — the lobula/kenyon cells are reachable near canvas center-left (~500,420 client coords at default orientation)
+- Sandbox display quirk reconfirmed: rg output strips "[m"-style sequences (brain.kenyonToMbon[m * …] displayed as "kenyonToMbon * s" — verified intact via Read tool)
+
+Stage Summary:
+- Neuron inspector fully functional and verified end-to-end: select → identity → live activity → synapse table (mixed fixed/plastic with signed weights) → poke/clear; engine untouched (read-only use of public matrices)
+
+---
+Task ID: 8 (lead integration)
+Agent: main (Z.ai Code)
+Task: Round QA, duel + inspector verification, bicycle presets, keyboard shortcuts, final integration
+
+Work Log:
+- Pre-round QA (agent-browser, isolated session): all 5 tabs stable, Dino evolves (GEN 17/HI 66), Bicycle evolves (GEN 2/best 4m), Library 6 rows, Docs render — zero console errors; discovered both "failed" Task-tool launches had ACTUALLY spawned agents whose code landed anyway (8-a completed + reported on retry; 8-b died after landing code but before reporting)
+- Verified 8-b neuron inspector in-browser myself (agent never reported): selection via hit-proxies works (Retina #155 with deterministic 1:1 lamina wiring row, Lamina #155/#137/#190, Lobula #23 with 6 synapses: MB #64 +0.99 FIXED, MB #214 +0.96 FIXED, Motor #3 −0.12/Motor #1 +0.11/Motor #0 −0.05/Motor #2 −0.01 PLASTIC±, giant-fiber note), Poke/Clear buttons work, empty-space deselect works, conditioning demo + toggles unaffected, zero errors; wrote 8-b's reconstructed worklog entry
+- Lead QA technique documented for future agents: R3F onClick needs a real DOM 'click' event (synthetic pointerdown/up alone never fires it — dispatch MouseEvent('click') too); default camera faces the fly's face so deeper regions hide behind retina sheets (lobula reachable near canvas ~500,420); synthetic PointerEvents trigger harmless releasePointerCapture errors (no real pointer id) — test artifacts, not product bugs
+- Verified 8-a duel in integrated build: disabled-until-champion → 30s training (GEN 61) → duel entry (YOU/FLY HUD, hint row, W/L chips), ArrowUp jumps, result overlay "The fly wins this round — 52 vs 48", Rematch, Back-to-training resumes (GEN 61→79 in the ~3s post-exit at ×10 — training correctly parked DURING duels; verified in code: duelRef branches before stepSim), W/L tally persisted across duels ("You 0 · Fly 1")
+- Built 8-c bicycle personality presets: physics.ts steerFromMotors(motor, gain=1) (default-identical); trainer.ts preset field + steerGain/rewardPerMeter + setPreset() with event-feed logging; BicycleTrainer.tsx segmented control (Steady=1.25 gain/0.045 sugar·m⁻¹, Standard=validated default, Frisky=0.8/0.022) with color-coded pressed states + explanatory caption, applies live without reset
+- Built 8-d keyboard shortcuts + hints: page.tsx global keydown (1–5 switch tabs with click sound, M toggles mute; ignores input/textarea/select/contentEditable and modifier combos — no collision with duel arrow/space controls); Kbd chip component; footer Explore buttons now carry per-tab hotkey digits + "1–5 switch rooms · M sound" hint line; TabsTrigger title hints
+- Regression verified: shortcuts 1/2/3/5 + M-mute round-trip (localStorage fly-sound-muted 1→0), Steady preset logs "Bike preset: Steady", no horizontal overflow, footer hints render, zero console errors throughout, bun run lint exit 0, dev.log clean
+
+Stage Summary:
+- Round 8 shipped: "You vs the fly" keyboard duel mode (champion keeps learning during duels, W/L tally), neuron inspector (identity + live activity + synapse tables from public plastic matrices + sampled fixed wiring, selection ring), bicycle personality presets (Steady/Standard/Frisky), global keyboard shortcuts with discoverable hints
+- All features verified end-to-end in the integrated build with zero console errors; engine untouched; lint clean
+- GitHub push STILL blocked: /home/z/my-project/upload/ empty (SSH key never arrived); push-github.ts remains a safe no-op
+- Next-round candidates: brain family-tree/lineage view, export conditioning-demo results, human-vs-fly BICYCLE challenge (keyboard balance), sound volume slider, seeded reproducible runs for demos

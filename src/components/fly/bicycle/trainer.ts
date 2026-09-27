@@ -92,6 +92,11 @@ export class BicycleTrainerCore {
   popSize = 5;
   queuedPopSize = 5;
   mutationStrength = 0.3;
+  /** bicycle "personality" — scales handlebar sensitivity (see steerFromMotors) */
+  preset: "steady" | "standard" | "frisky" = "standard";
+  steerGain = 1;
+  /** sugar per meter ridden — the Steady preset is richer, Frisky leaner */
+  rewardPerMeter = REWARD_PER_METER;
   bestEverDistance = 0;
   bestBrain: FlyBrain | null = null;
   history: GenRecord[] = [];
@@ -178,7 +183,7 @@ export class BicycleTrainerCore {
       r.motor.set(motor);
       r.pendingReward = 0;
 
-      const delta = steerFromMotors(r.motor);
+      const delta = steerFromMotors(r.motor, this.steerGain);
       const pedal = r.motor[2];
       const res = stepBike(st, delta, pedal, DT, roadCurvature(st.s));
 
@@ -205,7 +210,7 @@ export class BicycleTrainerCore {
       const meters = Math.floor(st.s) - r.meterFloor;
       if (meters > 0) {
         r.meterFloor += meters;
-        r.pendingReward += REWARD_PER_METER * meters;
+        r.pendingReward += this.rewardPerMeter * meters;
       }
       const mile = Math.floor(st.s / MILESTONE_STEP);
       if (mile > r.milestoneFloor) {
@@ -328,6 +333,25 @@ export class BicycleTrainerCore {
 
   setMutationStrength(s: number) {
     this.mutationStrength = s;
+  }
+
+  /** Apply a bicycle personality preset — steering authority × sugar richness. */
+  setPreset(p: "steady" | "standard" | "frisky") {
+    if (p === this.preset) return;
+    this.preset = p;
+    if (p === "steady") {
+      this.steerGain = 1.25;
+      this.rewardPerMeter = 0.045;
+      this.log("info", "Bike preset: Steady — forgiving geometry, richer sugar");
+    } else if (p === "frisky") {
+      this.steerGain = 0.8;
+      this.rewardPerMeter = 0.022;
+      this.log("info", "Bike preset: Frisky — twitchy handling, leaner sugar");
+    } else {
+      this.steerGain = 1;
+      this.rewardPerMeter = REWARD_PER_METER;
+      this.log("info", "Bike preset: Standard — the validated default");
+    }
   }
 
   setWatchBest(on: boolean) {

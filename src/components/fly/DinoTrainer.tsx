@@ -23,6 +23,15 @@
  *    score 0 so ducking can be trained deliberately
  *  - sound effects via @/lib/sound (milestone on new HI, gen on evolve,
  *    crash/jump at real-time speed, ding on save, click on start/resume)
+ *  - "You vs the fly" duel mode: the human plays a dino avatar (arrow keys)
+ *    head-to-head against the champion brain in the SAME world — identical
+ *    obstacles for both, so it's a fair race. Each avatar collides
+ *    independently; once one dies the survivor gets 30s to run up its
+ *    score. The champion keeps receiving its usual sugar (+0.4 per clear)
+ *    and shock (−0.3 on crash) during duels — extra lifetime learning —
+ *    and its trained weights are written back into the trainer's champion
+ *    when the duel ends, so rematches compound. Training is only PARKED
+ *    while dueling (same generation, same world on return).
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -36,11 +45,11 @@ import { evolvePopulation } from "./dino/evolution";
 import {
   BASE_SPEED,
   DUCK_THRESHOLD,
+  DUEL_SURVIVOR_CAP_S,
   FLY_X,
   GAME_H,
   GAME_W,
   GEN_TIME_CAP_S,
-  GRAVITY,
   GROUND_Y,
   JUMP_COOLDOWN_MS,
   JUMP_THRESHOLD,
@@ -59,10 +68,16 @@ import {
   freshDuckCounters,
   freshFly,
   hitObstacle,
+  stepAvatarPhysics,
   stepWorld,
   trackBirdEncounters,
 } from "./dino/game";
-import type { DeathCause, DuckCounters, World } from "./dino/game";
+import type {
+  DeathCause,
+  DuckCounters,
+  FlyAvatar,
+  World,
+} from "./dino/game";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Badge } from "@/components/ui/badge";
@@ -83,7 +98,13 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
+  Tooltip as UITooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   Activity,
+  ArrowLeft,
   Bird,
   Eye,
   Gamepad2,
@@ -95,6 +116,7 @@ import {
   Save,
   Sparkles,
   Sprout,
+  Swords,
   Trophy,
   Users,
   X,
@@ -162,6 +184,10 @@ interface Sim {
   genBirdDeaths: number;
   genCactusDeaths: number;
   genTimeoutDeaths: number;
+  /** duel session tally (persists across duels and population resets) */
+  duelWins: number;
+  duelLosses: number;
+  duelBest: number; // best HUMAN score achieved in a duel this session
 }
 
 interface Art {
@@ -170,6 +196,65 @@ interface Art {
   retina: HTMLCanvasElement;
   retinaCtx: CanvasRenderingContext2D;
 }
+
+// ---------------------------------------------------------------------------
+// "You vs the fly" duel mode
+// ---------------------------------------------------------------------------
+interface DuelAvatar {
+  fly: FlyAvatar;
+  alive: boolean;
+  /** score at death (frozen once dead) */
+  deathScore: number;
+}
+
+interface DuelResult {
+  winner: "you" | "fly" | "tie";
+  youScore: number;
+  flyScore: number;
+}
+
+/** Module-level duel state — stepped by the same rAF loop, never re-created
+ *  by React renders. The training Sim is only PARKED while a duel runs. */
+interface DuelSim {
+  world: World;
+  human: DuelAvatar;
+  /** the champion brain, cloned from sim.bestBrain (it keeps learning) */
+  ai: { brain: FlyBrain } & DuelAvatar;
+  /** held duck key (ArrowDown / S) */
+  duckHeld: boolean;
+  /** edge-triggered jump (set by keydown, consumed by the next step) */
+  jumpQueued: boolean;
+  /** world time of the first avatar's death — starts the 30s survivor cap */
+  firstDeathT: number | null;
+  ended: boolean;
+  result: DuelResult | null;
+}
+
+/** Duel slice pushed into React at the 4Hz flush cadence. */
+interface DuelHud {
+  you: number;
+  fly: number;
+  youAlive: boolean;
+  flyAlive: boolean;
+  youAir: boolean; // human avatar airborne (for tests / data-duel attr)
+  score: number;
+  speed: number;
+  ended: boolean;
+  result: DuelResult | null;
+  wins: number;
+  losses: number;
+  best: number;
+}
+
+/** Both avatars collide at the SAME x lane (FLY_X) so the race is perfectly
+ *  fair — identical timing against identical obstacles. The sprites are
+ *  drawn a little apart purely visually. */
+const DUEL_HUMAN_X = FLY_X + 14;
+const DUEL_FLY_X = FLY_X - 14;
+const DUEL_HUMAN_RING = "rgba(251,191,36,0.95)";
+const DUEL_HUMAN_LABEL = "#fbbf24";
+const DUEL_FLY_RING = "rgba(52,211,153,0.9)";
+const DUEL_FLY_LABEL = "#34d399";
 
 const STEP_DT = 1 / 60;
 const MAX_STEPS_PER_FRAME = 60;
@@ -313,6 +398,199 @@ function endGeneration(sim: Sim, popSize: number, mutStrength: number): void {
   sim.world = freshWorld(sim);
 }
 
+// ---------------------------------------------------------------------------
+// Duel mode internals (module level, like the training loop)
+// ---------------------------------------------------------------------------
+function createDuel(sim: Sim): DuelSim {
+  const w = createWorld();
+  w.birdPractice = sim.birdPractice; // duel world behaves like the trainer's
+  return {
+    world: w,
+    human: { fly: freshFly(), alive: true, deathScore: 0 },
+    ai: {
+      brain: sim.bestBrain ? sim.bestBrain.clone() : new FlyBrain(DEFAULT_ARCH_DINO),
+      fly: freshFly(),
+      alive: true,
+      deathScore: 0,
+    },
+    duckHeld: false,
+    jumpQueued: false,
+    firstDeathT: null,
+    ended: false,
+    result: null,
+  };
+}
+
+/** Both avatars are done — tally the session, fold the champion's lifetime
+ *  dopamine back into the trainer's best brain, freeze the result. */
+function finishDuel(d: DuelSim, s: Sim): void {
+  if (d.result) return;
+  const youScore = d.human.deathScore;
+  const flyScore = d.ai.deathScore;
+  const winner: DuelResult["winner"] =
+    youScore > flyScore ? "you" : youScore < flyScore ? "fly" : "tie";
+  if (winner === "you") s.duelWins += 1;
+  else if (winner === "fly") s.duelLosses += 1;
+  const newBest = youScore > s.duelBest;
+  if (newBest) s.duelBest = youScore;
+  // duels double as extra lifetime learning — keep the trained weights
+  s.bestBrain = d.ai.brain.clone();
+  d.result = { winner, youScore, flyScore };
+  d.ended = true;
+  if (newBest) playSound("milestone"); // new best duel score by the human
+}
+
+/** One 60Hz duel step: shared world → vision → human keys + champion brain →
+ *  physics → per-avatar collisions → end conditions. */
+function stepDuel(d: DuelSim, art: Art, s: Sim, dt: number): void {
+  const w = d.world;
+  const cleared = stepWorld(w, dt);
+
+  // shared avatar physics (same helper as the training runners)
+  stepAvatarPhysics(d.human.fly, dt);
+  stepAvatarPhysics(d.ai.fly, dt);
+
+  // human input: duck is held, jump is edge-triggered (ignores repeats)
+  d.human.fly.ducking = d.duckHeld;
+  if (d.jumpQueued) {
+    d.jumpQueued = false;
+    const f = d.human.fly;
+    if (!f.airborne && f.jumpCooldownMs <= 0) {
+      f.vy = -JUMP_V;
+      f.airborne = true;
+      f.jumpCooldownMs = JUMP_COOLDOWN_MS;
+      playSound("jump", 0.15);
+    }
+  }
+  // the champion re-decides duck every step, exactly like a training runner
+  d.ai.fly.ducking = false;
+
+  // vision: world WITHOUT avatars → shared retina (the fly can't see you)
+  drawWorld(art.gameCtx, w);
+  art.retinaCtx.drawImage(art.game, 0, 0, RETINA_W, RETINA_H);
+  const img = art.retinaCtx.getImageData(0, 0, RETINA_W, RETINA_H);
+  const input = retinaFromImageData(
+    img.data,
+    RETINA_W,
+    RETINA_H,
+    RETINA_COLS,
+    RETINA_ROWS,
+    false
+  );
+
+  // champion brain — usual dopamine during duels (obstacle clear +0.4,
+  // crash −0.3 further down), so every duel is extra lifetime learning
+  if (d.ai.alive) {
+    const delta = cleared.length > 0 ? REWARD_CLEAR : 0;
+    const m = d.ai.brain.step(input, delta);
+    const f = d.ai.fly;
+    if (!f.airborne && f.jumpCooldownMs <= 0 && m[0] > JUMP_THRESHOLD) {
+      f.vy = -JUMP_V;
+      f.airborne = true;
+      f.jumpCooldownMs = JUMP_COOLDOWN_MS;
+    }
+    if (m[1] > DUCK_THRESHOLD) f.ducking = true;
+  }
+
+  // independent collisions — each avatar dies on its own
+  if (d.human.alive && hitObstacle(w, d.human.fly)) {
+    d.human.alive = false;
+    d.human.deathScore = w.score;
+    if (d.firstDeathT === null) d.firstDeathT = w.t;
+    playSound("crash", 0.25);
+  }
+  if (d.ai.alive && hitObstacle(w, d.ai.fly)) {
+    d.ai.alive = false;
+    d.ai.deathScore = w.score;
+    if (d.firstDeathT === null) d.firstDeathT = w.t;
+    d.ai.brain.step(input, -PUNISH_CRASH); // death shock, same as training
+    playSound("crash", 0.25);
+  }
+
+  // end conditions: both dead, or the survivor's 30s cap is up
+  if (!d.human.alive && !d.ai.alive) {
+    finishDuel(d, s);
+  } else if (
+    d.firstDeathT !== null &&
+    w.t - d.firstDeathT >= DUEL_SURVIVOR_CAP_S
+  ) {
+    if (d.human.alive) {
+      d.human.alive = false;
+      d.human.deathScore = w.score;
+    }
+    if (d.ai.alive) {
+      d.ai.alive = false;
+      d.ai.deathScore = w.score;
+    }
+    finishDuel(d, s);
+  }
+}
+
+function drawDuelMarker(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  color: string
+): void {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.ellipse(x, GROUND_Y + 3.5, 10, 2.2, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function renderDuel(
+  canvas: HTMLCanvasElement,
+  game: HTMLCanvasElement,
+  d: DuelSim,
+  tNow: number
+): void {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (canvas.width > 0 && canvas.height > 0) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(game, 0, 0, GAME_W, GAME_H, 0, 0, canvas.width, canvas.height);
+  }
+  const sx = canvas.width / GAME_W;
+  const sy = canvas.height / GAME_H;
+  ctx.setTransform(sx, 0, 0, sy, 0, 0);
+
+  // champion FLY — emerald ring + halo, drawn first, slightly ghosted
+  if (d.ai.alive) {
+    drawDuelMarker(ctx, DUEL_FLY_X, "rgba(52,211,153,0.7)");
+    drawFly(ctx, {
+      x: DUEL_FLY_X,
+      feetY: d.ai.fly.y,
+      airborne: d.ai.fly.airborne,
+      ducking: d.ai.fly.ducking,
+      wingPhase: d.ai.fly.wingPhase,
+      alpha: 0.82,
+      isBest: true,
+      label: "FLY",
+      ringColor: DUEL_FLY_RING,
+      labelColor: DUEL_FLY_LABEL,
+      t: tNow,
+    });
+  }
+  // HUMAN — amber ring + halo, full opacity, drawn on top
+  if (d.human.alive) {
+    drawDuelMarker(ctx, DUEL_HUMAN_X, "rgba(251,191,36,0.8)");
+    drawFly(ctx, {
+      x: DUEL_HUMAN_X,
+      feetY: d.human.fly.y,
+      airborne: d.human.fly.airborne,
+      ducking: d.human.fly.ducking,
+      wingPhase: d.human.fly.wingPhase,
+      alpha: 1,
+      isBest: true,
+      label: "YOU",
+      ringColor: DUEL_HUMAN_RING,
+      labelColor: DUEL_HUMAN_LABEL,
+      t: tNow,
+    });
+  }
+}
+
 /** One 60Hz simulation step: world → vision → brains → action → collisions. */
 function stepSim(
   sim: Sim,
@@ -325,24 +603,10 @@ function stepSim(
   const w = sim.world;
   const cleared = stepWorld(w, dt);
 
-  // fly avatar physics
+  // fly avatar physics (shared with the duel — same helper, no drift)
   for (const r of sim.runners) {
-    const f = r.fly;
-    f.wingPhase += dt * 36;
-    if (f.jumpCooldownMs > 0) {
-      f.jumpCooldownMs = Math.max(0, f.jumpCooldownMs - dt * 1000);
-    }
-    if (f.airborne) {
-      // duck input while airborne = fast fall, like the real game
-      f.vy += GRAVITY * (f.ducking ? 2.6 : 1) * dt;
-      f.y += f.vy * dt;
-      if (f.y >= GROUND_Y) {
-        f.y = GROUND_Y;
-        f.vy = 0;
-        f.airborne = false;
-      }
-    }
-    f.ducking = false; // re-decided by the brain every step
+    stepAvatarPhysics(r.fly, dt);
+    r.fly.ducking = false; // re-decided by the brain every step
   }
 
   // vision: world without flies → 240×90 → 24×9 retina (shared input)
@@ -490,6 +754,9 @@ export function DinoTrainer() {
   const [history, setHistory] = useState<GenStat[]>([]);
   const [panelBrain, setPanelBrain] = useState<FlyBrain | null>(null);
   const [hasBest, setHasBest] = useState(false);
+  // --- duel mode state (the duel itself lives in duelRef, React only mirrors) ---
+  const [duelActive, setDuelActive] = useState(false);
+  const [duelHud, setDuelHud] = useState<DuelHud | null>(null);
   const [resume, setResume] = useState<{
     gen: number;
     best: number;
@@ -506,6 +773,8 @@ export function DinoTrainer() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const simRef = useRef<Sim | null>(null);
   const artRef = useRef<Art | null>(null);
+  /** active duel (null = normal population training) */
+  const duelRef = useRef<DuelSim | null>(null);
 
   useEffect(() => {
     runningRef.current = running;
@@ -548,10 +817,32 @@ export function DinoTrainer() {
     setFeed(s.events.slice(-8).reverse());
     setHistory(s.history.slice());
     setHasBest(Boolean(s.bestBrain));
+    // duel slice (null when not dueling — Object.is-stable, no re-render churn)
+    const d = duelRef.current;
+    if (d) {
+      setDuelHud({
+        you: d.human.alive ? d.world.score : d.human.deathScore,
+        fly: d.ai.alive ? d.world.score : d.ai.deathScore,
+        youAlive: d.human.alive,
+        flyAlive: d.ai.alive,
+        youAir: d.human.fly.airborne,
+        score: d.world.score,
+        speed: d.world.speed,
+        ended: d.ended,
+        result: d.result,
+        wins: s.duelWins,
+        losses: s.duelLosses,
+        best: s.duelBest,
+      });
+    } else {
+      setDuelHud(null);
+    }
     setPanelBrain((prev) => {
-      const next = s.watchMode
-        ? (s.runners[0]?.brain ?? null)
-        : bestAliveBrain(s);
+      const next = d
+        ? d.ai.brain // duel: the champion's live brain
+        : s.watchMode
+          ? (s.runners[0]?.brain ?? null)
+          : bestAliveBrain(s);
       return next === prev ? prev : next;
     });
   }, []);
@@ -585,6 +876,9 @@ export function DinoTrainer() {
       genBirdDeaths: 0,
       genCactusDeaths: 0,
       genTimeoutDeaths: 0,
+      duelWins: 0,
+      duelLosses: 0,
+      duelBest: 0,
     };
     simRef.current = sim;
     drawWorld(art.gameCtx, sim.world); // first paint so pause view isn't blank
@@ -600,7 +894,23 @@ export function DinoTrainer() {
       last = ts;
       const s = simRef.current;
       if (!s) return;
-      if (runningRef.current) {
+      const duel = duelRef.current;
+      if (duel) {
+        // duel mode: training is parked; the race always runs at real time
+        // (a human is playing — turbo would be cheating)
+        if (!duel.ended) {
+          acc += dt;
+          let n = 0;
+          while (acc >= STEP_DT && n < MAX_STEPS_PER_FRAME) {
+            stepDuel(duel, art, s, STEP_DT);
+            acc -= STEP_DT;
+            n += 1;
+          }
+          if (acc > 0.2) acc = 0.2;
+        } else {
+          acc = 0;
+        }
+      } else if (runningRef.current) {
         acc += dt * turboRef.current;
         let n = 0;
         // crash/jump sounds only in real time (turbo ×1) — no audio spam at ×10
@@ -620,7 +930,10 @@ export function DinoTrainer() {
         if (acc > 0.2) acc = 0.2; // never spiral after a long stall
       }
       const canvas = canvasRef.current;
-      if (canvas) renderVisible(canvas, art.game, s, ts / 1000);
+      if (canvas) {
+        if (duel) renderDuel(canvas, art.game, duel, ts / 1000);
+        else renderVisible(canvas, art.game, s, ts / 1000);
+      }
       if (ts - lastFlush >= 250) {
         lastFlush = ts;
         flush(s);
@@ -651,6 +964,55 @@ export function DinoTrainer() {
     ro.observe(wrap);
     return () => ro.disconnect();
   }, []);
+
+  // --- duel keyboard: window listeners active ONLY while dueling ----------
+  useEffect(() => {
+    if (!duelActive) return;
+    const isEditable = (t: EventTarget | null): boolean => {
+      const el = t as HTMLElement | null;
+      return (
+        !!el &&
+        typeof el.tagName === "string" &&
+        (el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.isContentEditable === true)
+      );
+    };
+    const down = (e: KeyboardEvent) => {
+      if (isEditable(e.target)) return; // never steal typing
+      const k = e.key;
+      if (k === "ArrowUp" || k === " " || k === "w" || k === "W") {
+        e.preventDefault(); // stop page scroll
+        if (e.repeat) return; // ignore held-key repeats
+        const d = duelRef.current;
+        if (d && !d.ended) d.jumpQueued = true;
+      } else if (k === "ArrowDown" || k === "s" || k === "S") {
+        e.preventDefault();
+        const d = duelRef.current;
+        if (d) d.duckHeld = true;
+      }
+    };
+    const up = (e: KeyboardEvent) => {
+      const k = e.key;
+      if (k === "ArrowDown" || k === "s" || k === "S") {
+        const d = duelRef.current;
+        if (d) d.duckHeld = false;
+      }
+    };
+    const blur = () => {
+      // alt-tab mid-duck would otherwise stick the key down forever
+      const d = duelRef.current;
+      if (d) d.duckHeld = false;
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", blur);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", blur);
+    };
+  }, [duelActive]);
 
   // --- adopt a snapshot (library load / session resume) ---------------------
   const adoptSnapshot = useCallback(
@@ -744,10 +1106,10 @@ export function DinoTrainer() {
   const toggleWatchMode = (on: boolean) => {
     const s = simRef.current;
     if (!s) return;
+    setWatchBest(on); // keep the controlled switch in sync with sim.watchMode
     if (on) {
       if (!s.bestBrain) {
         toast.error("No best brain yet — let at least one generation finish.");
-        setWatchBest(false);
         return;
       }
       s.savedRunners = s.runners;
@@ -776,6 +1138,54 @@ export function DinoTrainer() {
       s.world = freshWorld(s);
     }
     flush(s);
+  };
+
+  // --- duel mode: enter / rematch / exit --------------------------------------
+  const enterDuel = () => {
+    const s = simRef.current;
+    if (!s) return;
+    if (!s.bestBrain) {
+      toast.error("No champion yet — let at least one generation finish.");
+      return;
+    }
+    playSound("click");
+    if (s.watchMode) {
+      // leave watch-best first so the parked population comes back
+      toggleWatchMode(false);
+    }
+    duelRef.current = createDuel(s);
+    setDuelActive(true);
+    flush(s);
+    toast.info("Duel — same world, two avatars. ↑ / Space jump · ↓ duck");
+  };
+
+  const rematchDuel = () => {
+    const s = simRef.current;
+    if (!s) return;
+    playSound("click");
+    // fresh world + avatars; the champion keeps what it learned last duel
+    duelRef.current = createDuel(s);
+    flush(s);
+  };
+
+  const exitDuel = () => {
+    const s = simRef.current;
+    const d = duelRef.current;
+    playSound("click");
+    if (s && d) {
+      // fold the champion's lifetime dopamine back in, even on early exit
+      s.bestBrain = d.ai.brain.clone();
+    }
+    duelRef.current = null;
+    setDuelActive(false);
+    setDuelHud(null);
+    if (s) {
+      // restore the training view even if training is paused (stale duel
+      // frame would otherwise linger on the offscreen canvas)
+      const art = artRef.current;
+      if (art) drawWorld(art.gameCtx, s.world);
+      flush(s);
+    }
   };
 
   const resetPopulation = () => {
@@ -923,73 +1333,134 @@ export function DinoTrainer() {
                   ref={canvasRef}
                   className="block w-full bg-[#14110d]"
                   style={{ aspectRatio: "480 / 140" }}
-                  aria-label="Dino runner game view — population of flies"
+                  aria-label={
+                    duelActive
+                      ? "Duel game view — you versus the champion fly"
+                      : "Dino runner game view — population of flies"
+                  }
                   role="img"
                 />
 
                 {/* HUD overlay */}
                 <div className="pointer-events-none absolute inset-0 flex flex-col justify-between p-2.5 sm:p-3">
                   <div className="flex items-start justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <Badge className="border-border/60 bg-black/50 font-mono text-[10px] backdrop-blur-sm sm:text-xs">
-                        GEN {hud.gen}
-                      </Badge>
-                      <Badge className="gap-1 border-border/60 bg-black/50 font-mono text-[10px] backdrop-blur-sm sm:text-xs">
-                        <Users className="h-3 w-3" aria-hidden />
-                        {hud.alive}/{hud.total} alive
-                      </Badge>
-                      {hud.watch && (
-                        <Badge className="border-amber-500/40 bg-amber-500/20 font-mono text-[10px] text-amber-200 backdrop-blur-sm sm:text-xs">
-                          WATCHING BEST
-                        </Badge>
-                      )}
-                      {birdPractice && (
-                        <Badge className="gap-1 border-amber-500/40 bg-amber-500/20 font-mono text-[10px] text-amber-200 backdrop-blur-sm sm:text-xs">
-                          <Bird className="h-3 w-3" aria-hidden />
-                          BIRD PRACTICE
-                        </Badge>
-                      )}
-                      {(hud.birdDeaths > 0 || hud.cactusDeaths > 0) && (
-                        <Badge
-                          className="gap-1.5 border-border/60 bg-black/50 font-mono text-[10px] tabular-nums backdrop-blur-sm sm:text-xs"
-                          aria-label={`This generation: ${hud.birdDeaths} bird deaths, ${hud.cactusDeaths} cactus deaths`}
-                        >
-                          <span className="flex items-center gap-1 text-rose-300">
-                            <Bird className="h-3 w-3" aria-hidden />
-                            {hud.birdDeaths}
-                          </span>
-                          <span className="text-muted-foreground/50" aria-hidden>
-                            ·
-                          </span>
-                          <span className="flex items-center gap-1 text-emerald-300">
-                            <Sprout className="h-3 w-3" aria-hidden />
-                            {hud.cactusDeaths}
-                          </span>
-                          <span className="sr-only">deaths this gen (bird · cactus)</span>
-                        </Badge>
+                    <div
+                      className="flex flex-wrap items-center gap-1.5"
+                      data-testid={duelActive ? "duel-hud" : undefined}
+                      data-duel={
+                        duelHud
+                          ? `you:${duelHud.you}|fly:${duelHud.fly}|youAlive:${duelHud.youAlive ? 1 : 0}|flyAlive:${duelHud.flyAlive ? 1 : 0}|youAir:${duelHud.youAir ? 1 : 0}|ended:${duelHud.ended ? 1 : 0}${duelHud.result ? `|winner:${duelHud.result.winner}` : ""}`
+                          : undefined
+                      }
+                    >
+                      {duelHud ? (
+                        <>
+                          <Badge className="gap-1 border-amber-400/40 bg-amber-500/15 font-mono text-[10px] tabular-nums text-amber-200 backdrop-blur-sm sm:text-xs">
+                            <span aria-hidden>YOU</span>
+                            <span className="sr-only">your score:</span>
+                            {duelHud.you}
+                            {!duelHud.youAlive && (
+                              <span className="text-rose-300" title="crashed">
+                                ✕
+                              </span>
+                            )}
+                          </Badge>
+                          <Badge className="gap-1 border-emerald-400/40 bg-emerald-500/15 font-mono text-[10px] tabular-nums text-emerald-200 backdrop-blur-sm sm:text-xs">
+                            <span aria-hidden>FLY</span>
+                            <span className="sr-only">fly score:</span>
+                            {duelHud.fly}
+                            {!duelHud.flyAlive && (
+                              <span className="text-rose-300" title="crashed">
+                                ✕
+                              </span>
+                            )}
+                          </Badge>
+                          <Badge className="border-border/60 bg-black/50 font-mono text-[10px] tabular-nums backdrop-blur-sm sm:text-xs">
+                            You {duelHud.wins} · Fly {duelHud.losses}
+                          </Badge>
+                          <Badge className="border-border/60 bg-black/50 font-mono text-[10px] tabular-nums backdrop-blur-sm sm:text-xs">
+                            BEST {duelHud.best}
+                          </Badge>
+                        </>
+                      ) : (
+                        <>
+                          <Badge className="border-border/60 bg-black/50 font-mono text-[10px] backdrop-blur-sm sm:text-xs">
+                            GEN {hud.gen}
+                          </Badge>
+                          <Badge className="gap-1 border-border/60 bg-black/50 font-mono text-[10px] backdrop-blur-sm sm:text-xs">
+                            <Users className="h-3 w-3" aria-hidden />
+                            {hud.alive}/{hud.total} alive
+                          </Badge>
+                          {hud.watch && (
+                            <Badge className="border-amber-500/40 bg-amber-500/20 font-mono text-[10px] text-amber-200 backdrop-blur-sm sm:text-xs">
+                              WATCHING BEST
+                            </Badge>
+                          )}
+                          {birdPractice && (
+                            <Badge className="gap-1 border-amber-500/40 bg-amber-500/20 font-mono text-[10px] text-amber-200 backdrop-blur-sm sm:text-xs">
+                              <Bird className="h-3 w-3" aria-hidden />
+                              BIRD PRACTICE
+                            </Badge>
+                          )}
+                          {(hud.birdDeaths > 0 || hud.cactusDeaths > 0) && (
+                            <Badge
+                              className="gap-1.5 border-border/60 bg-black/50 font-mono text-[10px] tabular-nums backdrop-blur-sm sm:text-xs"
+                              aria-label={`This generation: ${hud.birdDeaths} bird deaths, ${hud.cactusDeaths} cactus deaths`}
+                            >
+                              <span className="flex items-center gap-1 text-rose-300">
+                                <Bird className="h-3 w-3" aria-hidden />
+                                {hud.birdDeaths}
+                              </span>
+                              <span className="text-muted-foreground/50" aria-hidden>
+                                ·
+                              </span>
+                              <span className="flex items-center gap-1 text-emerald-300">
+                                <Sprout className="h-3 w-3" aria-hidden />
+                                {hud.cactusDeaths}
+                              </span>
+                              <span className="sr-only">deaths this gen (bird · cactus)</span>
+                            </Badge>
+                          )}
+                        </>
                       )}
                     </div>
                     <div className="text-right leading-none">
                       <div className="font-mono text-lg font-bold tabular-nums text-amber-200 [text-shadow:0_0_12px_rgba(245,158,11,0.35)] sm:text-2xl">
-                        {String(hud.score).padStart(5, "0")}
+                        {String(duelHud ? duelHud.score : hud.score).padStart(5, "0")}
                       </div>
                       <div className="mt-1 font-mono text-[10px] tabular-nums text-muted-foreground sm:text-xs">
-                        HI {String(Math.max(hud.best, hud.score)).padStart(5, "0")}
+                        {duelHud
+                          ? `DUEL BEST ${String(duelHud.best).padStart(5, "0")}`
+                          : `HI ${String(Math.max(hud.best, hud.score)).padStart(5, "0")}`}
                       </div>
                     </div>
                   </div>
                   <div className="flex items-center justify-between">
                     <Badge className="border-border/60 bg-black/50 font-mono text-[10px] tabular-nums backdrop-blur-sm">
-                      SPD {(hud.speed / BASE_SPEED).toFixed(1)}×
+                      SPD {((duelHud ? duelHud.speed : hud.speed) / BASE_SPEED).toFixed(1)}×
                     </Badge>
-                    <span className="font-mono text-[9px] text-muted-foreground/80 sm:text-[10px]">
-                      retina 24×9 · {hud.total} brains
-                    </span>
+                    {duelHud ? (
+                      <span className="flex items-center gap-1.5 font-mono text-[9px] text-muted-foreground sm:text-[10px]">
+                        <kbd className="inline-flex h-4 min-w-4 items-center justify-center rounded border border-border/80 bg-black/50 px-1 text-[9px] leading-none text-foreground/90">
+                          ↑
+                        </kbd>
+                        <span>jump</span>
+                        <span aria-hidden>·</span>
+                        <kbd className="inline-flex h-4 min-w-4 items-center justify-center rounded border border-border/80 bg-black/50 px-1 text-[9px] leading-none text-foreground/90">
+                          ↓
+                        </kbd>
+                        <span>duck</span>
+                      </span>
+                    ) : (
+                      <span className="font-mono text-[9px] text-muted-foreground/80 sm:text-[10px]">
+                        retina 24×9 · {hud.total} brains
+                      </span>
+                    )}
                   </div>
                 </div>
 
                 {/* start overlay */}
-                {!running && (
+                {!running && !duelActive && (
                   <button
                     type="button"
                     onClick={() => {
@@ -1007,38 +1478,134 @@ export function DinoTrainer() {
                     </span>
                   </button>
                 )}
+
+                {/* duel result overlay */}
+                {duelHud?.ended && duelHud.result && (
+                  <div
+                    role="dialog"
+                    aria-label="Duel result"
+                    data-testid="duel-result"
+                    className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2.5 bg-black/60 p-4 backdrop-blur-[2px]"
+                  >
+                    <Trophy
+                      className={
+                        duelHud.result.winner === "you"
+                          ? "h-8 w-8 text-amber-400"
+                          : "h-8 w-8 text-muted-foreground"
+                      }
+                      aria-hidden
+                    />
+                    <p
+                      className={
+                        duelHud.result.winner === "you"
+                          ? "text-center text-sm font-semibold text-amber-200 sm:text-base"
+                          : "text-center text-sm font-semibold text-foreground/90 sm:text-base"
+                      }
+                    >
+                      {duelHud.result.winner === "you"
+                        ? `🏆 You outsurvived the fly, ${duelHud.result.youScore} vs ${duelHud.result.flyScore}`
+                        : duelHud.result.winner === "fly"
+                          ? `The fly wins this round — ${duelHud.result.flyScore} vs ${duelHud.result.youScore}. Keep training!`
+                          : `Dead heat — ${duelHud.result.youScore} all. Rematch?`}
+                    </p>
+                    <p className="font-mono text-xs tabular-nums text-muted-foreground">
+                      You {duelHud.result.youScore} · Fly {duelHud.result.flyScore} · session {duelHud.wins}–{duelHud.losses}
+                    </p>
+                    <div className="mt-1.5 flex flex-wrap items-center justify-center gap-2">
+                      <Button className="h-11" onClick={rematchDuel}>
+                        <RotateCcw aria-hidden />
+                        Rematch
+                      </Button>
+                      <Button variant="outline" className="h-11" onClick={exitDuel}>
+                        <ArrowLeft aria-hidden />
+                        Back to training
+                      </Button>
+                    </div>
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>
 
-          {/* turbo */}
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
-              <Zap className="h-4 w-4 text-amber-400" aria-hidden />
-              <ToggleGroup
-                type="single"
-                variant="outline"
-                value={String(turbo)}
-                onValueChange={(v) => {
-                  if (v) setTurbo(Number(v));
-                }}
-                aria-label="Turbo speed"
-              >
-                <ToggleGroupItem value="1" className="h-11 min-w-14 font-mono">
-                  ×1
-                </ToggleGroupItem>
-                <ToggleGroupItem value="3" className="h-11 min-w-14 font-mono">
-                  ×3
-                </ToggleGroupItem>
-                <ToggleGroupItem value="10" className="h-11 min-w-14 font-mono">
-                  ×10
-                </ToggleGroupItem>
-              </ToggleGroup>
+          {/* turbo / duel bar */}
+          {duelActive ? (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Swords className="h-4 w-4 text-amber-400" aria-hidden />
+                <Badge
+                  variant="outline"
+                  className="border-amber-500/40 bg-amber-500/10 font-mono text-xs tabular-nums text-amber-200"
+                >
+                  Duel · You {duelHud?.wins ?? 0} · Fly {duelHud?.losses ?? 0}
+                </Badge>
+                <Button
+                  variant="outline"
+                  className="h-11"
+                  onClick={exitDuel}
+                  aria-label="Leave duel mode and return to population training"
+                >
+                  <ArrowLeft aria-hidden />
+                  Back to training
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Duels also train the champion — it still earns sugar and shock.
+              </p>
             </div>
-            <p className="text-xs text-muted-foreground">
-              Turbo runs extra simulation steps per rendered frame.
-            </p>
-          </div>
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-2">
+                  <Zap className="h-4 w-4 text-amber-400" aria-hidden />
+                  <ToggleGroup
+                    type="single"
+                    variant="outline"
+                    value={String(turbo)}
+                    onValueChange={(v) => {
+                      if (v) setTurbo(Number(v));
+                    }}
+                    aria-label="Turbo speed"
+                  >
+                    <ToggleGroupItem value="1" className="h-11 min-w-14 font-mono">
+                      ×1
+                    </ToggleGroupItem>
+                    <ToggleGroupItem value="3" className="h-11 min-w-14 font-mono">
+                      ×3
+                    </ToggleGroupItem>
+                    <ToggleGroupItem value="10" className="h-11 min-w-14 font-mono">
+                      ×10
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+                </div>
+                <UITooltip>
+                  <TooltipTrigger asChild>
+                    {/* span wrapper: browsers fire no pointer events on a
+                        disabled <button>, so the "train a champion first"
+                        tooltip needs a hoverable parent to appear */}
+                    <span className="inline-flex">
+                      <Button
+                        variant="outline"
+                        className="h-11 gap-1.5 border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 hover:text-amber-100"
+                        onClick={enterDuel}
+                        disabled={!hasBest}
+                      >
+                        <Swords aria-hidden />
+                        You vs the fly
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {hasBest
+                      ? "Race the champion brain — same world, same obstacles"
+                      : "Train a champion first, then challenge it"}
+                  </TooltipContent>
+                </UITooltip>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Turbo runs extra simulation steps per rendered frame.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* --- right: instruments --- */}
@@ -1047,10 +1614,12 @@ export function DinoTrainer() {
             <CardHeader className="pb-3">
               <CardTitle className="flex items-center gap-2 text-sm">
                 <Sparkles className="h-4 w-4 text-amber-400" aria-hidden />
-                Best alive fly — live brain
+                {duelActive ? "Champion fly — live brain" : "Best alive fly — live brain"}
               </CardTitle>
               <CardDescription className="text-xs">
-                Retina → optic lobe → mushroom body → motor of the current leader.
+                {duelActive
+                  ? "Retina → optic lobe → mushroom body → motor of the brain you're racing."
+                  : "Retina → optic lobe → mushroom body → motor of the current leader."}
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -1120,6 +1689,7 @@ export function DinoTrainer() {
                     playSound("click");
                     setRunning((r) => !r);
                   }}
+                  disabled={duelActive}
                 >
                   {running ? (
                     <Pause aria-hidden />
@@ -1132,6 +1702,7 @@ export function DinoTrainer() {
                   variant="outline"
                   className="h-11"
                   onClick={resetPopulation}
+                  disabled={duelActive}
                   aria-label="Reset with a new random population"
                 >
                   <RotateCcw aria-hidden />
@@ -1188,6 +1759,7 @@ export function DinoTrainer() {
                   onCheckedChange={toggleWatchMode}
                   className="h-6 w-11"
                   aria-label="Watch best brain replay"
+                  disabled={duelActive}
                 />
               </div>
 
@@ -1206,6 +1778,7 @@ export function DinoTrainer() {
                   onCheckedChange={toggleBirdPractice}
                   className="h-6 w-11"
                   aria-label="Bird practice — spawn birds from score 0"
+                  disabled={duelActive}
                 />
               </div>
             </CardContent>

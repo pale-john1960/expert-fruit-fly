@@ -3,7 +3,7 @@
 /**
  * BrainLab — interactive explorer for the fruit fly brain.
  *
- * Owns a live demo FlyBrain (DEFAULT_ARCH_LAB, 926 neurons, 4 motors).
+ * Owns a live demo FlyBrain (DEFAULT_ARCH_LAB, 928 neurons, 4 motors).
  * - animated visual stimulus fed to the retina at ~30 ticks/sec, drawn into
  *   a "what the fly sees" canvas (24×9): sweep / two bars / sparkle / dark,
  *   plus Bar left (A) / Bar right (B) conditioning stimuli, a looming
@@ -14,7 +14,10 @@
  * - Classical-conditioning demo wizard: 24 automatic A+/B− trials driven
  *   from the SAME rAF tick loop, with a per-trial learning index chart
  * - stats row (ticks, spikes/s, dopamine, rewards/punishments) + motor bars
- * - click neurons in the 3D view to poke them (handled by BrainVisualizer3D)
+ * - click neurons in the 3D view to poke + inspect them — the Neuron
+ *   inspector card shows identity, live activity and the strongest
+ *   outgoing/incoming synapses (plastic weights via the engine's public
+ *   matrices, fixed wiring via getSampleEdges())
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -30,10 +33,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { BrainVisualizer3D } from "./BrainVisualizer3D";
+import { BrainVisualizer3D, REGION_META } from "./BrainVisualizer3D";
 import { BrainActivityPanel } from "./BrainActivityPanel";
 import { FlyBrain } from "@/lib/flybrain/engine";
-import { DEFAULT_ARCH_LAB } from "@/lib/flybrain/types";
+import { DEFAULT_ARCH_LAB, type BrainRegion } from "@/lib/flybrain/types";
 import { playSound } from "@/lib/sound";
 import { cn } from "@/lib/utils";
 import {
@@ -54,9 +57,11 @@ import {
   Eye,
   FlaskConical,
   GraduationCap,
+  Network,
   Pause,
   Play,
   RotateCcw,
+  X,
   Zap,
 } from "lucide-react";
 
@@ -111,6 +116,307 @@ function fmtInt(n: number): string {
 
 function signed(n: number): string {
   return `${n >= 0 ? "+" : "−"}${Math.abs(n).toFixed(2)}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* neuron inspector                                                    */
+/* ------------------------------------------------------------------ */
+
+/** One plain-language line per region — the friendly science story. */
+const REGION_DESC: Record<BrainRegion, string> = {
+  retina: "Light sensor — graded, no spikes.",
+  lamina: "First processing layer — contrast & adaptation.",
+  medulla: "Feature extractor — 8 channels of motion/edge.",
+  lobula: "Spiking pattern detector.",
+  kenyon: "Mushroom body — sparse coincidence detector, where memories form.",
+  mbon: "Mushroom body output — valence (appetitive/aversive) learned via dopamine.",
+  motor: "Output — what the fly does.",
+};
+
+/** custom scrollbar, matching the app's list styling pattern */
+const SCROLLBAR =
+  "[&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border";
+
+/** rows shown in the inspector synapse list (strongest first; a kenyon cell's
+ *  full 12-MBON column fits exactly) */
+const INSP_MAX_ROWS = 12;
+
+interface InspRow {
+  toRegion: BrainRegion;
+  toIdx: number; // index within the target region
+  toGlobal: number;
+  weight: number;
+  plastic: boolean;
+  /** MBON targets only: +1 appetitive / −1 aversive */
+  valence?: number;
+  /** retina → lamina 1:1 identity mapping */
+  identity?: boolean;
+}
+
+interface InspData {
+  rows: InspRow[];
+  direction: "out" | "in";
+  /** candidate count before the strongest-first cut */
+  total: number;
+  /** |weight| of the strongest row (bar scaling) */
+  maxAbs: number;
+  note: string;
+  emptyText?: string;
+}
+
+function fmtW(w: number): string {
+  const a = Math.abs(w);
+  const digits = a >= 0.995 ? 1 : a < 0.01 ? 3 : 2;
+  return `${w >= 0 ? "+" : "−"}${a.toFixed(digits)}`;
+}
+
+function regionIndexOf(
+  brain: FlyBrain,
+  gi: number,
+): { region: BrainRegion; idx: number } | null {
+  for (const rg of brain.regions) {
+    if (gi >= rg.start && gi < rg.start + rg.count) {
+      return { region: rg.region, idx: gi - rg.start };
+    }
+  }
+  return null;
+}
+
+/** Build the inspector's synapse list for one neuron. Called on selection
+ *  change / brain swap / dopamine event — never per tick (getSampleEdges is
+ *  cached in the engine; filtering ~520 edges is trivial).
+ *
+ *  Plastic weights come from the engine's PUBLIC matrices
+ *  (kenyonToMbon / mbonToMotor / lobulaToMotor — index math per the engine
+ *  comments); the fixed wiring (retina→lamina identity, lamina→medulla,
+ *  medulla→lobula, lobula→kenyon) is private and only visible through the
+ *  sampled edges. */
+function buildInspectorRows(brain: FlyBrain, gi: number): InspData | null {
+  const loc = regionIndexOf(brain, gi);
+  if (!loc) return null;
+  const { region, idx } = loc;
+  const s = brain.sizes;
+  const rows: InspRow[] = [];
+  const seen = new Set<number>();
+  const push = (r: InspRow) => {
+    if (seen.has(r.toGlobal)) return;
+    seen.add(r.toGlobal);
+    rows.push(r);
+  };
+  // the visualizer's fixed-wiring sample, filtered to this cell's outputs
+  const sampled: InspRow[] = [];
+  for (const e of brain.getSampleEdges()) {
+    if (e.from !== gi) continue;
+    const t = regionIndexOf(brain, e.to);
+    if (!t) continue;
+    sampled.push({
+      toRegion: t.region,
+      toIdx: t.idx,
+      toGlobal: e.to,
+      weight: e.weight,
+      plastic: e.plastic,
+      valence: t.region === "mbon" ? brain.mbonValence[t.idx] : undefined,
+    });
+  }
+
+  const finalize = (direction: "out" | "in", note: string, emptyText?: string): InspData => {
+    const total = rows.length;
+    rows.sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight));
+    const shown = rows.slice(0, INSP_MAX_ROWS);
+    let maxAbs = 1e-6;
+    for (const r of shown) maxAbs = Math.max(maxAbs, Math.abs(r.weight));
+    return { rows: shown, direction, total, maxAbs, note, emptyText };
+  };
+
+  if (region === "kenyon") {
+    // the full Kenyon→MBON column: all 12 MBONs, plastic (the memory trace)
+    const mb = brain.range("mbon");
+    for (let m = 0; m < s.mbon; m++) {
+      push({
+        toRegion: "mbon",
+        toIdx: m,
+        toGlobal: mb.start + m,
+        weight: brain.kenyonToMbon[m * s.kenyon + idx],
+        plastic: true,
+        valence: brain.mbonValence[m],
+      });
+    }
+    return finalize(
+      "out",
+      "All 12 Kenyon→MBON synapses of this cell (its full column) — plastic, dopamine-gated: sugar and shock rewrite these weights. This is where the fly's memories live.",
+    );
+  }
+  if (region === "mbon") {
+    // its full row of mbonToMotor
+    const mo = brain.range("motor");
+    for (let o = 0; o < s.motor; o++) {
+      push({
+        toRegion: "motor",
+        toIdx: o,
+        toGlobal: mo.start + o,
+        weight: brain.mbonToMotor[o * s.mbon + idx],
+        plastic: true,
+      });
+    }
+    return finalize(
+      "out",
+      "All MBON→motor synapses of this cell — plastic, dopamine-gated. Its valence decides whether the fly approaches or avoids.",
+    );
+  }
+  if (region === "lobula") {
+    // giant-fiber escape reflex (lobula→motor, plastic) + fixed wiring sample
+    const mo = brain.range("motor");
+    for (let o = 0; o < s.motor; o++) {
+      push({
+        toRegion: "motor",
+        toIdx: o,
+        toGlobal: mo.start + o,
+        weight: brain.lobulaToMotor[o * s.lobula + idx],
+        plastic: true,
+      });
+    }
+    for (const r of sampled) push(r);
+    return finalize(
+      "out",
+      "Giant-fiber escape reflex (lobula→motor, plastic — the 2-synapse jump path) plus its fixed wiring into the mushroom body (sampled).",
+    );
+  }
+  if (region === "retina") {
+    // retina→lamina is a clean 1:1 map — deterministic, no sampling needed
+    const la = brain.range("lamina");
+    push({
+      toRegion: "lamina",
+      toIdx: idx,
+      toGlobal: la.start + idx,
+      weight: 1,
+      plastic: false,
+      identity: true,
+    });
+    for (const r of sampled) push(r);
+    return finalize(
+      "out",
+      "Retina→lamina is a 1:1 map: this cell feeds the lamina cell of the same index (weight 1, fixed for life).",
+    );
+  }
+  if (region === "lamina" || region === "medulla") {
+    for (const r of sampled) push(r);
+    return finalize(
+      "out",
+      region === "lamina"
+        ? "Fixed wiring, sampled — the full lamina→medulla fan-out is thousands of connections."
+        : "Fixed wiring, sampled — medulla pools feed the lobula's spiking pattern detectors.",
+      "This cell's exact wiring didn't make it into the 520-edge visual sample — the full fixed wiring lives inside the engine (thousands of edges).",
+    );
+  }
+  if (region === "motor") {
+    // motor neurons have no outgoing synapses → show incoming plastic drives
+    const lo = brain.range("lobula");
+    for (let l = 0; l < s.lobula; l++) {
+      push({
+        toRegion: "lobula",
+        toIdx: l,
+        toGlobal: lo.start + l,
+        weight: brain.lobulaToMotor[idx * s.lobula + l],
+        plastic: true,
+      });
+    }
+    const mb = brain.range("mbon");
+    for (let m = 0; m < s.mbon; m++) {
+      push({
+        toRegion: "mbon",
+        toIdx: m,
+        toGlobal: mb.start + m,
+        weight: brain.mbonToMotor[idx * s.mbon + m],
+        plastic: true,
+        valence: brain.mbonValence[m],
+      });
+    }
+    return finalize(
+      "in",
+      "Motor neurons have no outgoing synapses — they are the output. Shown: the strongest incoming plastic drives, lobula giant-fiber (escape) and MBON valence, both dopamine-gated.",
+    );
+  }
+  return null;
+}
+
+/** region badge that matches the 3D legend colors (REGION_META is shared
+ *  with the visualizer); MBON badges carry their valence */
+function RegionBadge({ region, valence }: { region: BrainRegion; valence?: number }) {
+  const meta = REGION_META[region];
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-muted/30 px-1.5 py-0.5 text-[10px] font-medium text-foreground/90">
+      <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: meta.color }} />
+      {meta.label}
+      {valence != null && (
+        <span className={valence > 0 ? "text-emerald-300" : "text-rose-300"}>
+          {valence > 0 ? "appetitive" : "aversive"}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** one synapse row: target badge + centered-zero weight bar + plasticity chip */
+function InspectorRowView({ row, maxAbs }: { row: InspRow; maxAbs: number }) {
+  const mag = Math.min(1, Math.abs(row.weight) / maxAbs);
+  const pos = row.weight >= 0;
+  return (
+    <div className="rounded-md border border-border/50 bg-muted/20 px-2 py-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex min-w-0 items-center gap-1 text-[11px]">
+          <span
+            className="h-1.5 w-1.5 shrink-0 rounded-full"
+            style={{ background: REGION_META[row.toRegion].color }}
+          />
+          <span className="truncate">{REGION_META[row.toRegion].label}</span>
+          <span className="font-mono text-muted-foreground">#{row.toIdx}</span>
+        </span>
+        <span className="flex shrink-0 items-center gap-1.5">
+          {row.valence != null && (
+            <span
+              className={cn(
+                "text-[9px] font-medium",
+                row.valence > 0 ? "text-emerald-300" : "text-rose-300",
+              )}
+            >
+              {row.valence > 0 ? "▲ appetitive" : "▼ aversive"}
+            </span>
+          )}
+          <span
+            className={cn(
+              "font-mono text-[10px] tabular-nums",
+              pos ? "text-emerald-300" : "text-rose-300",
+            )}
+          >
+            {fmtW(row.weight)}
+          </span>
+        </span>
+      </div>
+      <div className="mt-1 flex items-center gap-2">
+        <div className="relative h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted/70">
+          <div className="absolute inset-y-0 left-1/2 w-px bg-foreground/25" />
+          <div
+            className="absolute inset-y-0 rounded-full"
+            style={{
+              left: pos ? "50%" : `${50 - mag * 50}%`,
+              width: `${Math.max(2, mag * 50)}%`,
+              background: pos ? "#34d399" : "#fb7185",
+            }}
+          />
+        </div>
+        <span
+          className={cn(
+            "shrink-0 rounded border px-1 text-[9px] uppercase tracking-wide",
+            row.plastic
+              ? "border-amber-500/40 text-amber-300"
+              : "border-border/60 text-muted-foreground",
+          )}
+        >
+          {row.identity ? "1:1" : row.plastic ? "plastic ±" : "fixed"}
+        </span>
+      </div>
+    </div>
+  );
 }
 
 function Stat({
@@ -225,6 +531,14 @@ export function BrainLab(_props: BrainLabProps = {}) {
   const [demoHud, setDemoHud] = useState<DemoHud>(DEMO_HUD_IDLE);
   const [demoResult, setDemoResult] = useState<DemoResult | null>(null);
 
+  // ---- neuron inspector (selection lives here; the visualizer renders the
+  //      ring, this card renders the data) ----
+  const [selNeuron, setSelNeuron] = useState<number | null>(null);
+  /** live values for the selected cell, synced at the existing ~11 Hz cadence */
+  const [selLive, setSelLive] = useState<{ rate: number; spiked: boolean } | null>(null);
+  /** increment → the visualizer pokes the selected neuron (click-identical) */
+  const [pokeNonce, setPokeNonce] = useState(0);
+
   // ---- sim state that must NOT trigger re-renders (refs) ----
   const brainRef = useRef<FlyBrain>(brain);
   const runningRef = useRef(true);
@@ -251,6 +565,17 @@ export function BrainLab(_props: BrainLabProps = {}) {
   /** the user's stimulus selection before the wizard took over the projector */
   const demoPrevPatternRef = useRef<Pattern | null>(null);
   const demoRunsRef = useRef(0);
+
+  // ---- neuron inspector runtime (refs; UI syncs at the existing ~11 Hz) ----
+  const selRef = useRef<number | null>(null);
+  /** show the SPIKED chip until this timestamp (spike flags last 1 tick) */
+  const selSpikeUntilRef = useRef(0);
+
+  // keep the loop's view of the selection current (live data resets happen
+  // in the event handlers below — never setState inside this effect)
+  useEffect(() => {
+    selRef.current = selNeuron;
+  }, [selNeuron]);
 
   // ---- demo wizard control ----
   const startDemo = useCallback(() => {
@@ -337,6 +662,31 @@ export function BrainLab(_props: BrainLabProps = {}) {
   const giveShock = useCallback(() => {
     pendingDaRef.current = -1;
     playSound("shock");
+  }, []);
+
+  // ---- neuron inspector controls ----
+  const handleNeuronSelect = useCallback(
+    (gi: number | null) => {
+      setSelNeuron(gi);
+      // a fresh cell never inherits the previous cell's SPIKED chip
+      selSpikeUntilRef.current = 0;
+      setSelLive(gi == null ? null : { rate: brain.rates[gi] ?? 0, spiked: false });
+    },
+    [brain],
+  );
+
+  const pokeSelected = useCallback(() => {
+    // the visualizer performs the poke (current + pop) via pokeNonce — the
+    // exact same path as clicking the neuron in the 3D view
+    playSound("click", 0.5);
+    setPokeNonce((n) => n + 1);
+  }, []);
+
+  const clearSelection = useCallback(() => {
+    playSound("click", 0.4);
+    selSpikeUntilRef.current = 0;
+    setSelNeuron(null);
+    setSelLive(null);
   }, []);
 
   // ---- simulation loop: rAF accumulator at TICK_RATE ----
@@ -546,6 +896,12 @@ export function BrainLab(_props: BrainLabProps = {}) {
       let sum = 0;
       for (let i = 0; i < brain.spiked.length; i++) sum += brain.spiked[i];
       spikeEmaRef.current = spikeEmaRef.current * 0.9 + sum * 0.1;
+      // hold the inspected cell's SPIKED chip briefly so the ~11 Hz UI sync
+      // can never miss a 1-tick spike flag
+      const selTick = selRef.current;
+      if (selTick != null && brain.spiked[selTick]) {
+        selSpikeUntilRef.current = performance.now() + 300;
+      }
       demoPost();
     };
 
@@ -577,6 +933,14 @@ export function BrainLab(_props: BrainLabProps = {}) {
           punishments: brain.punishments,
         });
         setMotors(Array.from(brain.motorRates));
+        // neuron inspector live values ride the same cadence (never per frame)
+        const selUi = selRef.current;
+        if (selUi != null) {
+          setSelLive({
+            rate: brain.rates[selUi] ?? 0,
+            spiked: performance.now() < selSpikeUntilRef.current,
+          });
+        }
         // demo HUD joins the existing ~11 Hz UI cadence (no extra renders)
         const d = demoRef.current;
         if (d.running) {
@@ -734,6 +1098,28 @@ export function BrainLab(_props: BrainLabProps = {}) {
     );
   }, [demoResult]);
 
+  // ---- neuron inspector: identity + synapse rows. Recomputed on selection
+  //      change / brain swap / dopamine event (learning rewrites the plastic
+  //      weights, so the snapshot must refresh then) — never per tick. ----
+  const daEvents = ui.rewards + ui.punishments;
+  const selInfo = useMemo(() => {
+    if (selNeuron == null) return null;
+    const loc = regionIndexOf(brain, selNeuron);
+    if (!loc) return null;
+    const data = buildInspectorRows(brain, selNeuron);
+    if (!data) return null;
+    return {
+      region: loc.region,
+      idx: loc.idx,
+      gi: selNeuron,
+      valence: loc.region === "mbon" ? brain.mbonValence[loc.idx] : undefined,
+      ...data,
+    };
+    // daEvents (total reward+punishment count) is a deliberate extra dep: it
+    // re-triggers this enumeration after every dopamine event, because plastic
+    // weights changed — never per tick.
+  }, [selNeuron, brain, daEvents]);
+
   const demoRunning = demoHud.status === "running";
   const phaseDot =
     demoHud.phase === "pause"
@@ -790,6 +1176,9 @@ export function BrainLab(_props: BrainLabProps = {}) {
             height="clamp(360px, 52vh, 500px)"
             autoRotate={autoRotate}
             showSynapses={showSynapses}
+            onNeuronSelect={handleNeuronSelect}
+            selectedNeuron={selNeuron}
+            pokeNonce={pokeNonce}
           />
 
           <Card className="gap-4 rounded-xl p-4">
@@ -1027,6 +1416,135 @@ export function BrainLab(_props: BrainLabProps = {}) {
                   Run again (same brain)
                 </Button>
               </>
+            )}
+          </Card>
+
+          {/* neuron inspector */}
+          <Card className="gap-4 rounded-xl p-4" data-testid="neuron-inspector">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Network className="h-4 w-4 text-primary" />
+                Neuron inspector
+              </div>
+              {selInfo && (
+                <Badge variant="outline" className="shrink-0 text-[10px] text-muted-foreground">
+                  live
+                </Badge>
+              )}
+            </div>
+
+            {!selInfo ? (
+              <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-border/60 bg-muted/20 px-3 py-5 text-center">
+                <Network className="h-6 w-6 text-muted-foreground/60" />
+                <p className="text-xs text-muted-foreground">
+                  Click a neuron in the 3D brain to inspect it.
+                </p>
+                <p className="text-[10px] leading-snug text-muted-foreground/70">
+                  You&apos;ll see what the cell is, what it connects to, and its live
+                  activity. Click empty space to deselect.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {/* identity */}
+                <div className="space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <RegionBadge region={selInfo.region} valence={selInfo.valence} />
+                    <span className="font-mono text-xs text-foreground">
+                      cell #{selInfo.idx}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      · global #{selInfo.gi} of {brain.total}
+                    </span>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">
+                    {REGION_DESC[selInfo.region]}
+                  </p>
+                </div>
+
+                {/* live activity */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Activity</span>
+                    <span className="flex items-center gap-1.5">
+                      {selLive?.spiked && (
+                        <span
+                          className="rounded border border-amber-500/50 bg-amber-500/15 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-amber-300"
+                          data-testid="insp-spiked"
+                        >
+                          ⚡ spiked
+                        </span>
+                      )}
+                      <span className="font-mono tabular-nums" data-testid="insp-rate-val">
+                        {Math.round((selLive?.rate ?? 0) * 100)}%
+                      </span>
+                    </span>
+                  </div>
+                  <div className="h-2.5 overflow-hidden rounded-full bg-muted/70">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-emerald-300 transition-[width] duration-100 ease-linear"
+                      data-testid="insp-rate"
+                      style={{
+                        width: `${Math.max(1.5, Math.min(100, (selLive?.rate ?? 0) * 100))}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {/* synapses */}
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs text-muted-foreground">
+                      {selInfo.direction === "in" ? "Incoming synapses" : "Outgoing synapses"}{" "}
+                      · strongest first
+                    </span>
+                    <Badge
+                      variant="outline"
+                      className="shrink-0 text-[10px] text-muted-foreground"
+                    >
+                      {selInfo.rows.length} of {selInfo.total}
+                    </Badge>
+                  </div>
+                  {selInfo.rows.length === 0 ? (
+                    <p className="rounded-md border border-dashed border-border/60 bg-muted/20 px-2.5 py-3 text-[11px] leading-relaxed text-muted-foreground">
+                      {selInfo.emptyText}
+                    </p>
+                  ) : (
+                    <div
+                      className={cn("max-h-72 space-y-1 overflow-y-auto pr-1", SCROLLBAR)}
+                      data-testid="insp-synapses"
+                    >
+                      {selInfo.rows.map((r) => (
+                        <InspectorRowView key={r.toGlobal} row={r} maxAbs={selInfo.maxAbs} />
+                      ))}
+                    </div>
+                  )}
+                  <p className="text-[10px] leading-snug text-muted-foreground">
+                    {selInfo.note}
+                  </p>
+                </div>
+
+                {/* actions */}
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    className="h-11 gap-1.5 border-amber-500/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25"
+                    onClick={pokeSelected}
+                    data-testid="btn-insp-poke"
+                  >
+                    <Zap className="h-4 w-4" />
+                    Poke +2.0
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="h-11 gap-1.5"
+                    onClick={clearSelection}
+                    data-testid="btn-insp-clear"
+                  >
+                    <X className="h-4 w-4" />
+                    Clear
+                  </Button>
+                </div>
+              </div>
             )}
           </Card>
 

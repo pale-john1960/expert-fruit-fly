@@ -41,6 +41,7 @@ export const REWARD_CLEAR = 0.4; // sugar
 export const PUNISH_CRASH = 0.3; // shock
 export const JUMP_COOLDOWN_MS = 500; // game-time
 export const GEN_TIME_CAP_S = 180; // 3 min hard cap per generation
+export const DUEL_SURVIVOR_CAP_S = 30; // duel: once one avatar dies, the other gets this long to run up its score
 
 // fly silhouette (visual + forgiving hitbox heights)
 export const STAND_BOX_H = 21;
@@ -169,6 +170,27 @@ export function freshFly(): FlyAvatar {
     jumpCooldownMs: 0,
     wingPhase: Math.random() * Math.PI * 2,
   };
+}
+
+/** Shared avatar physics for one sim step: wing flutter, jump-cooldown
+ *  tick, gravity (ducking while airborne = fast fall) and ground landing.
+ *  Used by BOTH the population trainer and the human-vs-fly duel so the
+ *  two modes can never drift apart. */
+export function stepAvatarPhysics(f: FlyAvatar, dt: number): void {
+  f.wingPhase += dt * 36;
+  if (f.jumpCooldownMs > 0) {
+    f.jumpCooldownMs = Math.max(0, f.jumpCooldownMs - dt * 1000);
+  }
+  if (f.airborne) {
+    // duck input while airborne = fast fall, like the real game
+    f.vy += GRAVITY * (f.ducking ? 2.6 : 1) * dt;
+    f.y += f.vy * dt;
+    if (f.y >= GROUND_Y) {
+      f.y = GROUND_Y;
+      f.vy = 0;
+      f.airborne = false;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +515,11 @@ export interface FlyDrawOpts {
   isBest: boolean;
   label?: string;
   t: number;
+  /** override the marker ring color (default: champion emerald) — used by
+   *  the duel mode to tint the HUMAN avatar amber */
+  ringColor?: string;
+  /** override the marker label color (default: champion emerald) */
+  labelColor?: string;
 }
 
 /**
@@ -605,9 +632,9 @@ export function drawFly(ctx: CanvasRenderingContext2D, o: FlyDrawOpts): void {
   ctx.lineTo(x + 8.5, headY - 6.3);
   ctx.stroke();
 
-  // best-fly marker ring + label
+  // best-fly marker ring + label (colors overridable — duel avatars)
   if (o.isBest) {
-    ctx.strokeStyle = "rgba(52,211,153,0.9)";
+    ctx.strokeStyle = o.ringColor ?? "rgba(52,211,153,0.9)";
     ctx.lineWidth = 1;
     ctx.setLineDash([3, 2.5]);
     ctx.beginPath();
@@ -615,7 +642,7 @@ export function drawFly(ctx: CanvasRenderingContext2D, o: FlyDrawOpts): void {
     ctx.stroke();
     ctx.setLineDash([]);
     if (o.label) {
-      ctx.fillStyle = "#34d399";
+      ctx.fillStyle = o.labelColor ?? "#34d399";
       ctx.font = "bold 6px ui-monospace, SFMono-Regular, monospace";
       ctx.textAlign = "center";
       ctx.fillText(o.label, x, y - (duck ? 20 : 27));

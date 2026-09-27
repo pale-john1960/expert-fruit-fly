@@ -230,6 +230,15 @@ const PILL_SPRING = {
   damping: 32,
 } as const;
 
+/** Tiny keyboard-key chip used in the footer shortcut hints. */
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd className="rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium text-foreground/80">
+      {children}
+    </kbd>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
@@ -242,6 +251,35 @@ export default function Home() {
 
   useEffect(() => {
     hydrateSoundMuted();
+  }, []);
+
+  // ---- keyboard shortcuts: 1–5 switch rooms, M toggles sound ------------
+  // (digits never collide with the Dino duel's arrow/space controls; typing
+  // in inputs and modifier combos are ignored)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      )
+        return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key >= "1" && e.key <= "5") {
+        const next = TABS[Number(e.key) - 1];
+        if (next) {
+          setTab(next.value);
+          playSound("click");
+        }
+      } else if (e.key === "m" || e.key === "M") {
+        toggleSoundMuted();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   const handleSoundToggle = () => {
@@ -411,11 +449,12 @@ export default function Home() {
               Explore
             </h2>
             <div className="flex flex-wrap gap-1.5">
-              {TABS.map(({ value, label, Icon, hover }) => (
+              {TABS.map(({ value, label, Icon, hover }, i) => (
                 <button
                   key={value}
                   type="button"
                   onClick={() => setTab(value)}
+                  title={`Press ${i + 1}`}
                   className={cn(
                     "inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
                     hover,
@@ -423,9 +462,15 @@ export default function Home() {
                 >
                   <Icon className="h-3.5 w-3.5" />
                   {label}
+                  <span className="rounded border border-border/60 px-1 font-mono text-[10px] text-muted-foreground/70">
+                    {i + 1}
+                  </span>
                 </button>
               ))}
             </div>
+            <p className="flex items-center gap-1.5 leading-relaxed">
+              <Kbd>1</Kbd>–<Kbd>5</Kbd> switch rooms · <Kbd>M</Kbd> sound
+            </p>
           </nav>
 
           {/* Credits */}

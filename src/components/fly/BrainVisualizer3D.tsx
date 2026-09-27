@@ -41,6 +41,16 @@ export interface BrainVisualizer3DProps {
   autoRotate?: boolean;
   /** draw the synapse edge web (default true) */
   showSynapses?: boolean;
+  /** fired when a neuron is clicked (its global index) — or null when empty
+   *  space is clicked (deselect). No-op unless provided (trainer embeds keep
+   *  their current behavior exactly). */
+  onNeuronSelect?: (globalIdx: number | null) => void;
+  /** the inspected neuron — renders a pulsing emerald selection ring at its
+   *  position (default null = hidden) */
+  selectedNeuron?: number | null;
+  /** increment this counter to poke `selectedNeuron` through the exact same
+   *  path as a canvas click (current injection + pop animation) */
+  pokeNonce?: number;
 }
 
 interface PokeTip {
@@ -67,8 +77,10 @@ const BG = "#0a0a0f";
 const EMERALD = "#34d399";
 const ROSE = "#fb7185";
 
-/** Anatomical palette — bioluminescent, no blues/indigo. */
-const REGION_META: Record<
+/** Anatomical palette — bioluminescent, no blues/indigo.
+ *  (Exported for the Brain Lab neuron inspector, so its region badges match
+ *  the 3D legend exactly.) */
+export const REGION_META: Record<
   BrainRegion,
   { label: string; color: string; radius: number; seg: number }
 > = {
@@ -100,9 +112,21 @@ interface BrainSceneProps {
   autoRotate: boolean;
   showSynapses: boolean;
   onPoke: (tip: PokeTip) => void;
+  onNeuronSelect?: (globalIdx: number | null) => void;
+  selectedNeuron: number | null;
+  pokeNonce: number;
 }
 
-function BrainScene({ brain, compact, autoRotate, showSynapses, onPoke }: BrainSceneProps) {
+function BrainScene({
+  brain,
+  compact,
+  autoRotate,
+  showSynapses,
+  onPoke,
+  onNeuronSelect,
+  selectedNeuron,
+  pokeNonce,
+}: BrainSceneProps) {
   // ---- per-brain static data (region palettes incl. MBON valence) ----
   const prep = useMemo(() => {
     const regionList: RegionInfo[] = brain.regions.map((rg, ordinal) => {
@@ -168,6 +192,7 @@ function BrainScene({ brain, compact, autoRotate, showSynapses, onPoke }: BrainS
   const proxyRefs = useRef<(THREE.InstancedMesh | null)[]>([]);
   const lineRef = useRef<THREE.LineSegments>(null);
   const ringRef = useRef<THREE.Mesh>(null);
+  const selRingRef = useRef<THREE.Mesh>(null);
   const daLightRef = useRef<THREE.PointLight>(null);
   const clockRef = useRef(0);
   const prevStats = useRef({ rewards: 0, punishments: 0 });
@@ -229,9 +254,22 @@ function BrainScene({ brain, compact, autoRotate, showSynapses, onPoke }: BrainS
         region: rg.label,
         neuron: e.instanceId,
       });
+      // same click also feeds the neuron inspector (if one is listening)
+      onNeuronSelect?.(gi);
     },
-    [brain, onPoke],
+    [brain, onPoke, onNeuronSelect],
   );
+
+  // ---- external poke (inspector "Poke" button) — identical path to a click:
+  //      current injection + white-flash pop animation on the selected cell ----
+  const lastPokeNonce = useRef(pokeNonce);
+  useEffect(() => {
+    if (pokeNonce === lastPokeNonce.current) return;
+    lastPokeNonce.current = pokeNonce;
+    if (pokeNonce <= 0 || selectedNeuron == null) return;
+    brain.poke(selectedNeuron, 2.0);
+    pokeFx.current = { gi: selectedNeuron, t0: clockRef.current };
+  }, [pokeNonce, selectedNeuron, brain]);
 
   // ---- per-frame update: neurons, edges, dopamine FX ----
   useFrame((state) => {
@@ -361,6 +399,24 @@ function BrainScene({ brain, compact, autoRotate, showSynapses, onPoke }: BrainS
       }
     }
 
+    // selection marker: pulsing billboarded emerald ring on the inspected
+    // neuron (depth-tested off → stays visible even when the cell is hidden
+    // behind the brain, like a lab marker)
+    const selRing = selRingRef.current;
+    if (selRing) {
+      if (selectedNeuron != null && selectedNeuron >= 0 && selectedNeuron < brain.total) {
+        const gi3 = selectedNeuron * 3;
+        const pulse = 0.5 + 0.5 * Math.sin(t * 4.0);
+        selRing.visible = true;
+        selRing.position.set(pos[gi3], pos[gi3 + 1], pos[gi3 + 2]);
+        selRing.scale.setScalar(0.15 + 0.035 * pulse);
+        selRing.quaternion.copy(state.camera.quaternion);
+        (selRing.material as THREE.MeshBasicMaterial).opacity = 0.55 + 0.4 * pulse;
+      } else {
+        selRing.visible = false;
+      }
+    }
+
     // dopamine ambient glow — the brain "feels" reward / punishment
     const light = daLightRef.current;
     if (light) {
@@ -448,6 +504,21 @@ function BrainScene({ brain, compact, autoRotate, showSynapses, onPoke }: BrainS
         />
       </mesh>
 
+      {/* pulsing selection ring on the inspected neuron (emerald) */}
+      <mesh ref={selRingRef} visible={false} frustumCulled={false} renderOrder={10}>
+        <ringGeometry args={[0.78, 1, 48]} />
+        <meshBasicMaterial
+          color={EMERALD}
+          transparent
+          opacity={0.8}
+          side={THREE.DoubleSide}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+          depthTest={false}
+          toneMapped={false}
+        />
+      </mesh>
+
       {!compact && (
         <Stars radius={45} depth={18} count={900} factor={2.4} saturation={0} fade speed={0.4} />
       )}
@@ -506,9 +577,15 @@ export function BrainVisualizer3D({
   compact = false,
   autoRotate = true,
   showSynapses = true,
+  onNeuronSelect,
+  selectedNeuron = null,
+  pokeNonce = 0,
 }: BrainVisualizer3DProps) {
   const [tooltip, setTooltip] = useState<PokeTip | null>(null);
   const tipTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // pointer-down position, to tell a genuine click on empty space apart from
+  // an orbit drag (same 6 px threshold as the neuron click handler)
+  const pointerDownPos = useRef<{ x: number; y: number } | null>(null);
   // remount the whole scene when the brain instance is swapped
   const sceneKey = useMemo(() => `brain-scene-${++sceneIdCounter}`, [brain]);
 
@@ -526,6 +603,25 @@ export function BrainVisualizer3D({
     [],
   );
 
+  const handlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    pointerDownPos.current = { x: e.clientX, y: e.clientY };
+  }, []);
+
+  // clicking empty space (not a drag) deselects the inspected neuron
+  const handlePointerMissed = useCallback(
+    (e: MouseEvent) => {
+      if (!onNeuronSelect) return;
+      const pd = pointerDownPos.current;
+      if (pd) {
+        const dx = e.clientX - pd.x;
+        const dy = e.clientY - pd.y;
+        if (Math.hypot(dx, dy) > 6) return; // that was an orbit drag
+      }
+      onNeuronSelect(null);
+    },
+    [onNeuronSelect],
+  );
+
   return (
     <div
       data-testid="brain-visualizer"
@@ -534,6 +630,7 @@ export function BrainVisualizer3D({
         className,
       )}
       style={{ height }}
+      onPointerDown={handlePointerDown}
     >
       {brain ? (
         <Canvas
@@ -541,6 +638,7 @@ export function BrainVisualizer3D({
           dpr={[1, compact ? 1.5 : 2]}
           gl={{ antialias: true, powerPreference: "high-performance" }}
           camera={{ position: [0, 1.15, 7.4], fov: 48 }}
+          onPointerMissed={handlePointerMissed}
         >
           <BrainScene
             key={sceneKey}
@@ -549,6 +647,9 @@ export function BrainVisualizer3D({
             autoRotate={autoRotate}
             showSynapses={showSynapses}
             onPoke={handlePoke}
+            onNeuronSelect={onNeuronSelect}
+            selectedNeuron={selectedNeuron}
+            pokeNonce={pokeNonce}
           />
         </Canvas>
       ) : (
@@ -560,7 +661,8 @@ export function BrainVisualizer3D({
       {!compact && brain && (
         <>
           <div className="pointer-events-none absolute right-2 top-2 z-10 rounded-md border border-white/10 bg-black/40 px-2 py-1 text-[10px] text-zinc-400 backdrop-blur-sm">
-            click a neuron to poke it · drag to orbit · scroll to zoom
+            click a neuron to poke + inspect · click empty space to deselect ·
+            drag to orbit
           </div>
           <Legend brain={brain} />
         </>

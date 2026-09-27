@@ -133,9 +133,11 @@ export function finishRider(
   return reason === "fall" ? punishes.fall : reason === "offroad" ? punishes.offroad : 0;
 }
 
-/** Steering angle from brain motor rates (motors: [steerLeft, steerRight, pedal]). */
-export function steerFromMotors(motor: Float32Array): number {
-  const d = (motor[1] - motor[0]) * STEER_GAIN;
+/** Steering angle from brain motor rates (motors: [steerLeft, steerRight, pedal]).
+ *  `gain` scales the handlebar sensitivity — the bicycle "personality":
+ *  > 1 = steadier geometry (stronger counter-steer authority), < 1 = twitchier. */
+export function steerFromMotors(motor: Float32Array, gain = 1): number {
+  const d = (motor[1] - motor[0]) * STEER_GAIN * gain;
   return d > 0.5 ? 0.5 : d < -0.5 ? -0.5 : d;
 }
 

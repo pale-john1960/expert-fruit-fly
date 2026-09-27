@@ -141,6 +141,7 @@ export function BicycleTrainer() {
   const [leaderBrain, setLeaderBrain] = useState<FlyBrain | null>(null);
   const [running, setRunning] = useState(true);
   const [turbo, setTurbo] = useState(1);
+  const [preset, setPresetState] = useState<"steady" | "standard" | "frisky">("standard");
   const [popQueued, setPopQueued] = useState(5);
   const [mutation, setMutation] = useState(0.3);
   const [watchBest, setWatchBest] = useState(false);
@@ -218,6 +219,13 @@ export function BicycleTrainer() {
   const changeTurbo = (t: number) => {
     setTurbo(t);
     core.setTurbo(t);
+  };
+
+  const changePreset = (p: "steady" | "standard" | "frisky") => {
+    if (p === preset) return;
+    setPresetState(p);
+    core.setPreset(p);
+    playSound("click");
   };
 
   const changePopulation = (v: number[]) => {
@@ -562,6 +570,49 @@ export function BicycleTrainer() {
                   <Label className="text-xs text-muted-foreground">Turbo</Label>
                   <TurboControl turbo={turbo} onChange={changeTurbo} />
                 </div>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <Label className="text-xs text-muted-foreground">
+                  Bike personality
+                </Label>
+                <div
+                  className="grid grid-cols-3 gap-1 rounded-lg bg-muted/60 p-1"
+                  role="group"
+                  aria-label="Bike personality preset"
+                >
+                  {(
+                    [
+                      { id: "steady", label: "Steady", hint: "Forgiving geometry, richer sugar — balance comes sooner" },
+                      { id: "standard", label: "Standard", hint: "The validated default setup" },
+                      { id: "frisky", label: "Frisky", hint: "Twitchy handling, leaner sugar — a real challenge" },
+                    ] as const
+                  ).map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      title={p.hint}
+                      aria-pressed={preset === p.id}
+                      onClick={() => changePreset(p.id)}
+                      className={`h-9 rounded-md px-2 text-xs font-medium transition-colors ${
+                        preset === p.id
+                          ? p.id === "steady"
+                            ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40"
+                            : p.id === "frisky"
+                              ? "bg-rose-500/20 text-rose-300 ring-1 ring-rose-500/40"
+                              : "bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  Steady gives the handlebars more righting authority (+25%) and
+                  pays 0.045 sugar per meter; Frisky dulls them (−20%) and pays
+                  0.022. Applies live — no reset needed.
+                </p>
               </div>
 
               <Separator />
