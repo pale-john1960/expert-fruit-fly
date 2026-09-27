@@ -63,7 +63,7 @@ import {
   toHistoryCsv,
   toSessionMarkdown,
 } from "@/lib/session-export";
-import type { BrainSnapshot } from "@/lib/flybrain/types";
+import type { BrainLineage, BrainSnapshot } from "@/lib/flybrain/types";
 import type { FlyBrain } from "@/lib/flybrain/engine";
 import {
   Bike,
@@ -455,6 +455,12 @@ export function BicycleTrainer() {
   const tallyRef = useRef({ wins: 0, losses: 0, best: 0 });
   const tallyCountedRef = useRef(false);
 
+  // --- Task 13-c lineage bookkeeping (read only inside the save handler) ---
+  /** wall-clock training-clock start — reset on fresh populations / adoptions */
+  const trainStartRef = useRef(Date.now());
+  /** name of the saved library brain this session continued from (null = fresh) */
+  const parentNameRef = useRef<string | null>(null);
+
   // --- champion lineage (family tree) -------------------------------------
   const [lineageOpen, setLineageOpen] = useState(false);
   /** recomputed only when a new champion is crowned (keyed — the ~6 Hz flush
@@ -543,6 +549,10 @@ export function BicycleTrainer() {
         }
         core.adoptSnapshot(snap);
         setSession(null);
+        // Task 13-c: adopting a saved brain starts a fresh training clock and
+        // records the parent for the next save's pedigree
+        trainStartRef.current = Date.now();
+        parentNameRef.current = snap.name;
         toast.success(`Loaded "${snap.name}"`, {
           description: `Gen ${snap.generation} champion (${snap.score.toFixed(0)} m) now seeds the whole population.`,
         });
@@ -579,6 +589,9 @@ export function BicycleTrainer() {
   };
 
   const doReset = () => {
+    // fresh random population = a fresh training session (Task 13-c clock)
+    trainStartRef.current = Date.now();
+    parentNameRef.current = null;
     core.reset();
     setWatchBest(false);
     setHud(core.hudSnapshot());
@@ -721,9 +734,40 @@ export function BicycleTrainer() {
     }
     const name = brainName.trim() || "Dusk Rider";
     const score = core.bestEverDistance;
+    // Task 13-c — pedigree milestones from the champion family tree
+    // (lineage.view): Founder → First champion (only when crowned strictly
+    // between the founder and this generation) → This brain.
+    const view = lineage.view;
+    const pedigree: { gen: number; score: number; label: string }[] = [];
+    if (view) {
+      pedigree.push({ gen: view.rootGen, score: view.rootScore, label: "Founder" });
+      if (view.champion.gen > view.rootGen && view.champion.gen < core.generation) {
+        pedigree.push({
+          gen: view.champion.gen,
+          score: view.champion.score,
+          label: "First champion",
+        });
+      }
+    }
+    pedigree.push({ gen: core.generation, score, label: "This brain" });
+    // a founder that IS this brain (saved before any breeding) → single chip
+    if (
+      pedigree.length === 2 &&
+      pedigree[0].gen === pedigree[1].gen &&
+      Math.abs(pedigree[0].score - pedigree[1].score) < 0.5
+    ) {
+      pedigree.shift();
+    }
+    const lineageMeta: BrainLineage = {
+      trainer: "bicycle",
+      generations: core.generation,
+      trainedMs: Math.max(0, Date.now() - trainStartRef.current),
+      pedigree,
+    };
+    if (parentNameRef.current) lineageMeta.parentName = parentNameRef.current;
     setSaving(true);
     try {
-      const snapshot = brain.toJSON("bicycle", name, core.generation, score);
+      const snapshot = brain.toJSON("bicycle", name, core.generation, score, lineageMeta);
       const res = await fetch("/api/brains", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

@@ -28,6 +28,7 @@ import {
   Play,
   RefreshCw,
   Search,
+  Sparkles,
   Trash2,
   TrendingUp,
   Upload,
@@ -71,6 +72,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { playSound } from "@/lib/sound";
+import { DEMO_BRAINS } from "@/lib/demo-brains";
 import { useBrainStore } from "@/lib/flybrain/store";
 import type { BrainSnapshot } from "@/lib/flybrain/types";
 import { cn } from "@/lib/utils";
@@ -96,6 +98,44 @@ export interface BrainRow {
   updatedAt: string;
   snapshotBytes: number;
 }
+
+// ---------------------------------------------------------------------------
+// built-in demo brains as library rows (Task 13-b)
+// ---------------------------------------------------------------------------
+// Demo brains are CLIENT-SIDE ONLY: they carry their snapshot INLINE, are
+// never POSTed to the database and never deleted. Every snapshot consumer in
+// this file — report card, genome diff (pair + progress), load-into-trainer,
+// export JSON — funnels through fetchBrain(), which short-circuits demo ids
+// through this table so the dialogs need no changes at all.
+
+interface DemoLibraryEntry {
+  row: BrainRow;
+  snapshot: BrainSnapshot;
+}
+
+const DEMO_LIBRARY_ENTRIES: readonly DemoLibraryEntry[] = DEMO_BRAINS.map((d) => {
+  const snapshotBytes = new TextEncoder().encode(JSON.stringify(d.snapshot)).length;
+  return {
+    row: {
+      id: d.id,
+      name: d.name,
+      task: d.task,
+      generation: d.generation,
+      score: d.score,
+      note: d.note,
+      createdAt: d.snapshot.createdAt,
+      updatedAt: d.snapshot.createdAt,
+      snapshotBytes,
+    },
+    snapshot: d.snapshot,
+  };
+});
+
+const DEMO_BY_ID: ReadonlyMap<string, DemoLibraryEntry> = new Map(
+  DEMO_LIBRARY_ENTRIES.map((entry) => [entry.row.id, entry]),
+);
+
+const DEMO_TOTAL_BYTES = DEMO_LIBRARY_ENTRIES.reduce((acc, e) => acc + e.row.snapshotBytes, 0);
 
 type TaskFilter = "all" | "dino" | "bicycle" | "lab";
 
@@ -157,7 +197,11 @@ export function formatBytes(n: number): string {
 
 export function relativeDate(iso: string): string {
   try {
-    return formatDistanceToNow(new Date(iso), { addSuffix: true });
+    const s = formatDistanceToNow(new Date(iso), { addSuffix: true });
+    // date-fns' sub-minute phrase is the one form long enough to trip the
+    // `truncate` ellipsis in narrow value columns — tighten it at the source
+    if (s === "less than a minute ago") return "just now";
+    return s;
   } catch {
     return "unknown";
   }
@@ -172,6 +216,11 @@ function sanitizeFileName(name: string): string {
 }
 
 export async function fetchBrain(id: string): Promise<{ brain: BrainRow; snapshot: BrainSnapshot }> {
+  // built-in demo brains carry their snapshot inline — never hit the database
+  // (this is what lets report cards, diffs, progress views, loads and exports
+  // work for demo rows with zero changes in the consuming dialogs)
+  const demo = DEMO_BY_ID.get(id);
+  if (demo) return { brain: demo.row, snapshot: demo.snapshot };
   const res = await fetch(`/api/brains/${id}`, { cache: "no-store" });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -249,9 +298,10 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
     void loadList("all");
   }, []);
 
-  // keep the diff selection valid when the list changes (deletes / refresh)
+  // keep the diff selection valid when the list changes (deletes / refresh);
+  // built-in demo rows are never in the DB list but stay selectable forever
   useEffect(() => {
-    setDiffIds((ids) => ids.filter((id) => brains.some((b) => b.id === id)));
+    setDiffIds((ids) => ids.filter((id) => brains.some((b) => b.id === id) || DEMO_BY_ID.has(id)));
   }, [brains]);
 
   /** toggle a row into the genome-diff selection (max 2, FIFO replacement) */
@@ -279,13 +329,27 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
     });
   }, [brains, query]);
 
+  /** built-in demo rows under the SAME task filter + search as the list above */
+  const visibleDemos = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return DEMO_LIBRARY_ENTRIES.filter(({ row }) => {
+      if (taskFilter !== "all" && row.task !== taskFilter) return false;
+      if (q) {
+        const haystack = `${row.name} ${row.task} ${row.note ?? ""}`.toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [taskFilter, query]);
+
   const totalBytes = useMemo(() => brains.reduce((acc, b) => acc + (b.snapshotBytes ?? 0), 0), [brains]);
 
-  /** the [A, B] pair once exactly two brains are selected for comparison */
+  /** the [A, B] pair once exactly two brains are selected for comparison —
+   *  demo rows resolve through the inline table, DB rows through the list */
   const diffRows = useMemo(() => {
     if (diffIds.length !== 2) return null;
-    const a = brains.find((b) => b.id === diffIds[0]);
-    const b = brains.find((b) => b.id === diffIds[1]);
+    const a = brains.find((b) => b.id === diffIds[0]) ?? DEMO_BY_ID.get(diffIds[0])?.row;
+    const b = brains.find((b) => b.id === diffIds[1]) ?? DEMO_BY_ID.get(diffIds[1])?.row;
     return a && b ? ([a, b] as const) : null;
   }, [diffIds, brains]);
 
@@ -447,7 +511,10 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
   const showEmptyState = !loading && !error && visible.length === 0;
   const showFilteredEmpty = showEmptyState && (brains.length > 0 || query.trim() !== "");
 
-  const rowActions = (row: BrainRow, full = false) => (
+  /** row actions shared by DB rows and demo rows. Built-in demo rows pass
+   *  `demo` — the delete action is omitted (they are never destroyed) and the
+   *  load/export/progress flows short-circuit to the inline snapshot. */
+  const rowActions = (row: BrainRow, full = false, demo = false) => (
     <div className={cn("flex items-center gap-2", full && "w-full")}>
       <Button
         size="sm"
@@ -500,16 +567,76 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
             <TrendingUp className="h-4 w-4 text-emerald-500 dark:text-emerald-400" aria-hidden />
             Progress vs newborn
           </DropdownMenuItem>
-          <DropdownMenuItem
-            className="min-h-11 cursor-pointer text-rose-400 focus:text-rose-300"
-            onSelect={() => setDeleteTarget(row)}
-          >
-            <Trash2 className="h-4 w-4" /> Delete
-          </DropdownMenuItem>
+          {demo ? (
+            <DropdownMenuItem
+              disabled
+              className="min-h-11 cursor-default opacity-60"
+              aria-disabled="true"
+            >
+              <Sparkles className="h-4 w-4 text-teal-500 dark:text-teal-400" aria-hidden />
+              Built-in · can&apos;t delete
+            </DropdownMenuItem>
+          ) : (
+            <DropdownMenuItem
+              className="min-h-11 cursor-pointer text-rose-400 focus:text-rose-300"
+              onSelect={() => setDeleteTarget(row)}
+            >
+              <Trash2 className="h-4 w-4" /> Delete
+            </DropdownMenuItem>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
   );
+
+  /** one built-in demo row — dashed border, teal built-in badge, inline
+   *  snapshot (Task 13-b). Same action affordances as a saved row minus
+   *  Delete; never touches the database. */
+  const demoRowCard = (entry: DemoLibraryEntry, i: number) => {
+    const row = entry.row;
+    return (
+      <motion.div
+        key={row.id}
+        initial={{ opacity: 0, y: 6 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.25, delay: Math.min(i * 0.04, 0.2) }}
+        data-testid={`demo-row-${row.id}`}
+        className="rounded-xl border border-dashed border-teal-500/35 bg-teal-500/[0.04] p-4"
+      >
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="truncate font-medium">{row.name}</span>
+              <Badge
+                data-testid="demo-badge"
+                variant="outline"
+                className="gap-1 border-teal-500/40 bg-teal-500/10 text-teal-600 dark:text-teal-300"
+              >
+                <Sparkles className="h-3 w-3" aria-hidden />
+                Built-in
+              </Badge>
+            </div>
+            {row.note ? (
+              <div className="mt-0.5 truncate text-xs text-muted-foreground" title={row.note}>
+                {row.note}
+              </div>
+            ) : null}
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <TaskBadge task={row.task} />
+            {diffToggleButton(row)}
+          </div>
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          <span className="font-mono">G{row.generation}</span>
+          <span>{formatScore(row.task, row.score)}</span>
+          <span>{formatBytes(row.snapshotBytes)}</span>
+          <span>shipped with the app</span>
+        </div>
+        <div className="mt-3">{rowActions(row, true, true)}</div>
+      </motion.div>
+    );
+  };
 
   // ----- render -----------------------------------------------------------
 
@@ -621,7 +748,7 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
               <GitCompareArrows className="h-4 w-4 shrink-0 text-amber-500 dark:text-amber-400" aria-hidden />
               <span className="text-xs font-medium text-muted-foreground">Genome diff:</span>
               {diffIds.map((id, i) => {
-                const row = brains.find((b) => b.id === id);
+                const row = brains.find((b) => b.id === id) ?? DEMO_BY_ID.get(id)?.row;
                 if (!row) return null;
                 return (
                   <span
@@ -691,6 +818,34 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
 
           {/* content */}
           <div className="mt-4">
+            {/* built-in demo brains — always present, client-side only (Task
+                13-b): snapshots are inline, never POSTed, never deleted, so
+                the library is never empty on a fresh install */}
+            {visibleDemos.length > 0 ? (
+              <section
+                data-testid="demo-section"
+                aria-labelledby="demo-brains-title"
+                className="rounded-xl border border-border/60 bg-muted/20 p-3 sm:p-4"
+              >
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-1">
+                  <Sparkles
+                    className="h-4 w-4 shrink-0 text-teal-500 dark:text-teal-400"
+                    aria-hidden
+                  />
+                  <h3 id="demo-brains-title" className="text-sm font-semibold">
+                    Built-in demo brains
+                  </h3>
+                  <p className="min-w-0 flex-1 basis-52 text-xs text-muted-foreground">
+                    shipped with the app — load one instantly, nothing touches your database
+                  </p>
+                </div>
+                <div className="mt-3 flex flex-col gap-3">
+                  {visibleDemos.map((entry, i) => demoRowCard(entry, i))}
+                </div>
+              </section>
+            ) : null}
+
+            <div className={cn(visibleDemos.length > 0 && "mt-4")}>
             {error && brains.length === 0 ? (
               <div className="flex flex-col items-center gap-3 rounded-xl border border-rose-500/30 bg-rose-500/5 px-6 py-10 text-center">
                 <FlaskConical className="h-8 w-8 text-rose-400" aria-hidden />
@@ -748,7 +903,8 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
                   <>
                     <p className="font-medium">No saved brains yet</p>
                     <p className="max-w-sm text-sm text-muted-foreground">
-                      Train a fly in the Dino or Bicycle tab and hit{" "}
+                      Your saved brains will appear here — meanwhile, meet the built-in demo
+                      flies above. Train a fly in the Dino or Bicycle tab and hit{" "}
                       <span className="font-medium text-foreground">Save</span> — its connectome
                       lands here, ready to re-load, export or share.
                     </p>
@@ -862,13 +1018,25 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
                 </div>
               </>
             )}
+            </div>
           </div>
 
           {/* footer stats */}
-          {!error && brains.length > 0 && (
+          {!error && (brains.length > 0 || DEMO_LIBRARY_ENTRIES.length > 0) && (
             <p className="mt-3 text-xs text-muted-foreground" aria-live="polite">
-              {brains.length} saved {brains.length === 1 ? "brain" : "brains"} ·{" "}
-              {formatBytes(totalBytes)} of connectome data
+              {brains.length > 0 ? (
+                <>
+                  {brains.length} saved {brains.length === 1 ? "brain" : "brains"} +{" "}
+                  {DEMO_LIBRARY_ENTRIES.length} built-in ·{" "}
+                  {formatBytes(totalBytes + DEMO_TOTAL_BYTES)} of connectome data
+                </>
+              ) : (
+                <>
+                  {DEMO_LIBRARY_ENTRIES.length} built-in demo{" "}
+                  {DEMO_LIBRARY_ENTRIES.length === 1 ? "brain" : "brains"} · your saved
+                  connectomes will appear here
+                </>
+              )}
             </p>
           )}
         </CardContent>

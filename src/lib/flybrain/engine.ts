@@ -15,6 +15,7 @@
 
 import {
   BrainArchitecture,
+  BrainLineage,
   BrainRegion,
   BrainSnapshot,
   Edge,
@@ -875,9 +876,15 @@ export class FlyBrain {
   // Serialization — save / load learned brains
   // -------------------------------------------------------------------------
 
-  toJSON(task: string, name: string, generation = 0, score = 0): BrainSnapshot {
+  toJSON(
+    task: string,
+    name: string,
+    generation = 0,
+    score = 0,
+    lineage?: BrainLineage
+  ): BrainSnapshot {
     const r4 = (a: Float32Array) => Array.from(a, (x) => Math.round(x * 1e5) / 1e5);
-    return {
+    const snap: BrainSnapshot = {
       version: 1,
       task,
       name,
@@ -898,6 +905,9 @@ export class FlyBrain {
         punishments: Math.round(this.punishments * 10) / 10,
       },
     };
+    // optional training pedigree (Task 13-c) — absent on every older snapshot
+    if (lineage) snap.lineage = lineage;
+    return snap;
   }
 
   static fromJSON(snap: BrainSnapshot): FlyBrain {

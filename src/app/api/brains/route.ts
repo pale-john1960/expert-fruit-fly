@@ -82,9 +82,31 @@ const archSchema = z.object({
 });
 
 /**
+ * Training pedigree (Task 13-c) — optional and validated loosely: it is
+ * display metadata that rides along inside the snapshot, never anything the
+ * engine resurrects. Older snapshots simply have no `lineage` at all.
+ */
+const lineageSchema = z.object({
+  trainer: z.enum(["dino", "bicycle", "lab"]),
+  parentName: z.string().min(1).max(80).optional(),
+  generations: finiteInt.min(0).max(1_000_000).optional(),
+  trainedMs: finiteNumber.min(0).optional(),
+  pedigree: z
+    .array(
+      z.object({
+        gen: finiteInt.min(0),
+        score: finiteNumber,
+        label: z.string().min(1).max(40),
+      }),
+    )
+    .max(50)
+    .optional(),
+});
+
+/**
  * The snapshot schema validates the fields we rely on; unknown extra keys
- * (meta, createdAt, …) are allowed to pass through untouched — we always
- * store the ORIGINAL object, never the stripped zod output.
+ * (meta, createdAt, lineage, …) are allowed to pass through untouched — we
+ * always store the ORIGINAL object, never the stripped zod output.
  */
 const snapshotSchema = z.object({
   version: z.literal(1),
@@ -92,6 +114,7 @@ const snapshotSchema = z.object({
   name: z.string().min(1).max(80),
   arch: archSchema,
   weights: weightsSchema,
+  lineage: lineageSchema.optional(),
 });
 
 const createBrainSchema = z.object({

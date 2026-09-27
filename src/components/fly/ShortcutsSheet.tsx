@@ -5,7 +5,8 @@
  * app ("?" key or the header keyboard button opens it).
  *
  * Groups mirror the tab accents: emerald (global/lab), amber (dino duel),
- * rose (bicycle challenge). Kbd chips are exported for reuse (page footer).
+ * rose (bicycle challenge), lime (dino arena). Kbd chips are exported for
+ * reuse (page footer).
  */
 
 import {
@@ -15,7 +16,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Bike, Gamepad2, Sparkles } from "lucide-react";
+import { Bike, Gamepad2, Sparkles, Swords } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /** Tiny keyboard-key chip (shared with the page footer hints). */
@@ -51,6 +52,7 @@ const GROUPS: ShortcutGroup[] = [
       { keys: ["3"], label: "Bicycle Training" },
       { keys: ["4"], label: "Brain Library" },
       { keys: ["5"], label: "How It Works" },
+      { keys: ["6"], label: "Dino Arena" },
       {
         keys: ["M"],
         label: "Mute / unmute sound",
@@ -91,6 +93,18 @@ const GROUPS: ShortcutGroup[] = [
         hint: "Hold to lean further — release to recover",
       },
       { keys: ["A", "D"], label: "Steer (left-hand alt)" },
+    ],
+  },
+  {
+    icon: <Swords className="h-4 w-4" />,
+    title: "Dino Arena — brain race",
+    accent: "text-lime-400",
+    rows: [
+      {
+        keys: ["Space"],
+        label: "Pause / resume the race",
+        hint: "Only while an arena race is running",
+      },
     ],
   },
 ];

@@ -28,7 +28,7 @@
  * valence semantics (appetitive vs aversive). No indigo/blue/purple.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { motion } from "framer-motion";
 import {
   Activity,
@@ -36,8 +36,10 @@ import {
   ClipboardCopy,
   Dna,
   Download,
+  GitBranch,
   GraduationCap,
   Loader2,
+  MoveRight,
   Network,
   RefreshCw,
   Scale,
@@ -57,7 +59,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { playSound } from "@/lib/sound";
-import type { BrainArchitecture, BrainSnapshot } from "@/lib/flybrain/types";
+import type { BrainArchitecture, BrainLineage, BrainSnapshot } from "@/lib/flybrain/types";
 import { cn } from "@/lib/utils";
 
 // Shared with (and exported by) BrainLibrary. This is a safe module cycle:
@@ -539,6 +541,115 @@ function StatTile({
 }
 
 // ---------------------------------------------------------------------------
+// training pedigree (Task 13-c) — family-tree chip strip from snapshot.lineage
+// ---------------------------------------------------------------------------
+
+/** 12345 ms → "12s" · 192000 ms → "3.2 min" · 10800000 ms → "3.0 h" */
+function fmtDuration(ms: number): string {
+  const s = ms / 1000;
+  if (s < 60) return `${Math.round(s)}s`;
+  const min = s / 60;
+  if (min < 60) return `${min.toFixed(1)} min`;
+  return `${(min / 60).toFixed(1)} h`;
+}
+
+/** one milestone chip: `Founder · gen 1 · 3.5 m` (score only when nonzero) */
+function PedigreeChip({
+  milestone,
+  task,
+  highlight,
+}: {
+  milestone: { gen: number; score: number; label: string };
+  task: string;
+  highlight?: boolean;
+}) {
+  return (
+    <span
+      data-testid="pedigree-chip"
+      className={cn(
+        "inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded-lg border px-2.5 py-1 text-[11px] font-medium tabular-nums",
+        highlight
+          ? "border-teal-500/30 bg-teal-500/10 text-teal-700 dark:text-teal-300"
+          : "border-border/60 bg-muted/30",
+      )}
+    >
+      <span className="truncate">{milestone.label}</span>
+      <span aria-hidden className="text-muted-foreground">·</span>
+      <span>gen {milestone.gen}</span>
+      {milestone.score > 0 ? (
+        <>
+          <span aria-hidden className="text-muted-foreground">·</span>
+          <span>{formatScore(task, milestone.score)}</span>
+        </>
+      ) : null}
+    </span>
+  );
+}
+
+/**
+ * Rendered ONLY when the snapshot carries a `lineage` object — every brain
+ * saved before round 13 renders nothing at all (backward-compatible silence).
+ */
+function PedigreeSection({ lineage, task }: { lineage: BrainLineage; task: string }) {
+  const milestones = lineage.pedigree ?? [];
+  if (milestones.length === 0 && !lineage.parentName) return null;
+
+  // muted stat line: "25 generations · 3.2 min of training"
+  const facts: string[] = [];
+  if (typeof lineage.generations === "number" && lineage.generations > 0) {
+    facts.push(
+      `${lineage.generations} generation${lineage.generations === 1 ? "" : "s"}`,
+    );
+  }
+  if (typeof lineage.trainedMs === "number" && lineage.trainedMs > 0) {
+    facts.push(`${fmtDuration(lineage.trainedMs)} of training`);
+  }
+
+  return (
+    <section aria-label="Training pedigree" data-testid="report-pedigree">
+      <h4 className="flex items-center gap-1.5 text-sm font-semibold">
+        <GitBranch className="h-4 w-4 text-teal-500 dark:text-teal-400" aria-hidden />
+        Pedigree
+      </h4>
+      <div
+        data-testid="pedigree-strip"
+        className="mt-2 flex flex-wrap items-center gap-1.5 gap-y-2"
+      >
+        {lineage.parentName ? (
+          <Fragment>
+            <span
+              data-testid="pedigree-parent"
+              title={`This session continued from the saved brain "${lineage.parentName}"`}
+              className="inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded-lg border border-rose-500/40 bg-rose-500/10 px-2.5 py-1 text-[11px] font-medium text-rose-600 dark:text-rose-400"
+            >
+              <span className="truncate">Cloned from &ldquo;{lineage.parentName}&rdquo;</span>
+            </span>
+            <MoveRight
+              className="h-3.5 w-3.5 shrink-0 text-emerald-500 dark:text-emerald-400"
+              aria-hidden
+            />
+          </Fragment>
+        ) : null}
+        {milestones.map((m, i) => (
+          <Fragment key={`${m.label}-${m.gen}-${i}`}>
+            {i > 0 ? (
+              <MoveRight
+                className="h-3.5 w-3.5 shrink-0 text-emerald-500 dark:text-emerald-400"
+                aria-hidden
+              />
+            ) : null}
+            <PedigreeChip milestone={m} task={task} highlight={i === milestones.length - 1} />
+          </Fragment>
+        ))}
+      </div>
+      {facts.length > 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground tabular-nums">{facts.join(" · ")}</p>
+      ) : null}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // main component
 // ---------------------------------------------------------------------------
 
@@ -781,6 +892,13 @@ export function BrainReportCard({ row, open, onOpenChange }: BrainReportCardProp
                 bar for exact numbers.
               </p>
             </section>
+
+            {/* 2.5 — training pedigree (Task 13-c): family-tree chip strip.
+                Rendered ONLY when the snapshot carries lineage metadata —
+                pre-round-13 brains render nothing (backward compatible). */}
+            {snapshot.lineage ? (
+              <PedigreeSection lineage={snapshot.lineage} task={shown.task} />
+            ) : null}
 
             {/* 3 — stats row */}
             <section

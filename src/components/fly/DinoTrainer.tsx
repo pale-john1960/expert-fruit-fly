@@ -44,7 +44,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FlyBrain, retinaFromImageData } from "@/lib/flybrain/engine";
 import { DEFAULT_ARCH_DINO } from "@/lib/flybrain/types";
-import type { BrainSnapshot } from "@/lib/flybrain/types";
+import type { BrainLineage, BrainSnapshot } from "@/lib/flybrain/types";
 import { useBrainStore } from "@/lib/flybrain/store";
 import { hydrateSoundMuted, playSound } from "@/lib/sound";
 import { BrainActivityPanel } from "./BrainActivityPanel";
@@ -1045,6 +1045,12 @@ export function DinoTrainer() {
   const popSizeRef = useRef(popSize);
   const mutStrengthRef = useRef(mutStrength);
   const adoptedRef = useRef(false);
+  /** Task 13-c lineage bookkeeping: wall-clock training-clock start (reset on
+   *  fresh populations / adopted brains) + the name of the saved library brain
+   *  this session continued from (null = wild-born population). Refs only —
+   *  read exclusively inside the save handler. */
+  const trainStartRef = useRef(Date.now());
+  const parentNameRef = useRef<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const simRef = useRef<Sim | null>(null);
   const artRef = useRef<Art | null>(null);
@@ -1315,6 +1321,8 @@ export function DinoTrainer() {
     (snap: BrainSnapshot, restoreHistory?: GenStat[]) => {
       adoptedRef.current = true;
       setResume(null);
+      // adopting any brain starts a fresh training clock (Task 13-c)
+      trainStartRef.current = Date.now();
       const s = simRef.current;
       if (!s) return;
       if (!snap.arch || snap.arch.motorCount < 2) {
@@ -1369,7 +1377,12 @@ export function DinoTrainer() {
   const pending = useBrainStore((s) => s.pending);
   useEffect(() => {
     const snap = useBrainStore.getState().consumeLoad("dino");
-    if (snap) adoptSnapshot(snap);
+    if (snap) {
+      // Task 13-c: this session continues from a SAVED brain — remember its
+      // display name so the next save can record the clone relationship
+      parentNameRef.current = snap.name;
+      adoptSnapshot(snap);
+    }
   }, [pending, adoptSnapshot]);
 
   // --- offer to resume the last session -------------------------------------
@@ -1501,6 +1514,9 @@ export function DinoTrainer() {
   const resetPopulation = () => {
     const s = simRef.current;
     if (!s) return;
+    // fresh random population = a fresh training session (Task 13-c clock)
+    trainStartRef.current = Date.now();
+    parentNameRef.current = null;
     s.watchMode = false;
     s.savedRunners = null;
     s.watchCooldown = null;
@@ -1545,6 +1561,19 @@ export function DinoTrainer() {
       return;
     }
     const name = brainName.trim() || `Dino fly gen ${s.bestGen}`;
+    // Task 13-c — persist the training pedigree inside the snapshot: every
+    // dino champion descends from the wild-born random founders; generations
+    // + best-ever score describe THIS brain; trainedMs is the session clock.
+    const lineage: BrainLineage = {
+      trainer: "dino",
+      generations: s.bestGen,
+      trainedMs: Math.max(0, Date.now() - trainStartRef.current),
+      pedigree: [
+        { gen: 0, score: 0, label: "Wild-born" },
+        { gen: s.bestGen, score: s.bestEver, label: "This brain" },
+      ],
+    };
+    if (parentNameRef.current) lineage.parentName = parentNameRef.current;
     setSaving(true);
     try {
       const res = await fetch("/api/brains", {
@@ -1555,7 +1584,7 @@ export function DinoTrainer() {
           task: "dino",
           generation: s.bestGen,
           score: s.bestEver,
-          snapshot: s.bestBrain.toJSON("dino", name, s.bestGen, s.bestEver),
+          snapshot: s.bestBrain.toJSON("dino", name, s.bestGen, s.bestEver, lineage),
         }),
       });
       if (!res.ok) {

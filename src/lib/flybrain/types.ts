@@ -55,6 +55,27 @@ export interface BrainArchitecture {
   seed: number;
 }
 
+/**
+ * Training pedigree persisted inside a snapshot (Task 13-c).
+ *
+ * Purely additive and optional: every brain saved before this field existed
+ * loads exactly as before (absent lineage ⇒ UIs render nothing). Built at
+ * save time by the trainer rooms and surfaced as the report card's
+ * "Pedigree" family-tree strip + the genome diff's lineage chips.
+ */
+export interface BrainLineage {
+  /** which room trained this brain */
+  trainer: "dino" | "bicycle" | "lab";
+  /** display name of the saved brain this session continued from (if any) */
+  parentName?: string;
+  /** generations of training behind this brain at save time */
+  generations?: number;
+  /** wall-clock training time in ms */
+  trainedMs?: number;
+  /** ordered pedigree milestones: founder → milestones… → this brain */
+  pedigree?: { gen: number; score: number; label: string }[];
+}
+
 /** Everything needed to resurrect a trained brain exactly as it was. */
 export interface BrainSnapshot {
   version: 1;
@@ -65,6 +86,8 @@ export interface BrainSnapshot {
   /** fitness / score at save time */
   score: number;
   createdAt: string;
+  /** training pedigree (optional — older snapshots carry none) */
+  lineage?: BrainLineage;
   /** plastic weights – the "learned" part of the brain */
   weights: {
     kenyonToMbon: number[];

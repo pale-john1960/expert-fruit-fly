@@ -245,6 +245,65 @@ html {
   scroll-behavior: smooth;
 }
 
+/* Typographic refinements — balanced headings (no lonely last words),
+   prettier paragraph rag. Progressive enhancement: no-ops where unsupported. */
+h1,
+h2,
+h3,
+h4 {
+  text-wrap: balance;
+}
+p,
+li {
+  text-wrap: pretty;
+}
+
+/* Modal glass — a whisper of blur behind dialogs/sheets so the lab UI
+   underneath reads as "instrument behind safety glass". (Standard property
+   only: the -webkit- prefixed twin makes the v4 CSS pipeline strip BOTH.) */
+[data-slot="dialog-overlay"],
+[data-slot="sheet-overlay"] {
+  backdrop-filter: blur(3px);
+}
+
+/* Print: the report cards / diff verdicts are worth printing — strip the
+   ambient chrome (glows, dot grid, sticky chrome) and print on plain white. */
+@media print {
+  body {
+    background-image: none !important;
+    background-color: #fff !important;
+  }
+  header,
+  footer,
+  .no-print {
+    display: none !important;
+  }
+  [data-slot="dialog-overlay"] {
+    position: static !important;
+    background: none !important;
+    backdrop-filter: none !important;
+  }
+  [data-slot="dialog-content"] {
+    position: static !important;
+    box-shadow: none !important;
+    border: 1px solid #ddd !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    transform: none !important;
+  }
+}
+
+/* Transparency-sensitive users: drop the ambient washes + glass blur. */
+@media (prefers-reduced-transparency: reduce) {
+  body {
+    background-image: none;
+  }
+  [data-slot="dialog-overlay"],
+  [data-slot="sheet-overlay"] {
+    backdrop-filter: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .fly-wing {
     animation: none;

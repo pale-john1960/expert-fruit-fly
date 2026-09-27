@@ -8,6 +8,7 @@ import { DinoTrainer } from "@/components/fly/DinoTrainer";
 import { BicycleTrainer } from "@/components/fly/BicycleTrainer";
 import { BrainLibrary } from "@/components/fly/BrainLibrary";
 import { HowItWorks } from "@/components/fly/HowItWorks";
+import { DinoArena } from "@/components/fly/arena/DinoArena";
 import {
   ShortcutsSheet,
   Kbd,
@@ -31,6 +32,7 @@ import {
   Keyboard,
   Library,
   Sparkles,
+  Swords,
   Volume2,
   VolumeX,
   X,
@@ -235,6 +237,15 @@ const TABS: TabDef[] = [
     pill: "border-orange-500/30 bg-orange-500/10",
     hover: "hover:text-orange-300",
   },
+  {
+    value: "arena",
+    label: "Arena",
+    Icon: Swords,
+    activeText:
+      "data-[state=active]:text-lime-400 dark:data-[state=active]:text-lime-400",
+    pill: "border-lime-500/30 bg-lime-500/10",
+    hover: "hover:text-lime-300",
+  },
 ];
 
 const PILL_SPRING = {
@@ -287,6 +298,14 @@ function ScrollTopButton() {
 
 const RELEASE_NOTES: { rev: string; items: string[] }[] = [
   {
+    rev: "rev 13",
+    items: [
+      "Dino Arena — race 2–4 saved brains head-to-head in one world (hotkey 6)",
+      "Built-in demo brains — the library is stocked from the very first load",
+      "Pedigree — every save now carries its training family tree",
+    ],
+  },
+  {
     rev: "rev 12",
     items: [
       "Learning progress — compare any saved brain against an untrained newborn",
@@ -308,14 +327,6 @@ const RELEASE_NOTES: { rev: string; items: string[] }[] = [
       "Bicycle champion lineage family tree",
       "Brain report card with personality fingerprint + PNG export",
       "Animated science diagrams + keyboard shortcuts sheet",
-    ],
-  },
-  {
-    rev: "rev 9",
-    items: [
-      "You-vs-the-fly duel mode with keyboard controls",
-      "Neuron inspector — click any neuron in the 3D brain",
-      "Bicycle challenge mode + sound volume control",
     ],
   },
 ];
@@ -396,7 +407,7 @@ export default function Home() {
     hydrateSoundMuted();
   }, []);
 
-  // ---- keyboard shortcuts: 1–5 switch rooms, M toggles sound ------------
+  // ---- keyboard shortcuts: 1–6 switch rooms, M toggles sound ------------
   // (digits never collide with the Dino duel's arrow/space controls; typing
   // in inputs and modifier combos are ignored)
   useEffect(() => {
@@ -411,7 +422,7 @@ export default function Home() {
       )
         return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key >= "1" && e.key <= "5") {
+      if (e.key >= "1" && e.key <= "6") {
         const next = TABS[Number(e.key) - 1];
         if (next) {
           setTab(next.value);
@@ -646,6 +657,9 @@ export default function Home() {
           <TabsContent value="docs" className="mt-0">
             <HowItWorks />
           </TabsContent>
+          <TabsContent value="arena" className="mt-0">
+            <DinoArena />
+          </TabsContent>
         </Tabs>
       </main>
 
@@ -702,7 +716,7 @@ export default function Home() {
               ))}
             </div>
             <p className="flex items-center gap-1.5 leading-relaxed">
-              <Kbd>1</Kbd>–<Kbd>5</Kbd> switch rooms · <Kbd>M</Kbd> sound ·{" "}
+              <Kbd>1</Kbd>–<Kbd>6</Kbd> switch rooms · <Kbd>M</Kbd> sound ·{" "}
               <Kbd>?</Kbd> shortcuts
             </p>
           </nav>
@@ -740,7 +754,7 @@ export default function Home() {
                 aria-hidden="true"
                 className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500/80 motion-safe:animate-pulse"
               />
-              live · rev 12
+              live · rev 13
             </span>
           </div>
         </div>

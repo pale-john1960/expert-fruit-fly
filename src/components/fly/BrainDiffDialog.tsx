@@ -48,6 +48,7 @@ import {
   Calendar,
   ClipboardCopy,
   Download,
+  GitBranch,
   GitCompareArrows,
   Loader2,
   Network,
@@ -75,7 +76,7 @@ import { playSound } from "@/lib/sound";
 // we only ever CONSTRUCT an untrained newborn from it — the engine itself
 // stays locked and untouched
 import { FlyBrain } from "@/lib/flybrain/engine";
-import type { BrainArchitecture, BrainSnapshot } from "@/lib/flybrain/types";
+import type { BrainArchitecture, BrainLineage, BrainSnapshot } from "@/lib/flybrain/types";
 import { cn } from "@/lib/utils";
 
 // Shared with (and exported by) BrainLibrary — the documented safe module
@@ -866,7 +867,53 @@ function SideChip({ side }: { side: "a" | "b" }) {
   );
 }
 
-function IdentityPanel({ side, row, newborn = false }: { side: "a" | "b"; row: BrainRow; newborn?: boolean }) {
+/** Lineage chip (Task 13-c): tiny muted chip under a brain's name when its
+ *  snapshot carries training pedigree — `dino · gen 25 · 25 gens of training`.
+ *  Brains saved before round 13 (and the progress-mode newborn) show nothing. */
+function LineageChip({
+  lineage,
+  fallbackGen,
+}: {
+  lineage: BrainLineage;
+  fallbackGen?: number;
+}) {
+  const gen =
+    typeof lineage.generations === "number" ? lineage.generations : fallbackGen;
+  return (
+    <span
+      data-testid="diff-lineage-chip"
+      title={`Trained in the ${
+        lineage.trainer === "dino" ? "Dino" : lineage.trainer === "bicycle" ? "Bicycle" : "Brain Lab"
+      } room${lineage.parentName ? ` · this session continued from "${lineage.parentName}"` : ""}`}
+      className="inline-flex max-w-full flex-wrap items-center gap-1 whitespace-nowrap rounded-md border border-border/60 bg-muted/30 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground tabular-nums"
+    >
+      {lineage.trainer}
+      {typeof gen === "number" ? (
+        <>
+          <span aria-hidden>·</span>
+          <span>gen {gen}</span>
+          <span aria-hidden>·</span>
+          <span>
+            {gen} gen{gen === 1 ? "" : "s"} of training
+          </span>
+        </>
+      ) : null}
+    </span>
+  );
+}
+
+function IdentityPanel({
+  side,
+  row,
+  newborn = false,
+  lineage,
+}: {
+  side: "a" | "b";
+  row: BrainRow;
+  newborn?: boolean;
+  /** snapshot lineage (Task 13-c) — undefined on pre-round-13 brains */
+  lineage?: BrainLineage;
+}) {
   return (
     <div
       data-testid={`diff-identity-${side}`}
@@ -887,6 +934,11 @@ function IdentityPanel({ side, row, newborn = false }: { side: "a" | "b"; row: B
           GEN {row.generation}
         </Badge>
       </div>
+      {lineage ? (
+        <div className="mt-1.5">
+          <LineageChip lineage={lineage} fallbackGen={row.generation} />
+        </div>
+      ) : null}
       <div className="mt-2 flex flex-col gap-1 text-xs text-muted-foreground">
         <span className="flex items-center gap-1.5">
           <Trophy className="h-3.5 w-3.5 shrink-0" aria-hidden />
@@ -1240,6 +1292,17 @@ export function BrainDiffDialog({
 
   const totalDelta = stats ? stats.a.total - stats.b.total : 0;
 
+  /** pair mode (Task 13-c): the shared parent name when BOTH brains were
+   *  cloned from the SAME saved library brain → drives the siblings badge */
+  const siblings =
+    !isProgress && snapshots
+      ? snapshots.a.lineage?.parentName != null &&
+        snapshots.b.lineage?.parentName != null &&
+        snapshots.a.lineage.parentName === snapshots.b.lineage.parentName
+        ? snapshots.a.lineage.parentName
+        : null
+      : null;
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -1367,11 +1430,18 @@ export function BrainDiffDialog({
               </section>
             ) : null}
 
-            {/* 2 — side-by-side identity */}
+            {/* 2 — side-by-side identity (lineage chips under the names when
+                the snapshots carry pedigree — Task 13-c; progress mode shows
+                the trained brain's chip only, the newborn has none) */}
             <section aria-label="Brain identities" data-testid="diff-identity">
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                <IdentityPanel side="a" row={shown[0]} />
-                <IdentityPanel side="b" row={shown[1]} newborn={isProgress} />
+                <IdentityPanel side="a" row={shown[0]} lineage={snapshots.a.lineage} />
+                <IdentityPanel
+                  side="b"
+                  row={shown[1]}
+                  newborn={isProgress}
+                  lineage={isProgress ? undefined : snapshots.b.lineage}
+                />
               </div>
             </section>
 
@@ -1599,6 +1669,20 @@ export function BrainDiffDialog({
                 </StatTile>
               </div>
             </section>
+
+            {/* 4.5 — siblings badge (Task 13-c): both brains were cloned from
+                the SAME saved parent in pair mode → emerald badge near the verdict */}
+            {siblings ? (
+              <div className="flex justify-center" data-testid="diff-siblings">
+                <span
+                  title={`Both sessions continued from the saved brain “${siblings}”`}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] font-medium text-emerald-600 dark:text-emerald-400"
+                >
+                  <GitBranch className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                  Siblings — cloned from the same parent
+                </span>
+              </div>
+            ) : null}
 
             {/* 5 — verdict */}
             {verdict ? (
