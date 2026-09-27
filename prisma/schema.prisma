@@ -1,0 +1,23 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Brain {
+  id         String   @id @default(cuid())
+  name       String
+  task       String // 'dino' | 'bicycle' | 'lab'
+  generation Int      @default(0)
+  score      Float    @default(0)
+  note       String?
+  snapshot   String // full JSON BrainSnapshot (weights + architecture)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
