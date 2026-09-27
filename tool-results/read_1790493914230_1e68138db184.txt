@@ -1,0 +1,837 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * BrainLibrary — save / load / export / import learned fly brains.
+     5→ *
+     6→ * - lists saved brains from GET /api/brains (name, task, generation, score, size, date)
+     7→ * - "Load"  → GET /api/brains/[id] → useBrainStore.requestLoad(task, snapshot, name)
+     8→ * - "Export" → downloads the snapshot as pretty JSON
+     9→ * - "Import" → file picker / drag-drop → POST /api/brains
+    10→ * - "Delete" → AlertDialog confirm → DELETE /api/brains/[id]
+    11→ */
+    12→
+    13→import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+    14→import { formatDistanceToNow } from "date-fns";
+    15→import { motion } from "framer-motion";
+    16→import { toast } from "sonner";
+    17→import {
+    18→  Bike,
+    19→  Brain,
+    20→  Download,
+    21→  FlaskConical,
+    22→  Gamepad2,
+    23→  GraduationCap,
+    24→  LayoutGrid,
+    25→  Loader2,
+    26→  MoreHorizontal,
+    27→  Play,
+    28→  RefreshCw,
+    29→  Search,
+    30→  Trash2,
+    31→  Upload,
+    32→  FileJson,
+    33→} from "lucide-react";
+    34→
+    35→import {
+    36→  AlertDialog,
+    37→  AlertDialogAction,
+    38→  AlertDialogCancel,
+    39→  AlertDialogContent,
+    40→  AlertDialogDescription,
+    41→  AlertDialogFooter,
+    42→  AlertDialogHeader,
+    43→  AlertDialogTitle,
+    44→} from "@/components/ui/alert-dialog";
+    45→import { Badge } from "@/components/ui/badge";
+    46→import { Button } from "@/components/ui/button";
+    47→import {
+    48→  Card,
+    49→  CardContent,
+    50→  CardDescription,
+    51→  CardHeader,
+    52→  CardTitle,
+    53→} from "@/components/ui/card";
+    54→import {
+    55→  Dialog,
+    56→  DialogContent,
+    57→  DialogDescription,
+    58→  DialogHeader,
+    59→  DialogTitle,
+    60→} from "@/components/ui/dialog";
+    61→import {
+    62→  DropdownMenu,
+    63→  DropdownMenuContent,
+    64→  DropdownMenuItem,
+    65→  DropdownMenuTrigger,
+    66→} from "@/components/ui/dropdown-menu";
+    67→import { Input } from "@/components/ui/input";
+    68→import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+    69→import { Toaster } from "@/components/ui/sonner";
+    70→import { playSound } from "@/lib/sound";
+    71→import { useBrainStore } from "@/lib/flybrain/store";
+    72→import type { BrainSnapshot } from "@/lib/flybrain/types";
+    73→import { cn } from "@/lib/utils";
+    74→
+    75→import { BrainReportCard } from "./BrainReportCard";
+    76→
+    77→export type BrainLibraryProps = Record<string, never>;
+    78→
+    79→// ---------------------------------------------------------------------------
+    80→// types + small helpers
+    81→// ---------------------------------------------------------------------------
+    82→
+    83→/** One row of the library table (also consumed by the report-card dialog). */
+    84→export interface BrainRow {
+    85→  id: string;
+    86→  name: string;
+    87→  task: string;
+    88→  generation: number;
+    89→  score: number;
+    90→  note: string | null;
+    91→  createdAt: string;
+    92→  updatedAt: string;
+    93→  snapshotBytes: number;
+    94→}
+    95→
+    96→type TaskFilter = "all" | "dino" | "bicycle" | "lab";
+    97→
+    98→const TASK_META: Record<
+    99→  string,
+   100→  { label: string; icon: typeof Gamepad2; badge: string; iconColor: string }
+   101→> = {
+   102→  dino: {
+   103→    label: "Dino",
+   104→    icon: Gamepad2,
+   105→    badge: "border-amber-500/30 bg-amber-500/10 text-amber-300",
+   106→    iconColor: "text-amber-400",
+   107→  },
+   108→  bicycle: {
+   109→    label: "Bicycle",
+   110→    icon: Bike,
+   111→    badge: "border-rose-500/30 bg-rose-500/10 text-rose-300",
+   112→    iconColor: "text-rose-400",
+   113→  },
+   114→  lab: {
+   115→    label: "Lab",
+   116→    icon: Brain,
+   117→    badge: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+   118→    iconColor: "text-emerald-400",
+   119→  },
+   120→};
+   121→
+   122→const FILTERS: { value: TaskFilter; label: string; icon: typeof Gamepad2 }[] = [
+   123→  { value: "all", label: "All", icon: LayoutGrid },
+   124→  { value: "dino", label: "Dino", icon: Gamepad2 },
+   125→  { value: "bicycle", label: "Bicycle", icon: Bike },
+   126→  { value: "lab", label: "Lab", icon: FlaskConical },
+   127→];
+   128→
+   129→export function taskMeta(task: string) {
+   130→  return (
+   131→    TASK_META[task] ?? {
+   132→      label: task ? task.charAt(0).toUpperCase() + task.slice(1) : "Unknown",
+   133→      icon: FlaskConical,
+   134→      badge: "border-border bg-muted text-muted-foreground",
+   135→      iconColor: "text-muted-foreground",
+   136→    }
+   137→  );
+   138→}
+   139→
+   140→export function formatScore(task: string, score: number): string {
+   141→  const num =
+   142→    Math.abs(score) >= 1000 ? `${(score / 1000).toFixed(1)}k` : `${Math.round(score * 10) / 10}`;
+   143→  if (task === "dino") return `${num} pts`;
+   144→  if (task === "bicycle") return `${num} m`;
+   145→  return num;
+   146→}
+   147→
+   148→export function formatBytes(n: number): string {
+   149→  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+   150→  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`;
+   151→  return `${n} B`;
+   152→}
+   153→
+   154→export function relativeDate(iso: string): string {
+   155→  try {
+   156→    return formatDistanceToNow(new Date(iso), { addSuffix: true });
+   157→  } catch {
+   158→    return "unknown";
+   159→  }
+   160→}
+   161→
+   162→function sanitizeFileName(name: string): string {
+   163→  const clean = name
+   164→    .toLowerCase()
+   165→    .replace(/[^a-z0-9-_]+/g, "-")
+   166→    .replace(/^-+|-+$/g, "");
+   167→  return clean || "brain";
+   168→}
+   169→
+   170→export async function fetchBrain(id: string): Promise<{ brain: BrainRow; snapshot: BrainSnapshot }> {
+   171→  const res = await fetch(`/api/brains/${id}`, { cache: "no-store" });
+   172→  const data = await res.json().catch(() => ({}));
+   173→  if (!res.ok) {
+   174→    throw new Error(data?.error ?? `Could not fetch brain (${res.status})`);
+   175→  }
+   176→  if (!data?.snapshot || typeof data.snapshot !== "object" || !data.snapshot.weights) {
+   177→    throw new Error("Stored snapshot is malformed");
+   178→  }
+   179→  return data;
+   180→}
+   181→
+   182→const SCROLLBAR =
+   183→  "[&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border";
+   184→
+   185→// ---------------------------------------------------------------------------
+   186→// task badge
+   187→// ---------------------------------------------------------------------------
+   188→
+   189→export function TaskBadge({ task }: { task: string }) {
+   190→  const meta = taskMeta(task);
+   191→  const Icon = meta.icon;
+   192→  return (
+   193→    <Badge variant="outline" className={cn("gap-1", meta.badge)}>
+   194→      <Icon className="h-3 w-3" aria-hidden />
+   195→      {meta.label}
+   196→    </Badge>
+   197→  );
+   198→}
+   199→
+   200→// ---------------------------------------------------------------------------
+   201→// main component
+   202→// ---------------------------------------------------------------------------
+   203→
+   204→export function BrainLibrary(_props: BrainLibraryProps = {}) {
+   205→  const [brains, setBrains] = useState<BrainRow[]>([]);
+   206→  const [loading, setLoading] = useState(true);
+   207→  const [error, setError] = useState<string | null>(null);
+   208→  const [taskFilter, setTaskFilter] = useState<TaskFilter>("all");
+   209→  const [query, setQuery] = useState("");
+   210→  const [busyId, setBusyId] = useState<string | null>(null);
+   211→  const [deleteTarget, setDeleteTarget] = useState<BrainRow | null>(null);
+   212→  const [deleteBusy, setDeleteBusy] = useState(false);
+   213→  const [importOpen, setImportOpen] = useState(false);
+   214→  const [importing, setImporting] = useState(false);
+   215→  const [dragOver, setDragOver] = useState(false);
+   216→  /** the brain whose report-card dialog is open (Task 10-b) */
+   217→  const [reportRow, setReportRow] = useState<BrainRow | null>(null);
+   218→
+   219→  const fileInputRef = useRef<HTMLInputElement>(null);
+   220→
+   221→  const loadList = useCallback(async (task: TaskFilter) => {
+   222→    setLoading(true);
+   223→    setError(null);
+   224→    try {
+   225→      const qs = task !== "all" ? `?task=${encodeURIComponent(task)}` : "";
+   226→      const res = await fetch(`/api/brains${qs}`, { cache: "no-store" });
+   227→      const data = await res.json().catch(() => ({}));
+   228→      if (!res.ok) throw new Error(data?.error ?? `Server responded ${res.status}`);
+   229→      setBrains(Array.isArray(data.brains) ? (data.brains as BrainRow[]) : []);
+   230→    } catch (err) {
+   231→      const msg = err instanceof Error ? err.message : "Failed to load the library";
+   232→      setError(msg);
+   233→      if (brains.length > 0) toast.error(`Couldn't refresh the library: ${msg}`);
+   234→    } finally {
+   235→      setLoading(false);
+   236→    }
+   237→  }, [brains.length]);
+   238→
+   239→  useEffect(() => {
+   240→    void loadList("all");
+   241→  }, []);
+   242→
+   243→  const handleFilterChange = (task: TaskFilter) => {
+   244→    setTaskFilter(task);
+   245→    void loadList(task);
+   246→  };
+   247→
+   248→  const visible = useMemo(() => {
+   249→    const q = query.trim().toLowerCase();
+   250→    return brains.filter((b) => {
+   251→      if (q) {
+   252→        const haystack = `${b.name} ${b.task} ${b.note ?? ""}`.toLowerCase();
+   253→        if (!haystack.includes(q)) return false;
+   254→      }
+   255→      return true;
+   256→    });
+   257→  }, [brains, query]);
+   258→
+   259→  const totalBytes = useMemo(() => brains.reduce((acc, b) => acc + (b.snapshotBytes ?? 0), 0), [brains]);
+   260→
+   261→  // ----- actions ----------------------------------------------------------
+   262→
+   263→  const handleLoad = async (row: BrainRow) => {
+   264→    setBusyId(row.id);
+   265→    try {
+   266→      const { snapshot } = await fetchBrain(row.id);
+   267→      useBrainStore.getState().requestLoad(row.task, snapshot, row.name);
+   268→      const meta = taskMeta(row.task);
+   269→      toast.success(`Loaded "${row.name}" — open the ${meta.label} tab to continue training`);
+   270→    } catch (err) {
+   271→      toast.error(err instanceof Error ? err.message : "Load failed");
+   272→    } finally {
+   273→      setBusyId(null);
+   274→    }
+   275→  };
+   276→
+   277→  const handleExport = async (row: BrainRow) => {
+   278→    setBusyId(row.id);
+   279→    try {
+   280→      const { snapshot } = await fetchBrain(row.id);
+   281→      const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
+   282→      const url = URL.createObjectURL(blob);
+   283→      const a = document.createElement("a");
+   284→      a.href = url;
+   285→      a.download = `fly-brain-${sanitizeFileName(row.name)}-gen${row.generation}.json`;
+   286→      document.body.appendChild(a);
+   287→      a.click();
+   288→      a.remove();
+   289→      URL.revokeObjectURL(url);
+   290→      toast.success(`Exported "${row.name}" (gen ${row.generation}) as JSON`);
+   291→    } catch (err) {
+   292→      toast.error(err instanceof Error ? err.message : "Export failed");
+   293→    } finally {
+   294→      setBusyId(null);
+   295→    }
+   296→  };
+   297→
+   298→  const handleDelete = async () => {
+   299→    if (!deleteTarget) return;
+   300→    setDeleteBusy(true);
+   301→    const row = deleteTarget;
+   302→    try {
+   303→      const res = await fetch(`/api/brains/${row.id}`, { method: "DELETE" });
+   304→      const data = await res.json().catch(() => ({}));
+   305→      if (!res.ok) throw new Error(data?.error ?? `Delete failed (${res.status})`);
+   306→      setBrains((bs) => bs.filter((b) => b.id !== row.id));
+   307→      toast.success(`Deleted "${row.name}" — that connectome is gone`);
+   308→      setDeleteTarget(null);
+   309→    } catch (err) {
+   310→      toast.error(err instanceof Error ? err.message : "Delete failed");
+   311→    } finally {
+   312→      setDeleteBusy(false);
+   313→    }
+   314→  };
+   315→
+   316→  const handleImportFile = async (file: File) => {
+   317→    setImporting(true);
+   318→    try {
+   319→      const text = await file.text();
+   320→      let parsed: unknown;
+   321→      try {
+   322→        parsed = JSON.parse(text);
+   323→      } catch {
+   324→        throw new Error("That file isn't valid JSON");
+   325→      }
+   326→      const snap = parsed as Partial<BrainSnapshot> | null;
+   327→      if (!snap || typeof snap !== "object" || Array.isArray(snap)) {
+   328→        throw new Error("Not a fly-brain file — expected a JSON object");
+   329→      }
+   330→      if (snap.version !== 1) throw new Error(`Unsupported brain version: ${String(snap.version)}`);
+   331→      if (typeof snap.task !== "string" || !snap.task.trim()) throw new Error("Snapshot is missing its task");
+   332→      if (!snap.arch || typeof snap.arch !== "object") throw new Error("Snapshot is missing its architecture");
+   333→      if (!snap.weights || typeof snap.weights !== "object") throw new Error("Snapshot is missing its weights");
+   334→      for (const key of ["kenyonToMbon", "mbonToMotor", "mbonBias", "motorBias"] as const) {
+   335→        if (!Array.isArray(snap.weights[key])) throw new Error(`Snapshot weights.${key} is missing`);
+   336→      }
+   337→
+   338→      const fallbackName = file.name
+   339→        .replace(/\.json$/i, "")
+   340→        .replace(/[_-]+/g, " ")
+   341→        .trim();
+   342→      const name =
+   343→        typeof snap.name === "string" && snap.name.trim() ? snap.name.trim() : fallbackName || "Imported brain";
+   344→
+   345→      const res = await fetch("/api/brains", {
+   346→        method: "POST",
+   347→        headers: { "Content-Type": "application/json" },
+   348→        body: JSON.stringify({
+   349→          name,
+   350→          task: snap.task,
+   351→          generation: typeof snap.generation === "number" ? snap.generation : 0,
+   352→          score: typeof snap.score === "number" ? snap.score : 0,
+   353→          note: typeof snap.meta?.note === "string" ? snap.meta.note : undefined,
+   354→          snapshot: snap,
+   355→        }),
+   356→      });
+   357→      const data = await res.json().catch(() => ({}));
+   358→      if (!res.ok) throw new Error(data?.error ?? `Import failed (${res.status})`);
+   359→
+   360→      toast.success(`Imported "${data.brain?.name ?? name}" (gen ${data.brain?.generation ?? 0}) into the library`);
+   361→      setImportOpen(false);
+   362→      await loadList(taskFilter);
+   363→    } catch (err) {
+   364→      toast.error(err instanceof Error ? err.message : "Import failed");
+   365→    } finally {
+   366→      setImporting(false);
+   367→      if (fileInputRef.current) fileInputRef.current.value = "";
+   368→    }
+   369→  };
+   370→
+   371→  // ----- report card (Task 10-b) ------------------------------------------
+   372→
+   373→  const handleOpenReport = (row: BrainRow) => {
+   374→    playSound("click");
+   375→    setReportRow(row);
+   376→  };
+   377→
+   378→  // ----- render helpers ---------------------------------------------------
+   379→
+   380→  const showEmptyState = !loading && !error && visible.length === 0;
+   381→  const showFilteredEmpty = showEmptyState && (brains.length > 0 || query.trim() !== "");
+   382→
+   383→  const rowActions = (row: BrainRow, full = false) => (
+   384→    <div className={cn("flex items-center gap-2", full && "w-full")}>
+   385→      <Button
+   386→        size="sm"
+   387→        className={cn("h-11 gap-1.5 bg-emerald-600 px-4 text-white hover:bg-emerald-500", full && "flex-1")}
+   388→        disabled={busyId === row.id}
+   389→        onClick={() => void handleLoad(row)}
+   390→        aria-label={`Load ${row.name} into the trainer`}
+   391→      >
+   392→        {busyId === row.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+   393→        Load
+   394→      </Button>
+   395→      <Button
+   396→        variant="outline"
+   397→        size={full ? "sm" : "icon"}
+   398→        className={cn(
+   399→          "h-11 shrink-0 border-teal-500/30 hover:border-teal-500/50 hover:bg-teal-500/10 hover:text-teal-600 dark:hover:text-teal-300",
+   400→          full ? "flex-1 gap-1.5 px-4" : "w-11",
+   401→        )}
+   402→        disabled={busyId === row.id}
+   403→        onClick={() => handleOpenReport(row)}
+   404→        aria-label={`Open report card for ${row.name}`}
+   405→        title="Report card"
+   406→      >
+   407→        <GraduationCap className="h-4 w-4" aria-hidden />
+   408→        {full ? "Report card" : null}
+   409→      </Button>
+   410→      <DropdownMenu>
+   411→        <DropdownMenuTrigger asChild>
+   412→          <Button
+   413→            variant="outline"
+   414→            size="icon"
+   415→            className="h-11 w-11 shrink-0"
+   416→            disabled={busyId === row.id}
+   417→            aria-label={`More actions for ${row.name}`}
+   418→          >
+   419→            <MoreHorizontal className="h-4 w-4" />
+   420→          </Button>
+   421→        </DropdownMenuTrigger>
+   422→        <DropdownMenuContent align="end" className="w-44">
+   423→          <DropdownMenuItem
+   424→            className="min-h-11 cursor-pointer"
+   425→            onSelect={() => void handleExport(row)}
+   426→          >
+   427→            <Download className="h-4 w-4" /> Export JSON
+   428→          </DropdownMenuItem>
+   429→          <DropdownMenuItem
+   430→            className="min-h-11 cursor-pointer text-rose-400 focus:text-rose-300"
+   431→            onSelect={() => setDeleteTarget(row)}
+   432→          >
+   433→            <Trash2 className="h-4 w-4" /> Delete
+   434→          </DropdownMenuItem>
+   435→        </DropdownMenuContent>
+   436→      </DropdownMenu>
+   437→    </div>
+   438→  );
+   439→
+   440→  // ----- render -----------------------------------------------------------
+   441→
+   442→  return (
+   443→    <div data-testid="brain-library" className="w-full">
+   444→      {/* sonner toaster — layout only mounts the radix one, so mount it here */}
+   445→      <Toaster position="bottom-right" />
+   446→
+   447→      <Card className="gap-4 border-border/60 bg-card/70 py-5 backdrop-blur-sm sm:py-6">
+   448→        <CardHeader className="border-b border-border/60 px-4 pb-4 sm:px-6">
+   449→          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+   450→            <div className="flex items-start gap-3">
+   451→              <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-emerald-500/30 bg-emerald-500/10">
+   452→                <Brain className="h-5 w-5 text-emerald-400" aria-hidden />
+   453→              </div>
+   454→              <div>
+   455→                <CardTitle className="text-lg">Brain Library</CardTitle>
+   456→                <CardDescription className="mt-1 max-w-xl text-sm">
+   457→                  Saved connectomes. Load one and the fly remembers everything it learned —
+   458→                  weights, generation, scars.
+   459→                </CardDescription>
+   460→              </div>
+   461→            </div>
+   462→            <div className="flex shrink-0 items-center gap-2">
+   463→              <Button
+   464→                variant="outline"
+   465→                size="icon"
+   466→                className="h-11 w-11"
+   467→                onClick={() => void loadList(taskFilter)}
+   468→                disabled={loading}
+   469→                aria-label="Refresh the brain library"
+   470→                title="Refresh"
+   471→              >
+   472→                <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+   473→              </Button>
+   474→              <Button
+   475→                size="sm"
+   476→                className="h-11 gap-1.5 bg-emerald-600 px-4 text-white hover:bg-emerald-500"
+   477→                onClick={() => setImportOpen(true)}
+   478→              >
+   479→                <Upload className="h-4 w-4" />
+   480→                Import
+   481→              </Button>
+   482→            </div>
+   483→          </div>
+   484→        </CardHeader>
+   485→
+   486→        <CardContent className="px-4 sm:px-6">
+   487→          {/* filters + search */}
+   488→          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+   489→            <div
+   490→              role="tablist"
+   491→              aria-label="Filter brains by task"
+   492→              className="inline-flex max-w-full items-center gap-1 overflow-x-auto rounded-xl border border-border/60 bg-muted/40 p-1"
+   493→            >
+   494→              {FILTERS.map((f) => {
+   495→                const active = taskFilter === f.value;
+   496→                const Icon = f.icon;
+   497→                return (
+   498→                  <button
+   499→                    key={f.value}
+   500→                    role="tab"
+   501→                    type="button"
+   502→                    aria-selected={active}
+   503→                    onClick={() => handleFilterChange(f.value)}
+   504→                    className={cn(
+   505→                      "flex h-11 shrink-0 items-center gap-1.5 rounded-lg px-3 text-sm font-medium transition-colors",
+   506→                      active
+   507→                        ? "border border-border/60 bg-card text-foreground shadow-sm"
+   508→                        : "text-muted-foreground hover:bg-card/60 hover:text-foreground"
+   509→                    )}
+   510→                  >
+   511→                    <Icon
+   512→                      className={cn(
+   513→                        "h-4 w-4",
+   514→                        f.value === "dino" && "text-amber-400",
+   515→                        f.value === "bicycle" && "text-rose-400",
+   516→                        f.value === "lab" && "text-emerald-400",
+   517→                        f.value === "all" && (active ? "text-foreground" : "text-muted-foreground")
+   518→                      )}
+   519→                      aria-hidden
+   520→                    />
+   521→                    {f.label}
+   522→                  </button>
+   523→                );
+   524→              })}
+   525→            </div>
+   526→            <div className="relative w-full sm:w-64">
+   527→              <Search
+   528→                className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+   529→                aria-hidden
+   530→              />
+   531→              <Input
+   532→                value={query}
+   533→                onChange={(e) => setQuery(e.target.value)}
+   534→                placeholder="Search by name…"
+   535→                className="h-11 pl-9"
+   536→                aria-label="Search saved brains by name"
+   537→              />
+   538→            </div>
+   539→          </div>
+   540→
+   541→          {/* content */}
+   542→          <div className="mt-4">
+   543→            {error && brains.length === 0 ? (
+   544→              <div className="flex flex-col items-center gap-3 rounded-xl border border-rose-500/30 bg-rose-500/5 px-6 py-10 text-center">
+   545→                <FlaskConical className="h-8 w-8 text-rose-400" aria-hidden />
+   546→                <p className="text-sm text-rose-300">Couldn&apos;t reach the brain library: {error}</p>
+   547→                <Button
+   548→                  variant="outline"
+   549→                  className="h-11"
+   550→                  onClick={() => void loadList(taskFilter)}
+   551→                >
+   552→                  <RefreshCw className="h-4 w-4" /> Try again
+   553→                </Button>
+   554→              </div>
+   555→            ) : loading && brains.length === 0 ? (
+   556→              <div className="space-y-2">
+   557→                {[0, 1, 2].map((i) => (
+   558→                  <div
+   559→                    key={i}
+   560→                    className="h-16 animate-pulse rounded-xl border border-border/40 bg-muted/30"
+   561→                    aria-hidden
+   562→                  />
+   563→                ))}
+   564→              </div>
+   565→            ) : showEmptyState ? (
+   566→              <motion.div
+   567→                initial={{ opacity: 0, y: 8 }}
+   568→                animate={{ opacity: 1, y: 0 }}
+   569→                transition={{ duration: 0.35 }}
+   570→                className="flex flex-col items-center gap-3 rounded-xl border border-dashed border-border/70 bg-muted/20 px-6 py-12 text-center"
+   571→              >
+   572→                <motion.div
+   573→                  animate={{ y: [0, -6, 0] }}
+   574→                  transition={{ duration: 3.5, repeat: Infinity, ease: "easeInOut" }}
+   575→                  className="flex h-16 w-16 items-center justify-center rounded-2xl border border-emerald-500/25 bg-emerald-500/10"
+   576→                >
+   577→                  <Brain className="h-8 w-8 text-emerald-400/80" aria-hidden />
+   578→                </motion.div>
+   579→                {showFilteredEmpty ? (
+   580→                  <>
+   581→                    <p className="font-medium">No brains match your filter</p>
+   582→                    <p className="max-w-sm text-sm text-muted-foreground">
+   583→                      Try a different task filter or clear the search box.
+   584→                    </p>
+   585→                    <Button
+   586→                      variant="outline"
+   587→                      className="h-11"
+   588→                      onClick={() => {
+   589→                        setQuery("");
+   590→                        handleFilterChange("all");
+   591→                      }}
+   592→                    >
+   593→                      Clear filters
+   594→                    </Button>
+   595→                  </>
+   596→                ) : (
+   597→                  <>
+   598→                    <p className="font-medium">No saved brains yet</p>
+   599→                    <p className="max-w-sm text-sm text-muted-foreground">
+   600→                      Train a fly in the Dino or Bicycle tab and hit{" "}
+   601→                      <span className="font-medium text-foreground">Save</span> — its connectome
+   602→                      lands here, ready to re-load, export or share.
+   603→                    </p>
+   604→                  </>
+   605→                )}
+   606→              </motion.div>
+   607→            ) : (
+   608→              <>
+   609→                {/* desktop table */}
+   610→                <div
+   611→                  className={cn(
+   612→                    "hidden max-h-96 overflow-y-auto rounded-xl border border-border/60 sm:block",
+   613→                    SCROLLBAR
+   614→                  )}
+   615→                >
+   616→                  <Table>
+   617→                    <TableHeader>
+   618→                      <TableRow className="hover:bg-transparent">
+   619→                        <TableHead className="pl-4 text-muted-foreground">Brain</TableHead>
+   620→                        <TableHead className="text-muted-foreground">Task</TableHead>
+   621→                        <TableHead className="text-muted-foreground">Gen</TableHead>
+   622→                        <TableHead className="text-muted-foreground">Score</TableHead>
+   623→                        <TableHead className="text-muted-foreground">Size</TableHead>
+   624→                        <TableHead className="text-muted-foreground">Saved</TableHead>
+   625→                        <TableHead className="pr-4 text-right text-muted-foreground">
+   626→                          Actions
+   627→                        </TableHead>
+   628→                      </TableRow>
+   629→                    </TableHeader>
+   630→                    <TableBody>
+   631→                      {visible.map((row) => (
+   632→                        <TableRow key={row.id} className="group">
+   633→                          <TableCell className="max-w-[220px] py-3 pl-4">
+   634→                            <div className="truncate font-medium">{row.name}</div>
+   635→                            {row.note ? (
+   636→                              <div className="truncate text-xs text-muted-foreground" title={row.note}>
+   637→                                {row.note}
+   638→                              </div>
+   639→                            ) : null}
+   640→                          </TableCell>
+   641→                          <TableCell>
+   642→                            <TaskBadge task={row.task} />
+   643→                          </TableCell>
+   644→                          <TableCell className="font-mono text-xs text-muted-foreground">
+   645→                            G{row.generation}
+   646→                          </TableCell>
+   647→                          <TableCell className="whitespace-nowrap">
+   648→                            {formatScore(row.task, row.score)}
+   649→                          </TableCell>
+   650→                          <TableCell className="whitespace-nowrap text-muted-foreground">
+   651→                            {formatBytes(row.snapshotBytes)}
+   652→                          </TableCell>
+   653→                          <TableCell
+   654→                            className="whitespace-nowrap text-muted-foreground"
+   655→                            title={new Date(row.createdAt).toLocaleString()}
+   656→                          >
+   657→                            {relativeDate(row.createdAt)}
+   658→                          </TableCell>
+   659→                          <TableCell className="py-2.5 pr-4">
+   660→                            <div className="flex justify-end">{rowActions(row)}</div>
+   661→                          </TableCell>
+   662→                        </TableRow>
+   663→                      ))}
+   664→                    </TableBody>
+   665→                  </Table>
+   666→                </div>
+   667→
+   668→                {/* mobile stacked cards */}
+   669→                <div
+   670→                  className={cn(
+   671→                    "flex max-h-96 flex-col gap-3 overflow-y-auto sm:hidden",
+   672→                    SCROLLBAR
+   673→                  )}
+   674→                >
+   675→                  {visible.map((row, i) => (
+   676→                    <motion.div
+   677→                      key={row.id}
+   678→                      initial={{ opacity: 0, y: 6 }}
+   679→                      animate={{ opacity: 1, y: 0 }}
+   680→                      transition={{ duration: 0.25, delay: Math.min(i * 0.04, 0.2) }}
+   681→                      className="rounded-xl border border-border/60 bg-background/40 p-4"
+   682→                    >
+   683→                      <div className="flex items-start justify-between gap-2">
+   684→                        <div className="min-w-0">
+   685→                          <div className="truncate font-medium">{row.name}</div>
+   686→                          {row.note ? (
+   687→                            <div className="truncate text-xs text-muted-foreground">{row.note}</div>
+   688→                          ) : null}
+   689→                        </div>
+   690→                        <TaskBadge task={row.task} />
+   691→                      </div>
+   692→                      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+   693→                        <span className="font-mono">G{row.generation}</span>
+   694→                        <span>{formatScore(row.task, row.score)}</span>
+   695→                        <span>{formatBytes(row.snapshotBytes)}</span>
+   696→                        <span title={new Date(row.createdAt).toLocaleString()}>
+   697→                          {relativeDate(row.createdAt)}
+   698→                        </span>
+   699→                      </div>
+   700→                      <div className="mt-3">{rowActions(row, true)}</div>
+   701→                    </motion.div>
+   702→                  ))}
+   703→                </div>
+   704→              </>
+   705→            )}
+   706→          </div>
+   707→
+   708→          {/* footer stats */}
+   709→          {!error && brains.length > 0 && (
+   710→            <p className="mt-3 text-xs text-muted-foreground" aria-live="polite">
+   711→              {brains.length} saved {brains.length === 1 ? "brain" : "brains"} ·{" "}
+   712→              {formatBytes(totalBytes)} of connectome data
+   713→            </p>
+   714→          )}
+   715→        </CardContent>
+   716→      </Card>
+   717→
+   718→      {/* import dialog */}
+   719→      <Dialog open={importOpen} onOpenChange={(open) => !importing && setImportOpen(open)}>
+   720→        <DialogContent className="sm:max-w-md">
+   721→          <DialogHeader>
+   722→            <DialogTitle className="flex items-center gap-2">
+   723→              <Upload className="h-4 w-4 text-emerald-400" aria-hidden />
+   724→              Import a brain
+   725→            </DialogTitle>
+   726→            <DialogDescription>
+   727→              Pick a <code className="rounded bg-muted px-1 py-0.5 text-xs">fly-brain-*.json</code>{" "}
+   728→              file — it will be validated and stored in the library.
+   729→            </DialogDescription>
+   730→          </DialogHeader>
+   731→          <div
+   732→            onDragOver={(e) => {
+   733→              e.preventDefault();
+   734→              setDragOver(true);
+   735→            }}
+   736→            onDragLeave={() => setDragOver(false)}
+   737→            onDrop={(e) => {
+   738→              e.preventDefault();
+   739→              setDragOver(false);
+   740→              const file = e.dataTransfer.files?.[0];
+   741→              if (file) void handleImportFile(file);
+   742→            }}
+   743→            className={cn(
+   744→              "flex flex-col items-center gap-3 rounded-xl border border-dashed p-8 text-center transition-colors",
+   745→              dragOver
+   746→                ? "border-emerald-500/60 bg-emerald-500/10"
+   747→                : "border-border bg-muted/20"
+   748→            )}
+   749→          >
+   750→            <FileJson className="h-8 w-8 text-muted-foreground" aria-hidden />
+   751→            <p className="text-sm text-muted-foreground">
+   752→              Drag &amp; drop a <code className="rounded bg-muted px-1 py-0.5">.json</code> brain file
+   753→              here
+   754→            </p>
+   755→            <Button
+   756→              variant="outline"
+   757→              className="h-11"
+   758→              onClick={() => fileInputRef.current?.click()}
+   759→              disabled={importing}
+   760→            >
+   761→              {importing ? (
+   762→                <>
+   763→                  <Loader2 className="h-4 w-4 animate-spin" /> Importing…
+   764→                </>
+   765→              ) : (
+   766→                <>
+   767→                  <Upload className="h-4 w-4" /> Choose file
+   768→                </>
+   769→              )}
+   770→            </Button>
+   771→            <input
+   772→              ref={fileInputRef}
+   773→              type="file"
+   774→              accept=".json,application/json"
+   775→              className="hidden"
+   776→              onChange={(e) => {
+   777→                const file = e.target.files?.[0];
+   778→                if (file) void handleImportFile(file);
+   779→              }}
+   780→              aria-label="Brain JSON file"
+   781→            />
+   782→          </div>
+   783→        </DialogContent>
+   784→      </Dialog>
+   785→
+   786→      {/* delete confirmation */}
+   787→      <AlertDialog
+   788→        open={!!deleteTarget}
+   789→        onOpenChange={(open) => {
+   790→          if (!open && !deleteBusy) setDeleteTarget(null);
+   791→        }}
+   792→      >
+   793→        <AlertDialogContent>
+   794→          <AlertDialogHeader>
+   795→            <AlertDialogTitle>
+   796→              Delete &ldquo;{deleteTarget?.name}&rdquo;?
+   797→            </AlertDialogTitle>
+   798→            <AlertDialogDescription>
+   799→              This erases the saved connectome permanently — every weight it learned since
+   800→              generation&nbsp;0. This can&apos;t be undone.
+   801→            </AlertDialogDescription>
+   802→          </AlertDialogHeader>
+   803→          <AlertDialogFooter>
+   804→            <AlertDialogCancel className="h-11" disabled={deleteBusy}>
+   805→              Cancel
+   806→            </AlertDialogCancel>
+   807→            <AlertDialogAction
+   808→              className="h-11 border-rose-500/40 bg-rose-600 text-white hover:bg-rose-500"
+   809→              disabled={deleteBusy}
+   810→              onClick={(e) => {
+   811→                e.preventDefault();
+   812→                void handleDelete();
+   813→              }}
+   814→            >
+   815→              {deleteBusy ? (
+   816→                <Loader2 className="h-4 w-4 animate-spin" />
+   817→              ) : (
+   818→                <Trash2 className="h-4 w-4" />
+   819→              )}
+   820→              Delete brain
+   821→            </AlertDialogAction>
+   822→          </AlertDialogFooter>
+   823→        </AlertDialogContent>
+   824→      </AlertDialog>
+   825→
+   826→      {/* per-brain report card (Task 10-b) */}
+   827→      <BrainReportCard
+   828→        row={reportRow}
+   829→        open={!!reportRow}
+   830→        onOpenChange={(open) => {
+   831→          if (!open) setReportRow(null);
+   832→        }}
+   833→      />
+   834→    </div>
+   835→  );
+   836→}
+   837→
