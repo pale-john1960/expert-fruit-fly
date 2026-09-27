@@ -321,3 +321,32 @@ Stage Summary:
 - All features verified end-to-end in the integrated build with zero console errors; engine untouched; lint clean
 - GitHub push STILL blocked: /home/z/my-project/upload/ empty (SSH key never arrived); push-github.ts remains a safe no-op
 - Next-round candidates: brain family-tree/lineage view, export conditioning-demo results, human-vs-fly BICYCLE challenge (keyboard balance), sound volume slider, seeded reproducible runs for demos
+
+---
+Task ID: 9-a
+Agent: full-stack-developer (bicycle challenge) — entry reconstructed by lead: the agent's code landed (BicycleTrainer.tsx + bicycle/trainer.ts + scene.tsx) but it died before reporting; lead verified everything in-browser
+
+Task: "You vs the fly" bicycle challenge — keyboard-balanced head-to-head ride against the champion brain
+
+Work Log:
+- BicycleTrainer.tsx: challenge mode UI — entry button (disabled until core.bestBrain exists, tooltip on wrapper span), W/L tally chips persisting across challenges AND population resets, "← → steer · balance!" hint chips, "Lean · you" φ meter (rotating gradient bar), YOU/FLY distance chips + CHALLENGE BEST, result overlay (data-testid="challenge-result") with three wordings (You out-balanced / The fly rides on / Dead heat) + Rematch + Back to training, "challenges also train the champion" caption
+- Keyboard: window keydown/keyup listeners ONLY while challenging (ArrowLeft/Right + A/D → core.challenge.keys.left/right refs), preventDefault on arrows, editable-target guard, blur-unstick (alt-tab can't stick a key), repeat-tolerant
+- trainer.ts: challenge sim lives on the core (parked population pattern like watch-best); human rider steers from held keys (steer ramps to ±0.5 rad), auto-pedal cruise; champion clone driven through the same buildRetina + stepBike path as training riders; per-rider fall detection; both-done or 30s survivor cap; champion receives its usual distance sugar + fall punishment during challenges (duels train it); scene.tsx distinguishes the two riders (amber YOU / emerald FLY markers)
+- Lead verification (session round9-lead): disabled→enabled after 25s training (GEN 10, best 16 m); entry HUD complete; ArrowRight held mid-ride moves the lean meter (-36.3° frozen at fall → -16.7° responsive while riding); human fell unaided at 6 m vs fly's 4 m → "You out-balanced the fly, 6 m vs 4 m" + W/L "You 1 · Fly 0"; rematch → fly won 4 m vs 3 m → "The fly rides on — 3 m vs 4 m. Keep breeding!" + "You 1 · Fly 1"; Back to training → overlay gone, population resumed at GEN 11 with presets intact; zero console errors throughout
+
+Stage Summary:
+- Bicycle challenge fully functional and verified end-to-end; normal training/presets/turbo regression clean; engine + physics dynamics untouched (additive helpers only)
+
+---
+Task ID: 9-b
+Agent: full-stack-developer (dino lineage tree) — entry reconstructed by lead: code landed (DinoTrainer.tsx + dino/evolution.ts) but the agent died before reporting; lead verified in-browser
+
+Task: Champion lineage ("family tree") — ancestry tracking + compact SVG tree for the Dino trainer
+
+Work Log:
+- Lineage tracking (in-memory, session scope, zero API/engine changes): every population brain gets a lineage node (id, parent ids, generation, score); the evolution step records parent links — elitism clones get 1 parent, tournament-crossover children get 2; champion line = walk back from bestBrain's node choosing the higher-scoring parent at forks, side branches kept at depth 1; capped ~12 generations / ~20 nodes with "older ancestry collapsed" chip; resets with the population (caption says so)
+- DinoTrainer.tsx: collapsible "Champion lineage" Card below the Score-by-generation chart — GitBranch icon, one-line summary ("10 generations of breeding — from gen 1's score 64 to gen 11's 85"), hand-drawn SVG (aria-label "Champion family tree…", class block): main-line circles sized/tinted amber by score connected left→right, crossover parents as smaller rose-tinted side nodes merging diagonally, dashed emerald ring + ★ champion on the current best, native <title> tooltips per node ("Gen 6 · score 77 · crossover child"), generation ticks + first/last score labels, legend row (main line / crossover parent / champion); recomputed on champion change at the 4Hz flush cadence, not per tick; empty state "No champion yet — finish a generation to start the family line"
+- Lead verification (session round9-lead): card present pre-training; ×10 training 25s → GEN 17 / HI 85; expanded card → SVG with 16 nodes + 15 tooltips read via DOM: "Gen 1 · score 64 · founding fly" → elite clones → "Gen 6 · score 77 · crossover child" → … → "Gen 11 · score 85 · crossover child" (champion), side branches "Gen 3/5/9/10 · crossover parent"; reset (paused) → empty state "No champion yet"; zero console errors
+
+Stage Summary:
+- Lineage tree fully functional: recording the actual evolution lineage costs nothing at runtime and renders a readable family tree with tooltips; regression clean (duel button, duck-defense chip, sounds all still working); engine untouched

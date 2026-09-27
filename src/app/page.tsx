@@ -14,6 +14,8 @@ import {
   useSoundMuted,
   toggleSoundMuted,
   hydrateSoundMuted,
+  useSoundVolume,
+  setSoundVolume,
 } from "@/lib/sound";
 import {
   Bike,
@@ -28,11 +30,15 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 
 /* ------------------------------------------------------------------ */
@@ -248,6 +254,7 @@ export default function Home() {
   const banner = useBrainStore((s) => s.banner);
   const clearBanner = useBrainStore((s) => s.clearBanner);
   const muted = useSoundMuted();
+  const volume = useSoundVolume();
 
   useEffect(() => {
     hydrateSoundMuted();
@@ -282,12 +289,6 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const handleSoundToggle = () => {
-    const willBeMuted = !muted;
-    toggleSoundMuted();
-    if (!willBeMuted) playSound("click");
-  };
-
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       {/* Header */}
@@ -308,24 +309,80 @@ export default function Home() {
             </div>
           </div>
           <div className="ml-auto flex items-center gap-1.5">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  aria-label="Toggle sound"
-                  onClick={handleSoundToggle}
-                  className="h-9 w-9 px-0 text-muted-foreground hover:text-foreground"
-                >
-                  {muted ? (
-                    <VolumeX className="h-4 w-4" />
-                  ) : (
-                    <Volume2 className="h-4 w-4" />
-                  )}
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Sound on/off</TooltipContent>
-            </Tooltip>
+            <Popover>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      aria-label="Sound settings"
+                      className="h-9 w-9 px-0 text-muted-foreground hover:text-foreground"
+                    >
+                      {muted ? (
+                        <VolumeX className="h-4 w-4" />
+                      ) : (
+                        <Volume2 className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </PopoverTrigger>
+                </TooltipTrigger>
+                <TooltipContent>Volume &amp; mute (M)</TooltipContent>
+              </Tooltip>
+              <PopoverContent align="end" className="w-64 p-4">
+                <div className="flex flex-col gap-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">Sound</span>
+                    <div className="flex items-center gap-2">
+                      <Switch
+                        id="sound-enabled"
+                        checked={!muted}
+                        onCheckedChange={(on) => {
+                          if (on === muted) toggleSoundMuted();
+                        }}
+                        aria-label={muted ? "Unmute" : "Mute"}
+                      />
+                      <Label
+                        htmlFor="sound-enabled"
+                        className="cursor-pointer text-xs text-muted-foreground"
+                      >
+                        {muted ? "muted" : "on"}
+                      </Label>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between">
+                      <Label
+                        htmlFor="volume-slider"
+                        className="text-xs text-muted-foreground"
+                      >
+                        Volume
+                      </Label>
+                      <span className="text-xs font-medium tabular-nums text-foreground">
+                        {Math.round(volume * 100)}%
+                      </span>
+                    </div>
+                    <Slider
+                      id="volume-slider"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={[volume]}
+                      onValueChange={(v) => setSoundVolume(v[0])}
+                      aria-label="Master volume"
+                    />
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 w-full text-xs"
+                    onClick={() => playSound("sugar")}
+                  >
+                    Test chime
+                  </Button>
+                </div>
+              </PopoverContent>
+            </Popover>
             <Button
               variant="ghost"
               size="sm"

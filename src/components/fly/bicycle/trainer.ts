@@ -6,6 +6,13 @@
  * (1/60 s) driven by an rAF accumulator, applies reward/punishment dopamine,
  * ends episodes when every rider is done and evolves the population
  * (elitism top-2 + tournament crossover + mutation).
+ *
+ * Also owns the "You vs the fly" challenge: the training population is
+ * PARKED (not stopped) while a HUMAN rider (keyboard steer, automatic cruise
+ * pedal) races the champion brain clone on the same road. The champion keeps
+ * receiving its usual dopamine (distance sugar + fall shock) during
+ * challenges, and its trained weights are folded back into the trainer's
+ * best brain when the challenge ends, so rematches compound.
  */
 
 import { FlyBrain } from "@/lib/flybrain/engine";
@@ -25,6 +32,7 @@ import {
   steerFromMotors,
   roadCurvature,
   type BikeState,
+  type StepResult,
 } from "./physics";
 import { buildRetina, RETINA_SIZE } from "./retina";
 import { playSound } from "@/lib/sound";
@@ -53,6 +61,37 @@ export interface Rider {
   milestoneFloor: number;
   /** real time (s) when the rider finished — drives the tumble animation */
   doneRealT: number;
+  /** "You vs the fly" challenge marker (undefined for training riders) */
+  tag?: RiderTag;
+}
+
+export type RiderTag = "you" | "fly";
+
+export interface ChallengeResult {
+  winner: "you" | "fly" | "tie";
+  youS: number;
+  flyS: number;
+}
+
+export interface ChallengeState {
+  /** HUMAN rider — keyboard-steered, dummy brain (never stepped) */
+  human: Rider;
+  /** champion clone — driven exactly like a training rider (keeps learning) */
+  fly: Rider;
+  /** held-key state, written by window listeners (refs, never React state) */
+  keys: { left: boolean; right: boolean };
+  /** ramped human steer delta (rad, ±HUMAN_STEER_MAX) */
+  humanSteer: number;
+  /** challenge-local fixed-dt accumulator (real time only — a human rides) */
+  acc: number;
+  simT: number;
+  /** sim time of the first rider's finish — starts the 30 s survivor cap */
+  firstDeathT: number | null;
+  ended: boolean;
+  result: ChallengeResult | null;
+  /** the parked training population (restored on endChallenge) */
+  parkedRiders: Rider[];
+  parkedLeaderIdx: number;
 }
 
 const PUNISH_FALL = -0.5;
@@ -62,6 +101,15 @@ const MILESTONE_BONUS = 0.2;
 const MILESTONE_STEP = 100;
 const MUTATE_RATE = 0.15;
 const MAX_STEPS_PER_FRAME = 600;
+
+// --- "You vs the fly" challenge -------------------------------------------
+const CHALLENGE_SURVIVOR_CAP_S = 30; // survivor's grace after the first fall
+const CHALLENGE_TOTAL_CAP_S = 90; // hard cap (same as a training episode)
+const CHALLENGE_LANE_M = 0.6; // side-by-side lane offset (1.2 m apart)
+const HUMAN_CRUISE_PEDAL = 0.11; // fixed pedal rate → ~7 m/s cruise
+const HUMAN_STEER_MAX = 0.5; // rad — same clamp as steerFromMotors
+const HUMAN_STEER_RAMP_S = 0.15; // hold-to-full-lock ramp time (s)
+const CHALLENGE_TIE_M = 0.5; // distances within this → dead heat
 
 function makeRider(brain: FlyBrain, idx: number): Rider {
   return {
@@ -75,6 +123,73 @@ function makeRider(brain: FlyBrain, idx: number): Rider {
     milestoneFloor: 0,
     doneRealT: 0,
   };
+}
+
+/** A challenge rider: same standing start for both (only the lane differs). */
+function makeChallengeRider(
+  brain: FlyBrain,
+  idx: number,
+  tag: RiderTag,
+  laneU: number,
+  phi0: number,
+  v0: number
+): Rider {
+  const r = makeRider(brain, idx);
+  r.tag = tag;
+  r.st.u = laneU;
+  r.st.psi = 0;
+  r.st.phi = phi0;
+  r.st.omega = 0;
+  r.st.v = v0;
+  return r;
+}
+
+function createChallenge(core: BicycleTrainerCore): ChallengeState {
+  // champion clone — it keeps learning during challenges (lifetime dopamine)
+  const champion = (core.bestBrain ?? core.championBrain()).clone();
+  // one shared random draw → both riders get identical push-off conditions
+  const phi0 = (Math.random() - 0.5) * 0.08;
+  const v0 = 3.0 + Math.random() * 0.6;
+  return {
+    human: makeChallengeRider(
+      new FlyBrain(DEFAULT_ARCH_BICYCLE), // dummy — the human has no brain
+      0,
+      "you",
+      CHALLENGE_LANE_M,
+      phi0,
+      v0
+    ),
+    fly: makeChallengeRider(champion, 1, "fly", -CHALLENGE_LANE_M, phi0, v0),
+    keys: { left: false, right: false },
+    humanSteer: 0,
+    acc: 0,
+    simT: 0,
+    firstDeathT: null,
+    ended: false,
+    result: null,
+    parkedRiders: [],
+    parkedLeaderIdx: 0,
+  };
+}
+
+/**
+ * Human keyboard steering — additive helper; stepBike's validated dynamics
+ * are untouched. While a key is held the target delta ramps to
+ * ±HUMAN_STEER_MAX over ~0.15 s and holds; releasing returns it to 0 at the
+ * same rate (analog-feeling steer, not instant full lock).
+ */
+export function humanSteer(
+  current: number,
+  keys: { left: boolean; right: boolean },
+  dt: number
+): number {
+  const target =
+    ((keys.right ? 1 : 0) - (keys.left ? 1 : 0)) * HUMAN_STEER_MAX;
+  const rate = (HUMAN_STEER_MAX / HUMAN_STEER_RAMP_S) * dt;
+  const d = target - current;
+  if (d > rate) return current + rate;
+  if (d < -rate) return current - rate;
+  return target;
 }
 
 export class BicycleTrainerCore {
@@ -99,6 +214,8 @@ export class BicycleTrainerCore {
   rewardPerMeter = REWARD_PER_METER;
   bestEverDistance = 0;
   bestBrain: FlyBrain | null = null;
+  /** "You vs the fly" challenge — null while normal training runs */
+  challenge: ChallengeState | null = null;
   history: GenRecord[] = [];
   events: TrainerEvent[] = [];
   leaderIdx = 0;
@@ -159,6 +276,21 @@ export class BicycleTrainerCore {
   advance(frameDt: number) {
     this.realTime += frameDt;
     if (this.shake > 0.0001) this.shake *= Math.exp(-frameDt * 5);
+    const ch = this.challenge;
+    if (ch) {
+      // challenge mode: population training is PARKED; the race runs at
+      // real-time fixed dt from the same rAF accumulator pattern (no turbo —
+      // a human is riding)
+      if (ch.ended) return;
+      ch.acc += frameDt;
+      if (ch.acc > MAX_STEPS_PER_FRAME * DT) {
+        ch.acc = MAX_STEPS_PER_FRAME * DT; // never spiral
+      }
+      let steps = Math.floor(ch.acc / DT);
+      ch.acc -= steps * DT;
+      while (steps-- > 0) this.stepChallenge();
+      return;
+    }
     if (!this.running) return;
     this.accumulator += frameDt * this.turbo;
     if (this.accumulator > MAX_STEPS_PER_FRAME * DT) {
@@ -316,6 +448,159 @@ export class BicycleTrainerCore {
     this.trainingBrains = next;
   }
 
+  // ----------------------------------------------------- "You vs the fly"
+
+  /** Enter (or re-enter — Rematch) the challenge. The training population
+   *  is parked and restored on endChallenge(); the champion clone keeps
+   *  learning from its duel dopamine. */
+  startChallenge() {
+    const prev = this.challenge;
+    const parked = prev ? prev.parkedRiders : this.riders;
+    const parkedLeaderIdx = prev ? prev.parkedLeaderIdx : this.leaderIdx;
+    const ch = createChallenge(this);
+    ch.parkedRiders = parked;
+    ch.parkedLeaderIdx = parkedLeaderIdx;
+    this.challenge = ch;
+    this.riders = [ch.human, ch.fly];
+    this.leaderIdx = 0;
+    this.log(
+      "info",
+      prev
+        ? "Rematch — the champion keeps what it learned"
+        : "Challenge — you vs the champion. ← / → to balance!"
+    );
+  }
+
+  /** Leave the challenge: fold the champion's lifetime learning back into
+   *  the trainer's best brain (even on early exit) and restore the parked
+   *  training population — same generation, same world positions. */
+  endChallenge() {
+    const ch = this.challenge;
+    if (!ch) return;
+    this.bestBrain = ch.fly.brain.clone(); // challenges train the champion
+    this.riders = ch.parkedRiders;
+    this.leaderIdx = ch.parkedLeaderIdx;
+    this.challenge = null;
+    this.log("info", "Back to population training");
+  }
+
+  private stepChallenge() {
+    const ch = this.challenge!;
+    ch.simT += DT;
+    const human = ch.human;
+    const fly = ch.fly;
+
+    // --- HUMAN: analog steer from held keys, automatic cruise pedal ---
+    if (human.st.alive) {
+      ch.humanSteer = humanSteer(ch.humanSteer, ch.keys, DT);
+      const res = stepBike(
+        human.st,
+        ch.humanSteer,
+        HUMAN_CRUISE_PEDAL,
+        DT,
+        roadCurvature(human.st.s)
+      );
+      if (res.fell || res.offRoad) {
+        this.finishChallengeRider(human, res, ch, "You");
+      }
+    }
+
+    // --- FLY: the champion brain, driven exactly like a training rider ---
+    if (fly.st.alive) {
+      buildRetina(fly.retina, fly.st, this.road);
+      const motor = fly.brain.step(fly.retina, fly.pendingReward);
+      fly.motor.set(motor);
+      fly.pendingReward = 0;
+      const delta = steerFromMotors(fly.motor, this.steerGain);
+      const res = stepBike(
+        fly.st,
+        delta,
+        fly.motor[2],
+        DT,
+        roadCurvature(fly.st.s)
+      );
+      if (res.fell || res.offRoad) {
+        this.finishChallengeRider(fly, res, ch, "The champion");
+      } else {
+        // progress = sugar (challenges train the champion)
+        const meters = Math.floor(fly.st.s) - fly.meterFloor;
+        if (meters > 0) {
+          fly.meterFloor += meters;
+          fly.pendingReward += this.rewardPerMeter * meters;
+        }
+      }
+    }
+
+    // leader = further alive rider (drives the chase camera)
+    let leadS = -1;
+    for (const r of this.riders) {
+      if (r.st.alive && r.st.s > leadS) {
+        leadS = r.st.s;
+        this.leaderIdx = r.idx;
+      }
+    }
+
+    // end conditions: both done, the survivor's 30 s cap after the first
+    // finish, or the hard 90 s cap (same as a training episode)
+    const bothDone = !human.st.alive && !fly.st.alive;
+    const survivorCap =
+      ch.firstDeathT !== null &&
+      ch.simT - ch.firstDeathT >= CHALLENGE_SURVIVOR_CAP_S;
+    const totalCap = ch.simT >= CHALLENGE_TOTAL_CAP_S;
+    if (bothDone || survivorCap || totalCap) {
+      for (const r of [human, fly]) {
+        if (r.st.alive) {
+          finishRider(r.st, "timeout", ch.simT, { fall: 0, offroad: 0 });
+          r.doneRealT = this.realTime;
+        }
+      }
+      this.finishChallenge();
+    }
+  }
+
+  private finishChallengeRider(
+    r: Rider,
+    res: StepResult,
+    ch: ChallengeState,
+    who: string
+  ) {
+    const reason: "fall" | "offroad" = res.fell ? "fall" : "offroad";
+    const punish = finishRider(r.st, reason, ch.simT, {
+      fall: PUNISH_FALL,
+      offroad: PUNISH_OFFROAD,
+    });
+    r.doneRealT = this.realTime;
+    if (r.tag === "fly") {
+      r.brain.step(r.retina, punish); // the shock, at the moment of failure
+    }
+    if (reason === "fall") this.shake = Math.min(0.9, this.shake + 0.5);
+    playSound("fall", 0.3);
+    if (ch.firstDeathT === null) ch.firstDeathT = ch.simT;
+    this.log(
+      reason,
+      `${who} ${reason === "fall" ? "fell" : "left the road"} at ${r.st.finalS.toFixed(0)} m`
+    );
+  }
+
+  private finishChallenge() {
+    const ch = this.challenge!;
+    if (ch.result) return;
+    const youS = ch.human.st.finalS;
+    const flyS = ch.fly.st.finalS;
+    const winner: ChallengeResult["winner"] =
+      Math.abs(youS - flyS) < CHALLENGE_TIE_M
+        ? "tie"
+        : youS > flyS
+          ? "you"
+          : "fly";
+    ch.result = { winner, youS, flyS };
+    ch.ended = true;
+    this.log(
+      "info",
+      `Challenge over — you ${youS.toFixed(0)} m vs the fly ${flyS.toFixed(0)} m`
+    );
+  }
+
   // -------------------------------------------------------------- controls
 
   setRunning(run: boolean) {
@@ -355,6 +640,7 @@ export class BicycleTrainerCore {
   }
 
   setWatchBest(on: boolean) {
+    if (this.challenge) return; // riders are the challenge pair right now
     if (on === this.watchBest) return;
     this.watchBest = on;
     if (on) {
@@ -366,6 +652,7 @@ export class BicycleTrainerCore {
   }
 
   reset() {
+    if (this.challenge) return; // exit the challenge first
     this.spawnFreshPopulation();
     this.log("info", "Fresh start — new random brains, Generation 1");
   }

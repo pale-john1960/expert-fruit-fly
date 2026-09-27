@@ -7,6 +7,13 @@
  * simulation running inside useFrame, the HUD overlay, the fly's retina
  * mini-canvas, live brain activity, the event feed, evolution controls,
  * save/load integration and the distance-history chart.
+ *
+ * Also owns the "You vs the fly" CHALLENGE UI: the human balances a bike
+ * with ← / → (or A / D — held keys ramp to full lock) while the champion
+ * fly brain rides beside it on the same road. Falls lose; the survivor
+ * gets 30 s to run up the score. Population training is parked during a
+ * challenge and resumes untouched on exit; the W/L tally persists across
+ * challenges in component state.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -24,6 +31,7 @@ import { Separator } from "@/components/ui/separator";
 import { BrainActivityPanel } from "./BrainActivityPanel";
 import {
   BicycleTrainerCore,
+  type ChallengeResult,
   type HudSnapshot,
   type TrainerEvent,
 } from "./bicycle/trainer";
@@ -47,8 +55,15 @@ import {
   Eye,
   FastForward,
   History,
+  Swords,
+  ArrowLeft,
   X,
 } from "lucide-react";
+import {
+  Tooltip as UITooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   LineChart,
   Line,
@@ -61,6 +76,22 @@ import {
 } from "recharts";
 
 const MAX_RIDERS = 8;
+
+/** Challenge slice pushed into React at the existing ~6 Hz HUD cadence. */
+interface ChallengeHud {
+  you: number; // metres ridden (frozen at fall)
+  fly: number;
+  youAlive: boolean;
+  flyAlive: boolean;
+  phi: number; // human lean (rad)
+  steer: number; // human steer delta (rad, ±0.5)
+  flyDop: number; // champion's live dopamine (it's learning!)
+  ended: boolean;
+  result: ChallengeResult | null;
+  wins: number;
+  losses: number;
+  best: number; // your best challenge distance this session
+}
 
 function eventIcon(kind: TrainerEvent["kind"]) {
   switch (kind) {
@@ -121,14 +152,16 @@ function StatChip({
   label,
   value,
   accent,
+  labelAccent,
 }: {
   label: string;
   value: string;
   accent?: string;
+  labelAccent?: string;
 }) {
   return (
     <div className="rounded-lg border border-white/10 bg-black/40 px-2.5 py-1.5 backdrop-blur-md">
-      <div className="text-[10px] uppercase tracking-wide text-white/50">{label}</div>
+      <div className={`text-[10px] uppercase tracking-wide ${labelAccent ?? "text-white/50"}`}>{label}</div>
       <div className={`text-sm font-semibold tabular-nums ${accent ?? "text-white"}`}>{value}</div>
     </div>
   );
@@ -154,13 +187,52 @@ export function BicycleTrainer() {
     snapshot: BrainSnapshot;
   } | null>(null);
 
+  // --- "You vs the fly" challenge (sim lives on the core; React mirrors) ---
+  const [challengeActive, setChallengeActive] = useState(false);
+  const [challengeHud, setChallengeHud] = useState<ChallengeHud | null>(null);
+  /** session W/L tally — persists across challenges AND population resets */
+  const tallyRef = useRef({ wins: 0, losses: 0, best: 0 });
+  const tallyCountedRef = useRef(false);
+
   // ---- HUD polling (keeps React renders at ~6 Hz, the scene stays 60 fps)
   useEffect(() => {
     const iv = setInterval(() => {
       setHud(core.hudSnapshot());
-      const lead = core.leader;
-      if (lead) {
-        setLeaderBrain((prev) => (prev === lead.brain ? prev : lead.brain));
+      const ch = core.challenge;
+      if (ch) {
+        // count the tally exactly once per finished challenge
+        if (ch.result && !tallyCountedRef.current) {
+          tallyCountedRef.current = true;
+          if (ch.result.winner === "you") tallyRef.current.wins += 1;
+          else if (ch.result.winner === "fly") tallyRef.current.losses += 1;
+          if (ch.result.youS > tallyRef.current.best) {
+            tallyRef.current.best = ch.result.youS;
+            playSound("milestone"); // new challenge best distance
+          }
+        }
+        const t = tallyRef.current;
+        setChallengeHud({
+          you: ch.human.st.alive ? ch.human.st.s : ch.human.st.finalS,
+          fly: ch.fly.st.alive ? ch.fly.st.s : ch.fly.st.finalS,
+          youAlive: ch.human.st.alive,
+          flyAlive: ch.fly.st.alive,
+          phi: ch.human.st.phi,
+          steer: ch.humanSteer,
+          flyDop: ch.fly.brain.getDopamine(),
+          ended: ch.ended,
+          result: ch.result,
+          wins: t.wins,
+          losses: t.losses,
+          best: t.best,
+        });
+        // the brain panel shows the champion you're racing, not the human
+        setLeaderBrain((prev) => (prev === ch.fly.brain ? prev : ch.fly.brain));
+      } else {
+        setChallengeHud(null);
+        const lead = core.leader;
+        if (lead) {
+          setLeaderBrain((prev) => (prev === lead.brain ? prev : lead.brain));
+        }
       }
     }, 160);
     return () => clearInterval(iv);
@@ -172,6 +244,12 @@ export function BicycleTrainer() {
       const snap = useBrainStore.getState().pending.bicycle;
       if (snap) {
         useBrainStore.getState().consumeLoad("bicycle");
+        if (core.challenge) {
+          // adopting replaces the population — leave the challenge first
+          core.endChallenge();
+          setChallengeActive(false);
+          setChallengeHud(null);
+        }
         core.adoptSnapshot(snap);
         setSession(null);
         toast.success(`Loaded "${snap.name}"`, {
@@ -245,9 +323,95 @@ export function BicycleTrainer() {
     core.setWatchBest(on);
   };
 
+  // ---------------------------------------------- "You vs the fly" challenge
+
+  const enterChallenge = () => {
+    if (!core.bestBrain) return;
+    playSound("click");
+    if (watchBest) {
+      // leave watch-best first so the parked population comes back intact
+      setWatchBest(false);
+      core.setWatchBest(false);
+    }
+    core.startChallenge();
+    tallyCountedRef.current = false;
+    setChallengeActive(true);
+    toast.info("You vs the fly — balance!", {
+      description:
+        "← / → (or A / D) steer · pedal is automatic. Last one rolling wins.",
+    });
+  };
+
+  const rematchChallenge = () => {
+    if (!core.challenge) return;
+    playSound("click");
+    core.startChallenge(); // keeps the parked training population
+    tallyCountedRef.current = false;
+  };
+
+  const exitChallenge = () => {
+    if (!core.challenge) return;
+    playSound("click");
+    core.endChallenge(); // folds the champion's learning back in
+    setChallengeActive(false);
+    setChallengeHud(null);
+  };
+
+  // --- challenge keyboard: window listeners active ONLY while challenging ---
+  useEffect(() => {
+    if (!challengeActive) return;
+    const isEditable = (t: EventTarget | null): boolean => {
+      const el = t as HTMLElement | null;
+      return (
+        !!el &&
+        typeof el.tagName === "string" &&
+        (el.tagName === "INPUT" ||
+          el.tagName === "TEXTAREA" ||
+          el.isContentEditable === true)
+      );
+    };
+    const apply = (key: string, down: boolean) => {
+      const ch = core.challenge;
+      if (!ch || ch.ended) return;
+      if (key === "ArrowLeft" || key === "a" || key === "A") ch.keys.left = down;
+      else if (key === "ArrowRight" || key === "d" || key === "D")
+        ch.keys.right = down;
+    };
+    const down = (e: KeyboardEvent) => {
+      if (isEditable(e.target)) return; // never steal typing
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        e.preventDefault(); // stop page scroll (held keys → repeat is fine)
+      }
+      apply(e.key, true);
+    };
+    const up = (e: KeyboardEvent) => apply(e.key, false);
+    const blur = () => {
+      // alt-tab mid-steer would otherwise stick the key down forever
+      const ch = core.challenge;
+      if (ch) {
+        ch.keys.left = false;
+        ch.keys.right = false;
+      }
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", blur);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", blur);
+    };
+  }, [challengeActive, core]);
+
   const resumeSession = () => {
     if (!session) return;
     playSound("click");
+    if (core.challenge) {
+      // resuming replaces the population — leave the challenge first
+      core.endChallenge();
+      setChallengeActive(false);
+      setChallengeHud(null);
+    }
     core.adoptSnapshot(session.snapshot);
     core.history = session.history;
     core.generation = session.generation;
@@ -379,77 +543,208 @@ export function BicycleTrainer() {
 
             {/* HUD overlay */}
             <div className="pointer-events-none absolute inset-0 select-none">
-              <div className="absolute left-3 top-3 flex flex-wrap items-center gap-2">
-                <StatChip
-                  label="Generation"
-                  value={`#${gen}`}
-                  accent="text-rose-300"
-                />
-                <StatChip
-                  label="Alive"
-                  value={`${alive} / ${total}`}
-                  accent={alive > 0 ? "text-emerald-300" : "text-rose-300"}
-                />
-                {watchBest && (
-                  <StatChip label="Mode" value="watch best" accent="text-amber-300" />
+              <div
+                className="absolute left-3 top-3 flex flex-wrap items-center gap-2"
+                data-duel={
+                  challengeHud
+                    ? `you:${challengeHud.you.toFixed(1)}|fly:${challengeHud.fly.toFixed(1)}|youAlive:${challengeHud.youAlive ? 1 : 0}|flyAlive:${challengeHud.flyAlive ? 1 : 0}|phi:${challengeHud.phi.toFixed(3)}|steer:${challengeHud.steer.toFixed(3)}|ended:${challengeHud.ended ? 1 : 0}${challengeHud.result ? `|winner:${challengeHud.result.winner}` : ""}`
+                    : undefined
+                }
+              >
+                {challengeHud ? (
+                  <>
+                    <StatChip
+                      label="YOU"
+                      labelAccent="text-amber-300/90"
+                      value={`${challengeHud.you.toFixed(0)} m${challengeHud.youAlive ? "" : " ✕"}`}
+                      accent="text-amber-200"
+                    />
+                    <StatChip
+                      label="FLY"
+                      labelAccent="text-emerald-300/90"
+                      value={`${challengeHud.fly.toFixed(0)} m${challengeHud.flyAlive ? "" : " ✕"}`}
+                      accent="text-emerald-200"
+                    />
+                    <StatChip
+                      label="Session"
+                      value={`You ${challengeHud.wins} · Fly ${challengeHud.losses}`}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <StatChip
+                      label="Generation"
+                      value={`#${gen}`}
+                      accent="text-rose-300"
+                    />
+                    <StatChip
+                      label="Alive"
+                      value={`${alive} / ${total}`}
+                      accent={alive > 0 ? "text-emerald-300" : "text-rose-300"}
+                    />
+                    {watchBest && (
+                      <StatChip label="Mode" value="watch best" accent="text-amber-300" />
+                    )}
+                  </>
                 )}
               </div>
               <div className="absolute right-3 top-3 flex flex-col items-end gap-2">
-                <StatChip
-                  label="Best ever"
-                  value={`${bestEver.toFixed(0)} m`}
-                  accent="text-amber-300"
-                />
-                <StatChip label="Leader" value={`${leaderS.toFixed(0)} m`} />
-                <StatChip label="Speed" value={`${leaderV.toFixed(1)} m/s`} />
+                {challengeHud ? (
+                  <StatChip
+                    label="Challenge best"
+                    value={`${challengeHud.best.toFixed(0)} m`}
+                    accent="text-amber-300"
+                  />
+                ) : (
+                  <>
+                    <StatChip
+                      label="Best ever"
+                      value={`${bestEver.toFixed(0)} m`}
+                      accent="text-amber-300"
+                    />
+                    <StatChip label="Leader" value={`${leaderS.toFixed(0)} m`} />
+                    <StatChip label="Speed" value={`${leaderV.toFixed(1)} m/s`} />
+                  </>
+                )}
               </div>
 
-              {/* lean + dopamine bottom-left */}
+              {/* lean + steer + dopamine bottom-left */}
               <div className="absolute bottom-3 left-3 flex items-end gap-3">
-                <div className="rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
-                  <div className="mb-1 text-[10px] uppercase tracking-wide text-white/50">
-                    Lean
-                  </div>
-                  <div className="flex h-12 w-16 items-center justify-center">
-                    <div
-                      className="h-1.5 w-14 rounded-full bg-gradient-to-r from-rose-400 via-white/80 to-amber-300 shadow"
-                      style={{
-                        transform: `rotate(${(leaderPhi * (180 / Math.PI)).toFixed(1)}deg)`,
-                      }}
-                    />
-                  </div>
-                </div>
-                <div className="w-36 rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
-                  <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wide text-white/50">
-                    <span>Dopamine</span>
-                    <span className={dop >= 0 ? "text-emerald-300" : "text-rose-300"}>
-                      {dop >= 0 ? "+" : ""}
-                      {dop.toFixed(2)}
-                    </span>
-                  </div>
-                  <div className="relative h-2 w-full overflow-hidden rounded-full bg-white/10">
-                    <div className="absolute left-1/2 top-0 h-full w-px bg-white/40" />
-                    <div
-                      className={`absolute top-0 h-full ${
-                        dop >= 0 ? "bg-emerald-400" : "bg-rose-400"
-                      }`}
-                      style={
-                        dop >= 0
-                          ? { left: "50%", width: `${dopPct * 50}%` }
-                          : { right: "50%", width: `${dopPct * 50}%` }
-                      }
-                    />
-                  </div>
-                </div>
+                {challengeHud ? (
+                  <>
+                    <div className="rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
+                      <div className="mb-1 text-[10px] uppercase tracking-wide text-amber-300/90">
+                        Lean · you
+                      </div>
+                      <div className="flex h-9 w-16 items-center justify-center">
+                        <div
+                          className="h-1.5 w-14 rounded-full bg-gradient-to-r from-rose-400 via-white/80 to-amber-300 shadow"
+                          style={{
+                            transform: `rotate(${(challengeHud.phi * (180 / Math.PI)).toFixed(1)}deg)`,
+                          }}
+                        />
+                      </div>
+                      <div className="mb-1 mt-1.5 text-[10px] uppercase tracking-wide text-white/50">
+                        Steer
+                      </div>
+                      <div className="relative h-1.5 w-14 rounded-full bg-white/10">
+                        <div className="absolute left-1/2 top-0 h-full w-px bg-white/40" />
+                        <div
+                          className="absolute top-0 h-full rounded-full bg-amber-300"
+                          style={
+                            challengeHud.steer >= 0
+                              ? {
+                                  left: "50%",
+                                  width: `${(Math.abs(challengeHud.steer) / 0.5) * 50}%`,
+                                }
+                              : {
+                                  right: "50%",
+                                  width: `${(Math.abs(challengeHud.steer) / 0.5) * 50}%`,
+                                }
+                          }
+                        />
+                      </div>
+                    </div>
+                    <div className="w-36 rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
+                      <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wide text-white/50">
+                        <span>Dopamine · fly</span>
+                        <span
+                          className={
+                            challengeHud.flyDop >= 0
+                              ? "text-emerald-300"
+                              : "text-rose-300"
+                          }
+                        >
+                          {challengeHud.flyDop >= 0 ? "+" : ""}
+                          {challengeHud.flyDop.toFixed(2)}
+                        </span>
+                      </div>
+                      <div className="relative h-2 w-full overflow-hidden rounded-full bg-white/10">
+                        <div className="absolute left-1/2 top-0 h-full w-px bg-white/40" />
+                        <div
+                          className={`absolute top-0 h-full ${
+                            challengeHud.flyDop >= 0
+                              ? "bg-emerald-400"
+                              : "bg-rose-400"
+                          }`}
+                          style={
+                            challengeHud.flyDop >= 0
+                              ? {
+                                  left: "50%",
+                                  width: `${Math.min(1, Math.abs(challengeHud.flyDop)) * 50}%`,
+                                }
+                              : {
+                                  right: "50%",
+                                  width: `${Math.min(1, Math.abs(challengeHud.flyDop)) * 50}%`,
+                                }
+                          }
+                        />
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
+                      <div className="mb-1 text-[10px] uppercase tracking-wide text-white/50">
+                        Lean
+                      </div>
+                      <div className="flex h-12 w-16 items-center justify-center">
+                        <div
+                          className="h-1.5 w-14 rounded-full bg-gradient-to-r from-rose-400 via-white/80 to-amber-300 shadow"
+                          style={{
+                            transform: `rotate(${(leaderPhi * (180 / Math.PI)).toFixed(1)}deg)`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                    <div className="w-36 rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
+                      <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wide text-white/50">
+                        <span>Dopamine</span>
+                        <span className={dop >= 0 ? "text-emerald-300" : "text-rose-300"}>
+                          {dop >= 0 ? "+" : ""}
+                          {dop.toFixed(2)}
+                        </span>
+                      </div>
+                      <div className="relative h-2 w-full overflow-hidden rounded-full bg-white/10">
+                        <div className="absolute left-1/2 top-0 h-full w-px bg-white/40" />
+                        <div
+                          className={`absolute top-0 h-full ${
+                            dop >= 0 ? "bg-emerald-400" : "bg-rose-400"
+                          }`}
+                          style={
+                            dop >= 0
+                              ? { left: "50%", width: `${dopPct * 50}%` }
+                              : { right: "50%", width: `${dopPct * 50}%` }
+                          }
+                        />
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
 
-              {/* turbo bottom-right */}
-              <div className="pointer-events-auto absolute bottom-3 right-3">
-                <TurboControl turbo={turbo} onChange={changeTurbo} />
-              </div>
+              {/* steer hints (challenge) / turbo (training) bottom-right */}
+              {challengeHud ? (
+                <div
+                  className="absolute bottom-3 right-3 flex items-center gap-2 rounded-lg border border-white/10 bg-black/50 px-3 py-2 backdrop-blur-md"
+                  title="Steer with the arrow keys (or A / D) — pedal is automatic"
+                >
+                  <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded border border-border/80 bg-black/50 px-1.5 font-mono text-xs leading-none text-foreground/90">
+                    ←
+                  </kbd>
+                  <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded border border-border/80 bg-black/50 px-1.5 font-mono text-xs leading-none text-foreground/90">
+                    →
+                  </kbd>
+                  <span className="text-xs text-white/80">steer · balance!</span>
+                </div>
+              ) : (
+                <div className="pointer-events-auto absolute bottom-3 right-3">
+                  <TurboControl turbo={turbo} onChange={changeTurbo} />
+                </div>
+              )}
 
-              {/* paused veil */}
-              {!running && (
+              {/* paused veil (training only — a challenge runs real-time) */}
+              {!running && !challengeActive && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/35 backdrop-blur-[2px]">
                   <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/60 px-5 py-2.5 text-sm font-medium text-white/90">
                     <Pause className="h-4 w-4" /> Paused — the flies are resting
@@ -457,6 +752,52 @@ export function BicycleTrainer() {
                 </div>
               )}
             </div>
+
+            {/* challenge result overlay */}
+            {challengeHud?.ended && challengeHud.result && (
+              <div
+                role="dialog"
+                aria-label="Challenge result"
+                data-testid="challenge-result"
+                className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2.5 bg-black/60 p-4 backdrop-blur-[2px]"
+              >
+                <Trophy
+                  className={
+                    challengeHud.result.winner === "you"
+                      ? "h-8 w-8 text-amber-400"
+                      : "h-8 w-8 text-muted-foreground"
+                  }
+                  aria-hidden
+                />
+                <p
+                  className={
+                    challengeHud.result.winner === "you"
+                      ? "text-center text-sm font-semibold text-amber-200 sm:text-base"
+                      : "text-center text-sm font-semibold text-foreground/90 sm:text-base"
+                  }
+                >
+                  {challengeHud.result.winner === "you"
+                    ? `🏆 You out-balanced the fly, ${challengeHud.result.youS.toFixed(0)} m vs ${challengeHud.result.flyS.toFixed(0)} m`
+                    : challengeHud.result.winner === "fly"
+                      ? `The fly rides on — ${challengeHud.result.youS.toFixed(0)} m vs ${challengeHud.result.flyS.toFixed(0)} m. Keep breeding!`
+                      : `Dead heat — ${challengeHud.result.youS.toFixed(0)} m each. Rematch?`}
+                </p>
+                <p className="font-mono text-xs tabular-nums text-muted-foreground">
+                  You {challengeHud.wins} · Fly {challengeHud.losses} · your best{" "}
+                  {challengeHud.best.toFixed(0)} m
+                </p>
+                <div className="mt-1.5 flex flex-wrap items-center justify-center gap-2">
+                  <Button className="h-11" onClick={rematchChallenge}>
+                    <RotateCcw aria-hidden />
+                    Rematch
+                  </Button>
+                  <Button variant="outline" className="h-11" onClick={exitChallenge}>
+                    <ArrowLeft aria-hidden />
+                    Back to training
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         </Card>
 
@@ -467,11 +808,12 @@ export function BicycleTrainer() {
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-2 text-sm">
                 <Eye className="h-4 w-4 text-rose-300" />
-                What the fly sees
+                {challengeActive ? "What the champion sees" : "What the fly sees"}
               </CardTitle>
               <CardDescription className="text-xs">
-                The 24×9 retina — road stripe, edge lines, glow posts. Lean
-                shifts the whole view.
+                {challengeActive
+                  ? "The 24×9 retina driving the brain you're racing — live, mid-challenge."
+                  : "The 24×9 retina — road stripe, edge lines, glow posts. Lean shifts the whole view."}
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -496,9 +838,15 @@ export function BicycleTrainer() {
           {/* brain activity */}
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm">Leader's brain activity</CardTitle>
+              <CardTitle className="text-sm">
+                {challengeActive
+                  ? "Champion fly — live brain"
+                  : "Leader's brain activity"}
+              </CardTitle>
               <CardDescription className="text-xs">
-                Retina → optic lobe → mushroom body → motor, live.
+                {challengeActive
+                  ? "Retina → optic lobe → mushroom body → motor of the brain you're racing."
+                  : "Retina → optic lobe → mushroom body → motor, live."}
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -542,8 +890,73 @@ export function BicycleTrainer() {
           {/* controls */}
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="text-sm">Training controls</CardTitle>
+              <CardTitle className="flex items-center gap-2 text-sm">
+                {challengeActive ? (
+                  <>
+                    <Swords className="h-4 w-4 text-amber-400" aria-hidden />
+                    You vs the fly
+                  </>
+                ) : (
+                  "Training controls"
+                )}
+              </CardTitle>
             </CardHeader>
+            {challengeActive ? (
+              <CardContent className="flex flex-col gap-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge
+                    variant="outline"
+                    className="border-amber-500/40 bg-amber-500/10 font-mono text-xs tabular-nums text-amber-200"
+                  >
+                    You {challengeHud?.wins ?? 0}
+                  </Badge>
+                  <Badge
+                    variant="outline"
+                    className="border-emerald-500/40 bg-emerald-500/10 font-mono text-xs tabular-nums text-emerald-200"
+                  >
+                    Fly {challengeHud?.losses ?? 0}
+                  </Badge>
+                  <Badge
+                    variant="outline"
+                    className="border-border/60 bg-black/40 font-mono text-xs tabular-nums"
+                  >
+                    your best {(challengeHud?.best ?? 0).toFixed(0)} m
+                  </Badge>
+                </div>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Balance with{" "}
+                  <kbd className="inline-flex h-5 min-w-5 items-center justify-center rounded border border-border/80 bg-black/50 px-1 font-mono text-[10px] leading-none text-foreground/90">
+                    ←
+                  </kbd>{" "}
+                  <kbd className="inline-flex h-5 min-w-5 items-center justify-center rounded border border-border/80 bg-black/50 px-1 font-mono text-[10px] leading-none text-foreground/90">
+                    →
+                  </kbd>{" "}
+                  (or A / D) — pedal is automatic. Falls lose; the survivor
+                  gets 30 s to run up the score.
+                </p>
+                <div className="flex gap-2">
+                  <Button
+                    onClick={exitChallenge}
+                    variant="outline"
+                    className="h-11 flex-1 gap-2 text-sm"
+                    aria-label="Leave the challenge and return to population training"
+                  >
+                    <ArrowLeft className="h-4 w-4" /> Back to training
+                  </Button>
+                  <Button
+                    onClick={rematchChallenge}
+                    className="h-11 flex-1 gap-2 text-sm"
+                    aria-label="Restart the challenge with fresh riders"
+                  >
+                    <RotateCcw className="h-4 w-4" /> Rematch
+                  </Button>
+                </div>
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  Challenges also train the champion — it still earns distance
+                  sugar and fall shock, and hands its weights back afterwards.
+                </p>
+              </CardContent>
+            ) : (
             <CardContent className="flex flex-col gap-4">
               <div className="flex gap-2">
                 <Button
@@ -564,6 +977,30 @@ export function BicycleTrainer() {
                   <RotateCcw className="h-4 w-4" /> Reset
                 </Button>
               </div>
+
+              <UITooltip>
+                <TooltipTrigger asChild>
+                  {/* span wrapper: browsers fire no pointer events on a
+                      disabled <button>, so the "train a champion first"
+                      tooltip needs a hoverable parent to appear */}
+                  <span className="block">
+                    <Button
+                      onClick={enterChallenge}
+                      disabled={!hud?.hasBest}
+                      variant="outline"
+                      className="h-11 w-full gap-2 border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 hover:text-amber-100"
+                      aria-label="Challenge the champion fly to a balance duel"
+                    >
+                      <Swords className="h-4 w-4" aria-hidden /> You vs the fly
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  {hud?.hasBest
+                    ? "Balance against the champion brain — same road, same curves"
+                    : "Train a champion first, then challenge it"}
+                </TooltipContent>
+              </UITooltip>
 
               <div>
                 <div className="mb-2 flex items-center justify-between">
@@ -677,6 +1114,7 @@ export function BicycleTrainer() {
                 />
               </div>
             </CardContent>
+            )}
           </Card>
 
           {/* save */}

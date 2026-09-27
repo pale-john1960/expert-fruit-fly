@@ -54,6 +54,8 @@ import { motion } from "framer-motion";
 import {
   Activity,
   Candy,
+  ClipboardCopy,
+  Download,
   Eye,
   FlaskConical,
   GraduationCap,
@@ -530,6 +532,86 @@ export function BrainLab(_props: BrainLabProps = {}) {
   const [motors, setMotors] = useState<number[]>([0, 0, 0, 0]);
   const [demoHud, setDemoHud] = useState<DemoHud>(DEMO_HUD_IDLE);
   const [demoResult, setDemoResult] = useState<DemoResult | null>(null);
+  /** transient inline feedback for the demo export buttons ("Saved ✓") */
+  const [demoExported, setDemoExported] = useState<null | "png" | "json">(null);
+
+  // ---- demo exports: chart PNG (SVG → canvas raster) + results JSON -------
+  const exportDemoPng = useCallback(() => {
+    const holder = document.querySelector('[data-testid="demo-chart"]');
+    const svg = holder?.querySelector("svg");
+    if (!svg) return;
+    try {
+      const rect = svg.getBoundingClientRect();
+      const clone = svg.cloneNode(true) as SVGSVGElement;
+      clone.setAttribute("width", String(Math.max(1, Math.round(rect.width))));
+      clone.setAttribute("height", String(Math.max(1, Math.round(rect.height))));
+      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      const xml = new XMLSerializer().serializeToString(clone);
+      const url = URL.createObjectURL(
+        new Blob([xml], { type: "image/svg+xml;charset=utf-8" }),
+      );
+      const img = new Image();
+      img.onload = () => {
+        const scale = 2;
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round((img.width || rect.width) * scale));
+        canvas.height = Math.max(1, Math.round((img.height || rect.height) * scale));
+        const c = canvas.getContext("2d");
+        if (c) {
+          c.fillStyle = "#0a0a10";
+          c.fillRect(0, 0, canvas.width, canvas.height);
+          c.drawImage(img, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob((blob) => {
+            if (!blob) return;
+            const a = document.createElement("a");
+            a.href = URL.createObjectURL(blob);
+            a.download = `fly-conditioning-run${demoResult?.run ?? 0}.png`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+          });
+        }
+        URL.revokeObjectURL(url);
+        setDemoExported("png");
+        playSound("ding");
+        window.setTimeout(() => setDemoExported(null), 2000);
+      };
+      img.onerror = () => URL.revokeObjectURL(url);
+      img.src = url;
+    } catch {
+      /* rasterization unsupported — ignore */
+    }
+  }, [demoResult]);
+
+  const copyDemoJson = useCallback(async () => {
+    if (!demoResult) return;
+    const payload = {
+      exported: new Date().toISOString(),
+      experiment: "classical conditioning — Bar left + sugar (A) vs Bar right + shock (B), 24 trials",
+      run: demoResult.run,
+      verdict: {
+        dA: demoResult.dA,
+        dB: demoResult.dB,
+        gapEarly: demoResult.gapEarly,
+        gapLate: demoResult.gapLate,
+        naiveBaseline: demoResult.baseline,
+      },
+      trials: demoResult.points,
+    };
+    const text = JSON.stringify(payload, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // clipboard API unavailable → fall back to a file download
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+      a.download = `fly-conditioning-run${demoResult.run}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+    setDemoExported("json");
+    playSound("click");
+    window.setTimeout(() => setDemoExported(null), 2000);
+  }, [demoResult]);
 
   // ---- neuron inspector (selection lives here; the visualizer renders the
   //      ring, this card renders the data) ----
@@ -1094,9 +1176,29 @@ export function BrainLab(_props: BrainLabProps = {}) {
           over the last second of each trial. Run again — weights persist, so learning
           compounds; <span className="text-foreground/80">Reset brain</span> clears it.
         </p>
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1.5 px-2.5 text-[11px]"
+            onClick={exportDemoPng}
+          >
+            <Download className="h-3 w-3" />
+            {demoExported === "png" ? "Saved ✓" : "Chart PNG"}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1.5 px-2.5 text-[11px]"
+            onClick={() => void copyDemoJson()}
+          >
+            <ClipboardCopy className="h-3 w-3" />
+            {demoExported === "json" ? "Copied ✓" : "Results JSON"}
+          </Button>
+        </div>
       </motion.div>
     );
-  }, [demoResult]);
+  }, [demoResult, demoExported, exportDemoPng, copyDemoJson]);
 
   // ---- neuron inspector: identity + synapse rows. Recomputed on selection
   //      change / brain swap / dopamine event (learning rewrites the plastic

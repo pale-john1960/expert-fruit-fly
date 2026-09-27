@@ -22,6 +22,7 @@ import {
   type RoadData,
 } from "./road";
 import type { BicycleTrainerCore } from "./trainer";
+import type { RiderTag } from "./trainer";
 import { retinaColor, RETINA_COLS, RETINA_ROWS } from "./retina";
 
 // ---------------------------------------------------------------- palette
@@ -529,6 +530,39 @@ interface RigMaterials {
   wing: THREE.MeshBasicMaterial;
 }
 
+// "You vs the fly" challenge markers (amber = YOU, emerald = FLY)
+const TAG_COLORS = {
+  you: { rim: "#fbbf24", lamp: "#ffc24a" },
+  fly: { rim: "#34d399", lamp: "#3ce6a0" },
+} as const;
+
+const riderLabelTex: Partial<Record<RiderTag, THREE.CanvasTexture>> = {};
+/** Lazily-built glowing "YOU" / "FLY" label textures (browser canvas). */
+function riderLabelTexture(tag: RiderTag): THREE.CanvasTexture | null {
+  const cached = riderLabelTex[tag];
+  if (cached) return cached;
+  if (typeof document === "undefined") return null;
+  const cv = document.createElement("canvas");
+  cv.width = 256;
+  cv.height = 96;
+  const ctx = cv.getContext("2d");
+  if (!ctx) return null;
+  const isYou = tag === "you";
+  ctx.font = "700 54px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowColor = isYou ? "rgba(251,191,36,0.85)" : "rgba(52,211,153,0.85)";
+  ctx.shadowBlur = 22;
+  ctx.fillStyle = isYou ? "#fde68a" : "#a7f3d0";
+  // double pass → a stronger glow around the lettering
+  ctx.fillText(isYou ? "YOU" : "FLY", 128, 52);
+  ctx.fillText(isYou ? "YOU" : "FLY", 128, 52);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  riderLabelTex[tag] = tex;
+  return tex;
+}
+
 function makeRigMaterials(): RigMaterials {
   // one material set per rig — ghost translucency and death fades are
   // driven imperatively in useFrame by animating opacity
@@ -579,6 +613,7 @@ function BikeRig({
   const legR = useRef<THREE.Mesh>(null);
   const rim = useRef<THREE.Mesh>(null);
   const lamp = useRef<THREE.PointLight>(null);
+  const label = useRef<THREE.Sprite>(null);
   const wingL = useRef<THREE.Mesh>(null);
   const wingR = useRef<THREE.Mesh>(null);
 
@@ -610,7 +645,8 @@ function BikeRig({
 
     // --- ghost vs solid vs leader materials ---
     const isLeader = riderIndex === core.leaderIdx;
-    const ghost = !isLeader && core.riders.length > 1;
+    // challenge riders (tagged YOU / FLY) are always fully visible
+    const ghost = !isLeader && core.riders.length > 1 && !r.tag;
     const bodyMats = [mats.frame, mats.tire, mats.dark, mats.body];
     if (r.st.alive) {
       const target = ghost ? 0.28 : 1;
@@ -668,13 +704,40 @@ function BikeRig({
     if (wingL.current) wingL.current.rotation.y = 0.7 + flut;
     if (wingR.current) wingR.current.rotation.y = -0.7 - flut;
 
-    // --- leader highlight: pulsing rose rim + warm lamp ---
+    // --- leader highlight / challenge marker: pulsing rim + warm lamp ---
+    const tag = r.tag as RiderTag | undefined;
     if (rim.current) {
-      rim.current.visible = isLeader;
+      rim.current.visible = isLeader || !!tag;
       const s = 1 + Math.sin(core.realTime * 3.2) * 0.06;
       rim.current.scale.set(s, s, 1);
+      const rimMat = rim.current.material as THREE.MeshBasicMaterial;
+      if (tag === "you") rimMat.color.set(TAG_COLORS.you.rim);
+      else if (tag === "fly") rimMat.color.set(TAG_COLORS.fly.rim);
+      else rimMat.color.set(C.rim);
     }
-    if (lamp.current) lamp.current.intensity = isLeader ? 2.4 : 0;
+    if (lamp.current) {
+      lamp.current.intensity = isLeader || tag ? 2.4 : 0;
+      lamp.current.color.set(
+        tag === "you"
+          ? TAG_COLORS.you.lamp
+          : tag === "fly"
+            ? TAG_COLORS.fly.lamp
+            : "#ffa070"
+      );
+    }
+    // floating YOU / FLY label over challenge riders
+    if (label.current) {
+      const tex = tag ? riderLabelTexture(tag) : null;
+      label.current.visible = !!tex;
+      if (tex) {
+        const lm = label.current.material as THREE.SpriteMaterial;
+        if (lm.map !== tex) {
+          lm.map = tex;
+          lm.needsUpdate = true;
+        }
+        label.current.position.y = 2.0 + Math.sin(core.realTime * 2.1) * 0.04;
+      }
+    }
   });
 
   const tube = (
@@ -814,6 +877,10 @@ function BikeRig({
         <meshBasicMaterial color={C.rim} transparent opacity={0.85} toneMapped={false} side={THREE.DoubleSide} />
       </mesh>
       <pointLight ref={lamp} color="#ffa070" intensity={2.4} distance={11} decay={2} position={[0, 1.6, 0]} />
+      {/* floating YOU / FLY challenge label (visibility set per frame) */}
+      <sprite ref={label} position={[0, 2.0, 0]} visible={false} scale={[1.15, 0.43, 1]}>
+        <spriteMaterial transparent depthTest={false} toneMapped={false} />
+      </sprite>
     </group>
   );
 }
@@ -827,14 +894,39 @@ function ChaseCamera({ core }: { core: BicycleTrainerCore }) {
   const tgt = useRef(new THREE.Vector3());
 
   useFrame((_, dt) => {
+    let wx: number;
+    let wz: number;
+    let heading: number;
+    let lean: number;
+    let back = 7.2;
+    let ahead = 3.4;
+    const ch = core.challenge;
+    if (ch) {
+      // challenge: frame BOTH riders — target the midpoint of the pair and
+      // orient along the further rider's heading; bank with the human's lean
+      const a = core.riderWorld(0);
+      const b = core.riderWorld(1);
+      wx = (a.x + b.x) / 2;
+      wz = (a.z + b.z) / 2;
+      const leadW = ch.human.st.s >= ch.fly.st.s ? a : b;
+      heading = leadW.heading;
+      lean = ch.human.st.alive ? ch.human.st.phi : ch.fly.st.phi;
+      back = 8.6;
+      ahead = 4.0;
+    } else {
+      const w = core.riderWorld(core.leaderIdx);
+      wx = w.x;
+      wz = w.z;
+      heading = w.heading;
+      lean = w.lean;
+    }
     const lead = core.leader;
     if (!lead) return;
-    const w = core.riderWorld(core.leaderIdx);
-    const fwdX = Math.sin(w.heading);
-    const fwdZ = Math.cos(w.heading);
+    const fwdX = Math.sin(heading);
+    const fwdZ = Math.cos(heading);
 
-    desired.current.set(w.x - fwdX * 7.2, 2.6 + Math.max(0, w.lean) * 0, w.z - fwdZ * 7.2);
-    tgt.current.set(w.x + fwdX * 3.4, 1.05, w.z + fwdZ * 3.4);
+    desired.current.set(wx - fwdX * back, 2.6, wz - fwdZ * back);
+    tgt.current.set(wx + fwdX * ahead, 1.05, wz + fwdZ * ahead);
 
     const k = 1 - Math.exp(-dt * 2.6);
     camPos.current.lerp(desired.current, k);
@@ -850,8 +942,8 @@ function ChaseCamera({ core }: { core: BicycleTrainerCore }) {
     camera.position.set(camPos.current.x + sx, camPos.current.y + sy, camPos.current.z);
     camera.up.set(0, 1, 0);
     camera.lookAt(camTgt.current);
-    // gentle banking with the rider's lean
-    camera.rotateZ(-w.lean * 0.16);
+    // gentle banking with the rider's lean (the human's, during a challenge)
+    camera.rotateZ(-lean * 0.16);
   });
   return null;
 }
@@ -874,8 +966,10 @@ function SimRunner({
     core.advance(Math.min(dt, 0.1));
 
     const cv = retinaCanvas.current;
-    const lead = core.leader;
-    if (cv && lead && typeof ImageData !== "undefined") {
+    // in challenge mode the mini-canvas shows what the CHAMPION FLY sees
+    // (its actual brain input), otherwise the current leader's view
+    const src = core.challenge ? core.challenge.fly : core.leader;
+    if (cv && src && typeof ImageData !== "undefined") {
       const ctx = cv.getContext("2d");
       if (ctx) {
         if (!bufRef.current) {
@@ -885,7 +979,7 @@ function SimRunner({
           };
         }
         const { img, px } = bufRef.current;
-        const r = lead.retina;
+        const r = src.retina;
         for (let i = 0; i < RETINA_COLS * RETINA_ROWS; i++) {
           const [cr, cg, cb] = retinaColor(r[i]);
           px[i * 4] = cr;

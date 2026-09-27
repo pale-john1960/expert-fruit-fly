@@ -28,27 +28,43 @@ export type SoundName =
   | "click"; // tiny neutral UI click
 
 const STORAGE_KEY = "fly-sound-muted";
+const VOLUME_KEY = "fly-sound-volume";
 
 /* ------------------------------------------------------------------ */
-/* mute state                                                          */
+/* mute + volume state                                                 */
 /* ------------------------------------------------------------------ */
 
 interface SoundStore {
   muted: boolean;
+  /** 0..1 master volume scale (default 1 = the original loudness) */
+  volume: number;
   setMuted: (m: boolean) => void;
+  setVolume: (v: number) => void;
 }
 
 export const useSoundStore = create<SoundStore>((set) => ({
   muted: false,
+  volume: 1,
   setMuted: (m) => set({ muted: m }),
+  setVolume: (v) => set({ volume: v }),
 }));
 
-/** Read the persisted preference into the store — call once from a mount
+/** Read the persisted preferences into the store — call once from a mount
  *  effect (never during render, to keep SSR/client output identical). */
 export function hydrateSoundMuted(): void {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (raw === "1") useSoundStore.getState().setMuted(true);
+    // NB: getItem returns null when unset — Number(null) === 0, so parse only
+    // when the key actually exists (otherwise a fresh visitor starts muted).
+    const rawVol = window.localStorage.getItem(VOLUME_KEY);
+    if (rawVol !== null) {
+      const vol = Number(rawVol);
+      if (Number.isFinite(vol) && vol >= 0 && vol <= 1) {
+        useSoundStore.getState().setVolume(vol);
+        applyMasterVolume(vol);
+      }
+    }
   } catch {
     /* localStorage unavailable — ignore */
   }
@@ -66,6 +82,32 @@ export function toggleSoundMuted(): void {
 
 export function useSoundMuted(): boolean {
   return useSoundStore((s) => s.muted);
+}
+
+export function useSoundVolume(): number {
+  return useSoundStore((s) => s.volume);
+}
+
+/** Scale the synth's master gain (base loudness 0.5 × volume). Safe before
+ *  the AudioContext exists — applyMasterVolume re-runs on every ensureCtx. */
+function applyMasterVolume(v: number): void {
+  try {
+    if (master) master.gain.value = 0.5 * Math.max(0, Math.min(1, v));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Persist + apply a 0..1 master volume. */
+export function setSoundVolume(v: number): void {
+  const clamped = Math.max(0, Math.min(1, v));
+  useSoundStore.getState().setVolume(clamped);
+  applyMasterVolume(clamped);
+  try {
+    window.localStorage.setItem(VOLUME_KEY, String(clamped));
+  } catch {
+    /* ignore */
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -102,7 +144,7 @@ function ensureCtx(): AudioContext | null {
       if (!AC) return null;
       ctx = new AC();
       master = ctx.createGain();
-      master.gain.value = 0.5;
+      master.gain.value = 0.5 * useSoundStore.getState().volume;
       master.connect(ctx.destination);
     }
     if (ctx.state === "suspended") void ctx.resume();

@@ -32,6 +32,13 @@
  *    and its trained weights are written back into the trainer's champion
  *    when the duel ends, so rematches compound. Training is only PARKED
  *    while dueling (same generation, same world on return).
+ *  - champion lineage ("family tree"): every brain gets a lineage node
+ *    (parents + generation + final score) recorded as the evolution step
+ *    builds children — elitism clones get 1 parent, crossover children 2.
+ *    The champion's line is walked back through its parents and drawn as a
+ *    compact SVG family tree below the score chart (higher-scoring parent
+ *    continues the main line, the other parent shows as a rose side
+ *    branch). Session memory only — it resets with the population.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -41,7 +48,19 @@ import type { BrainSnapshot } from "@/lib/flybrain/types";
 import { useBrainStore } from "@/lib/flybrain/store";
 import { hydrateSoundMuted, playSound } from "@/lib/sound";
 import { BrainActivityPanel } from "./BrainActivityPanel";
-import { evolvePopulation } from "./dino/evolution";
+import {
+  buildLineageView,
+  evolvePopulation,
+  freshLineage,
+  nodeIdOf,
+  registerFounders,
+} from "./dino/evolution";
+import type {
+  LineageOrigin,
+  LineageRecord,
+  LineageView,
+  LineageViewNode,
+} from "./dino/evolution";
 import {
   BASE_SPEED,
   DUCK_THRESHOLD,
@@ -89,6 +108,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
@@ -106,8 +126,10 @@ import {
   Activity,
   ArrowLeft,
   Bird,
+  ChevronDown,
   Eye,
   Gamepad2,
+  GitBranch,
   History,
   Loader2,
   Pause,
@@ -188,6 +210,10 @@ interface Sim {
   duelWins: number;
   duelLosses: number;
   duelBest: number; // best HUMAN score achieved in a duel this session
+  /** champion lineage graph (session memory — resets with the population) */
+  lineage: LineageRecord;
+  /** lineage node id of the current all-time champion brain (0 = none) */
+  bestNodeId: number;
 }
 
 interface Art {
@@ -368,6 +394,7 @@ function endGeneration(sim: Sim, popSize: number, mutStrength: number): void {
     sim.bestEver = best;
     sim.bestGen = sim.generation;
     sim.bestBrain = sim.runners[bi].brain.clone();
+    sim.bestNodeId = nodeIdOf(sim.lineage, sim.runners[bi].brain);
     playSound("milestone"); // new all-time HI score
   }
   const duckNote =
@@ -388,7 +415,14 @@ function endGeneration(sim: Sim, popSize: number, mutStrength: number): void {
     sim.runners.map((r) => r.brain),
     scores,
     popSize,
-    mutStrength
+    mutStrength,
+    // lineage record-keeping (pure observation — the recipe is unchanged)
+    {
+      record: sim.lineage,
+      parentIds: sim.runners.map((r) => nodeIdOf(sim.lineage, r.brain)),
+      parentScores: scores,
+      childGen: sim.generation + 1,
+    }
   );
   sim.generation += 1;
   sim.runners = brains.map((b, i) => makeRunner(b, i));
@@ -725,6 +759,233 @@ function renderVisible(
 }
 
 // ---------------------------------------------------------------------------
+// Champion lineage ("family tree") rendering
+// ---------------------------------------------------------------------------
+const L_SPACING = 72; // px between main-line generations
+const L_MAIN_Y = 52; // baseline of the main line
+const L_SIDE_DY = 38; // side-branch offset above/below the baseline
+const L_HEIGHT = 112;
+
+function lineageOriginText(o: LineageOrigin): string {
+  return o === "crossover"
+    ? "crossover child"
+    : o === "clone"
+      ? "elite clone"
+      : "founding fly";
+}
+
+/** Compact hand-rolled SVG tree — no chart library. Oldest ancestor on the
+ *  left, current champion on the right. Main-line circles are amber, sized
+ *  and tinted by score; crossover forks merge in diagonally from smaller
+ *  rose side-branch nodes (one level deep, never recursed into). Every node
+ *  carries a native <title> tooltip. */
+function LineageTreeSvg({ view }: { view: LineageView }) {
+  const n = view.main.length;
+  const sideNodes = view.sides.filter(
+    (s): s is LineageViewNode => Boolean(s)
+  );
+  const maxScore = Math.max(
+    1,
+    ...view.main.map((m) => m.score),
+    ...sideNodes.map((s) => s.score)
+  );
+  const hasChip = view.hiddenGens > 0;
+  const chipText = `…${view.hiddenGens} more generation${view.hiddenGens === 1 ? "" : "s"}`;
+  const chipW = Math.max(58, 16 + chipText.length * 4.7);
+  const padL = hasChip ? 18 + chipW + 14 : 18;
+  const padR = 66; // room for the ★ champion label
+  const width = padL + (n - 1) * L_SPACING + padR;
+  const xs = view.main.map((_, i) => padL + i * L_SPACING);
+  const champIdx = n - 1;
+  const mainR = (score: number) => 5 + 6 * Math.min(1, Math.max(0, score / maxScore));
+
+  return (
+    <svg
+      data-testid="lineage-svg"
+      data-nodes={n}
+      data-sides={sideNodes.length}
+      data-hidden={view.hiddenGens}
+      data-champ-gen={view.champion.gen}
+      width={width}
+      height={L_HEIGHT}
+      viewBox={`0 0 ${width} ${L_HEIGHT}`}
+      role="img"
+      aria-label={`Champion family tree — ${view.breedGens} generations of breeding from gen ${view.rootGen} to gen ${view.champion.gen}`}
+      className="block"
+    >
+      {/* main-line baseline */}
+      <line
+        x1={xs[0]}
+        y1={L_MAIN_Y}
+        x2={xs[champIdx]}
+        y2={L_MAIN_Y}
+        stroke="rgba(245,158,11,0.28)"
+        strokeWidth={1.5}
+      />
+
+      {/* collapsed older ancestry chip */}
+      {hasChip && (
+        <g>
+          <title>{`Older ancestry collapsed — the full line goes back ${view.breedGens} generations to gen ${view.rootGen} (score ${view.rootScore})`}</title>
+          <rect
+            x={8}
+            y={L_MAIN_Y - 9}
+            width={chipW}
+            height={18}
+            rx={9}
+            fill="rgba(245,158,11,0.06)"
+            stroke="rgba(245,158,11,0.3)"
+            strokeWidth={1}
+          />
+          <text
+            x={8 + chipW / 2}
+            y={L_MAIN_Y + 3}
+            textAnchor="middle"
+            fontSize={8}
+            fill="#d6d3d1"
+            className="font-mono"
+          >
+            {chipText}
+          </text>
+          <line
+            x1={8 + chipW + 4}
+            y1={L_MAIN_Y}
+            x2={xs[0] - 10}
+            y2={L_MAIN_Y}
+            stroke="rgba(245,158,11,0.3)"
+            strokeWidth={1}
+            strokeDasharray="2 3"
+          />
+        </g>
+      )}
+
+      {/* crossover side branches — diagonal merges into the main line */}
+      {view.sides.map((side, i) => {
+        if (!side || i === 0) return null;
+        const up = i % 2 === 1;
+        const sx = (xs[i - 1] + xs[i]) / 2;
+        const sy = up ? L_MAIN_Y - L_SIDE_DY : L_MAIN_Y + L_SIDE_DY;
+        const childR = mainR(view.main[i].score);
+        const endY = up ? L_MAIN_Y - childR - 3 : L_MAIN_Y + childR + 3;
+        const cx = (sx + xs[i]) / 2;
+        const cy = up ? sy + 16 : sy - 16;
+        const sideR = 3.5 + 2.5 * Math.min(1, Math.max(0, side.score / maxScore));
+        return (
+          <g key={`s${side.id}`}>
+            <path
+              d={`M ${sx} ${sy} Q ${cx} ${cy} ${xs[i]} ${endY}`}
+              fill="none"
+              stroke="rgba(251,113,133,0.5)"
+              strokeWidth={1.2}
+            />
+            <circle
+              cx={sx}
+              cy={sy}
+              r={sideR}
+              fill="rgba(251,113,133,0.28)"
+              stroke="rgba(251,113,133,0.55)"
+              strokeWidth={1}
+              className="cursor-help"
+            >
+              <title>{`Gen ${side.gen} · score ${side.score} · crossover parent`}</title>
+            </circle>
+          </g>
+        );
+      })}
+
+      {/* main-line nodes + generation ticks */}
+      {view.main.map((m, i) => {
+        const ratio = Math.min(1, Math.max(0, m.score / maxScore));
+        const r = 5 + 6 * ratio;
+        const isChamp = i === champIdx;
+        return (
+          <g key={m.id}>
+            <circle
+              cx={xs[i]}
+              cy={L_MAIN_Y}
+              r={r}
+              fill={`rgba(245,158,11,${(0.3 + 0.65 * ratio).toFixed(3)})`}
+              stroke="rgba(245,158,11,0.75)"
+              strokeWidth={1.2}
+              className="cursor-help"
+            >
+              <title>{`Gen ${m.gen} · score ${m.score} · ${lineageOriginText(m.origin)}`}</title>
+            </circle>
+            {/* generation tick + label */}
+            <line
+              x1={xs[i]}
+              y1={L_MAIN_Y + 15}
+              x2={xs[i]}
+              y2={L_MAIN_Y + 19}
+              stroke="rgba(168,162,158,0.4)"
+              strokeWidth={1}
+              aria-hidden
+            />
+            <text
+              x={xs[i]}
+              y={L_MAIN_Y + 30}
+              textAnchor="middle"
+              fontSize={8.5}
+              fill="#a8a29e"
+              className="font-mono"
+            >
+              {m.gen}
+            </text>
+            {/* score labels under the first + last (champion) nodes */}
+            {i === 0 && n > 1 && (
+              <text
+                x={xs[0]}
+                y={L_MAIN_Y + 43}
+                textAnchor="middle"
+                fontSize={8.5}
+                fill="#a8a29e"
+                className="font-mono"
+              >
+                score {m.score}
+              </text>
+            )}
+            {isChamp && (
+              <>
+                <circle
+                  cx={xs[i]}
+                  cy={L_MAIN_Y}
+                  r={r + 3.5}
+                  fill="none"
+                  stroke="#34d399"
+                  strokeWidth={1.4}
+                  strokeDasharray="3 2.5"
+                />
+                <text
+                  x={xs[i]}
+                  y={L_MAIN_Y - 26}
+                  textAnchor="middle"
+                  fontSize={9}
+                  fontWeight={600}
+                  fill="#34d399"
+                  className="font-mono"
+                >
+                  ★ champion
+                </text>
+                <text
+                  x={xs[i]}
+                  y={L_MAIN_Y + 43}
+                  textAnchor="middle"
+                  fontSize={8.5}
+                  fill="#fbbf24"
+                  className="font-mono"
+                >
+                  score {m.score}
+                </text>
+              </>
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 export function DinoTrainer() {
@@ -763,6 +1024,14 @@ export function DinoTrainer() {
     snap: BrainSnapshot;
     history: GenStat[];
   } | null>(null);
+  // --- champion lineage (family tree) -------------------------------------
+  const [lineageOpen, setLineageOpen] = useState(false);
+  /** recomputed only when the champion changes (keyed — the 4Hz flush is a
+   *  no-op for this state between crowns; the ≤20-node walk is cheap) */
+  const [lineage, setLineage] = useState<{ key: string; view: LineageView | null }>({
+    key: "none",
+    view: null,
+  });
 
   // --- refs (read inside the rAF loop without restarting it) ----------------
   const runningRef = useRef(running);
@@ -845,6 +1114,19 @@ export function DinoTrainer() {
           : bestAliveBrain(s);
       return next === prev ? prev : next;
     });
+    // champion lineage: rebuild the family-tree view ONLY when a new champion
+    // is crowned (or the record resets) — never per tick
+    const lKey =
+      s.bestNodeId > 0
+        ? `${s.lineage.version}:${s.bestNodeId}:${s.bestEver}`
+        : "none";
+    setLineage((prev) => {
+      if (prev.key === lKey) return prev; // Object-identical → no re-render
+      return {
+        key: lKey,
+        view: s.bestNodeId > 0 ? buildLineageView(s.lineage, s.bestNodeId) : null,
+      };
+    });
   }, []);
 
   // --- mount: build the sim + the animation loop ----------------------------
@@ -879,8 +1161,16 @@ export function DinoTrainer() {
       duelWins: 0,
       duelLosses: 0,
       duelBest: 0,
+      lineage: freshLineage(),
+      bestNodeId: 0,
     };
     simRef.current = sim;
+    // every brain in the initial random population is a lineage founder
+    registerFounders(
+      sim.lineage,
+      sim.runners.map((r) => r.brain),
+      1
+    );
     drawWorld(art.gameCtx, sim.world); // first paint so pause view isn't blank
     setPanelBrain(sim.runners[0]?.brain ?? null);
 
@@ -1041,8 +1331,22 @@ export function DinoTrainer() {
       s.genBirdDeaths = 0;
       s.genCactusDeaths = 0;
       s.genTimeoutDeaths = 0;
+      // adopted population: fresh family line — the loaded brain is the root
+      // founder (its recorded ancestry is unknowable from a snapshot)
+      s.lineage = freshLineage();
       const n = popSizeRef.current;
       s.runners = Array.from({ length: n }, (_, i) => makeRunner(base.clone(), i));
+      registerFounders(
+        s.lineage,
+        s.runners.map((r) => r.brain),
+        s.generation
+      );
+      // the loaded champion's known score seeds its founder nodes
+      for (const r of s.runners) {
+        const node = s.lineage.nodes.get(nodeIdOf(s.lineage, r.brain));
+        if (node) node.score = Math.max(node.score, s.bestEver);
+      }
+      s.bestNodeId = nodeIdOf(s.lineage, s.runners[0]?.brain ?? base);
       s.world = freshWorld(s);
       setWatchBest(false);
       setRunning(true);
@@ -1207,12 +1511,21 @@ export function DinoTrainer() {
     s.genBirdDeaths = 0;
     s.genCactusDeaths = 0;
     s.genTimeoutDeaths = 0;
+    // lineage is session memory — a fresh population starts a fresh family
+    // line (see the caption under the lineage card)
+    s.lineage = freshLineage();
+    s.bestNodeId = 0;
     const n = popSizeRef.current;
     s.runners = Array.from({ length: n }, (_, i) =>
       makeRunner(
         new FlyBrain({ ...DEFAULT_ARCH_DINO, seed: (Math.random() * 0x7fffffff) | 0 }),
         i
       )
+    );
+    registerFounders(
+      s.lineage,
+      s.runners.map((r) => r.brain),
+      1
     );
     s.world = freshWorld(s);
     flush(s);
@@ -1253,6 +1566,18 @@ export function DinoTrainer() {
   };
 
   const lastGenAvg = history.length > 0 ? history[history.length - 1].avg : null;
+
+  // one-line summary for the lineage card header
+  const lineageSummary = lineage.view
+    ? lineage.view.breedGens > 0
+      ? `${lineage.view.breedGens} generations of breeding — from gen ${lineage.view.rootGen}'s score ${lineage.view.rootScore} to gen ${lineage.view.champion.gen}'s ${lineage.view.champion.score}`
+      : `The champion is an original fly — gen ${lineage.view.champion.gen}, score ${lineage.view.champion.score}. Bred descendants will grow its family line.`
+    : "No champion yet — finish a generation to start the family line.";
+
+  const toggleLineageOpen = (open: boolean) => {
+    setLineageOpen(open);
+    playSound("click");
+  };
 
   // duck-defense color band: rose < 33% ≤ amber < 66% ≤ emerald
   const duckRate =
@@ -1941,6 +2266,86 @@ export function DinoTrainer() {
             </div>
           )}
         </CardContent>
+      </Card>
+
+      {/* --- champion lineage (family tree) --- */}
+      <Card className="mt-4 gap-0 py-0" data-testid="lineage-card">
+        <Collapsible open={lineageOpen} onOpenChange={toggleLineageOpen}>
+          <CollapsibleTrigger asChild>
+            <button
+              type="button"
+              data-testid="lineage-toggle"
+              aria-controls="dino-lineage-panel"
+              className="flex w-full items-center gap-3 px-6 py-4 text-left transition-colors hover:bg-muted/30"
+            >
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-400">
+                <GitBranch className="h-4 w-4" aria-hidden />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-2 text-sm font-semibold">
+                  Champion lineage
+                </span>
+                <span
+                  className="mt-1 block truncate text-xs text-muted-foreground"
+                  data-testid="lineage-summary"
+                >
+                  {lineageSummary}
+                </span>
+              </span>
+              <ChevronDown
+                className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ${
+                  lineageOpen ? "rotate-180" : ""
+                }`}
+                aria-hidden
+              />
+            </button>
+          </CollapsibleTrigger>
+          <CollapsibleContent id="dino-lineage-panel">
+            <CardContent className="border-t border-border/60 px-4 pb-5 pt-4 sm:px-6">
+              {lineage.view ? (
+                <>
+                  <div
+                    className="overflow-x-auto pb-1 [&::-webkit-scrollbar]:h-2 [&::-webkit-scrollbar-track]:bg-transparent [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border"
+                  >
+                    <LineageTreeSvg view={lineage.view} />
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11px] text-muted-foreground">
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className="h-2 w-2 rounded-full bg-amber-500/80"
+                        aria-hidden
+                      />
+                      main line
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className="h-2 w-2 rounded-full bg-rose-400/60"
+                        aria-hidden
+                      />
+                      crossover parent
+                    </span>
+                    <span className="flex items-center gap-1.5 text-emerald-300">
+                      <span aria-hidden>★</span>
+                      champion
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <div
+                  data-testid="lineage-empty"
+                  className="flex h-[120px] items-center justify-center rounded-lg border border-dashed border-border px-4 text-center text-xs text-muted-foreground"
+                >
+                  No champion yet — finish a generation to start the family line.
+                </div>
+              )}
+              <p className="mt-2.5 text-[10px] leading-snug text-muted-foreground/70">
+                Breeding history of the all-time champion — elitism clones inherit one parent,
+                crossover children merge two. Session memory only: the line resets with the
+                population (Reset or loading a brain starts a fresh family).
+              </p>
+            </CardContent>
+          </CollapsibleContent>
+        </Collapsible>
       </Card>
     </section>
   );
