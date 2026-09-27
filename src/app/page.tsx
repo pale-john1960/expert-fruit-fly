@@ -52,31 +52,31 @@ export default function Home() {
             <TabsList className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none bg-transparent p-0 pb-px">
               <TabsTrigger
                 value="lab"
-                className="gap-1.5 rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
+                className="gap-1.5 whitespace-nowrap rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
               >
                 <Bug className="h-4 w-4" /> Brain Lab
               </TabsTrigger>
               <TabsTrigger
                 value="dino"
-                className="gap-1.5 rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
+                className="gap-1.5 whitespace-nowrap rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
               >
                 <Gamepad2 className="h-4 w-4" /> Dino Training
               </TabsTrigger>
               <TabsTrigger
                 value="bicycle"
-                className="gap-1.5 rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
+                className="gap-1.5 whitespace-nowrap rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
               >
                 <Bike className="h-4 w-4" /> Bicycle Training
               </TabsTrigger>
               <TabsTrigger
                 value="library"
-                className="gap-1.5 rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
+                className="gap-1.5 whitespace-nowrap rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
               >
                 <Library className="h-4 w-4" /> Brain Library
               </TabsTrigger>
               <TabsTrigger
                 value="docs"
-                className="gap-1.5 rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
+                className="gap-1.5 whitespace-nowrap rounded-t-lg border-b-2 border-transparent data-[state=active]:border-primary data-[state=active]:bg-transparent px-3 py-2"
               >
                 <BookOpen className="h-4 w-4" /> How It Works
               </TabsTrigger>
