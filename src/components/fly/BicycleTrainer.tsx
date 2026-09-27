@@ -43,8 +43,10 @@ import {
 import { BrainActivityPanel } from "./BrainActivityPanel";
 import {
   BicycleTrainerCore,
+  DEFAULT_TUNING,
   type ChallengeResult,
   type HudSnapshot,
+  type RewardTuning,
   type TrainerEvent,
 } from "./bicycle/trainer";
 import { DuskScene } from "./bicycle/scene";
@@ -87,6 +89,9 @@ import {
   ChevronDown,
   Download,
   FileText,
+  FileJson,
+  SlidersHorizontal,
+  Gauge,
 } from "lucide-react";
 import {
   Tooltip as UITooltip,
@@ -429,15 +434,26 @@ function LineageTreeSvg({ view }: { view: LineageView }) {
 }
 
 export function BicycleTrainer() {
-  const [core] = useState(() => new BicycleTrainerCore(5));
+  // Round 14: manual start — the population is created parked; training
+  // begins only when the rider presses Start (mirrors the dino trainer's
+  // begin gate). The core class itself still defaults to running so the
+  // headless demo-brain generator keeps working unchanged.
+  const [core] = useState(() => {
+    const c = new BicycleTrainerCore(5);
+    c.setRunning(false);
+    return c;
+  });
   const retinaCanvas = useRef<HTMLCanvasElement | null>(null);
   const [hud, setHud] = useState<HudSnapshot | null>(null);
   const [leaderBrain, setLeaderBrain] = useState<FlyBrain | null>(null);
-  const [running, setRunning] = useState(true);
+  const [running, setRunning] = useState(false);
   const [turbo, setTurbo] = useState(1);
   const [preset, setPresetState] = useState<"steady" | "standard" | "frisky">("standard");
   const [popQueued, setPopQueued] = useState(5);
   const [mutation, setMutation] = useState(0.3);
+  // Round 14 — reward shaping panel state (single source of truth for the
+  // sliders; core.tuningSnapshot() is the echo the HUD badges read)
+  const [tuning, setTuning] = useState<RewardTuning>(() => core.tuningSnapshot());
   const [watchBest, setWatchBest] = useState(false);
   const [brainName, setBrainName] = useState("Dusk Rider");
   const [saving, setSaving] = useState(false);
@@ -593,9 +609,12 @@ export function BicycleTrainer() {
     trainStartRef.current = Date.now();
     parentNameRef.current = null;
     core.reset();
+    // Round 14: a fresh population waits for you again — no auto-restart
+    core.setRunning(false);
+    setRunning(false);
     setWatchBest(false);
     setHud(core.hudSnapshot());
-    toast.info("Fresh start", { description: "New random brains — Generation 1 rolls out." });
+    toast.info("Fresh start", { description: "New random brains — Generation 1 is ready. Press Start when you are." });
   };
 
   const changeTurbo = (t: number) => {
@@ -607,7 +626,24 @@ export function BicycleTrainer() {
     if (p === preset) return;
     setPresetState(p);
     core.setPreset(p);
+    // presets also reshape rewardPerMeter — keep the panel in sync
+    setTuning(core.tuningSnapshot());
     playSound("click");
+  };
+
+  // Round 14 — live reward shaping (clamped inside the core)
+  const changeTuning = (patch: Partial<RewardTuning>) => {
+    core.setRewardTuning(patch);
+    setTuning(core.tuningSnapshot());
+  };
+
+  const resetTuning = () => {
+    core.setRewardTuning(DEFAULT_TUNING);
+    setTuning(core.tuningSnapshot());
+    playSound("click");
+    toast.info("Reward tuning reset", {
+      description: "Back to the validated defaults — +0.03 per metre, −0.5 fall shock, 90 s episodes.",
+    });
   };
 
   const changePopulation = (v: number[]) => {
@@ -812,6 +848,8 @@ export function BicycleTrainer() {
   const events = hud?.events ?? [];
   const history = hud?.history ?? [];
   const popApplied = (hud?.popSize ?? popQueued) === popQueued;
+  // Round 14 — true until the first Start press produces any training at all
+  const neverStarted = history.length === 0 && gen <= 1 && bestEver <= 0 && !watchBest;
 
   // one-line summary for the lineage card header
   const lineageSummary = lineage.view
@@ -898,6 +936,39 @@ export function BicycleTrainer() {
     }
   };
 
+  // Round 14 — export the CURRENT champion connectome as a JSON file (the
+  // latest brain, straight out of the trainer — no library round-trip)
+  const exportChampionJson = () => {
+    const brain = core.bestBrain ?? core.leader?.brain;
+    if (!brain || core.bestEverDistance <= 0) {
+      toast.error("No champion yet", {
+        description: "Finish a generation first — then the best brain can be exported.",
+      });
+      return;
+    }
+    const snap = brain.toJSON(
+      "bicycle",
+      brainName.trim() || "Dusk Rider",
+      core.generation,
+      core.bestEverDistance,
+    );
+    const ok = downloadTextFile(
+      `expert-fruit-fly-bicycle-champion-gen${core.generation}.json`,
+      JSON.stringify(snap, null, 2),
+      "application/json",
+    );
+    if (ok) {
+      playSound("ding");
+      toast.success("Champion brain exported", {
+        description: `Generation ${core.generation} · ${core.bestEverDistance.toFixed(0)} m — full connectome JSON, importable anywhere.`,
+      });
+    } else {
+      toast.error("Download blocked", {
+        description: "The browser refused the file download.",
+      });
+    }
+  };
+
   return (
     <section className="flex flex-col gap-4">
       <Toaster theme="dark" position="bottom-right" closeButton />
@@ -917,13 +988,35 @@ export function BicycleTrainer() {
                 generation.
               </CardDescription>
             </div>
-            <div className="flex items-center gap-2">
-              <Badge variant="secondary" className="gap-1.5 border-amber-500/30 bg-amber-500/10 text-amber-300">
-                <Sparkles className="h-3 w-3" /> reward +0.03 / m
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge
+                variant="secondary"
+                data-testid="bike-reward-badge"
+                className="gap-1.5 border-amber-500/30 bg-amber-500/10 font-mono text-amber-300"
+              >
+                <Sparkles className="h-3 w-3" /> reward +{tuning.rewardPerMeter.toFixed(3)} / m
               </Badge>
-              <Badge variant="secondary" className="gap-1.5 border-rose-500/30 bg-rose-500/10 text-rose-300">
-                <Zap className="h-3 w-3" /> shock −0.5 on fall
+              <Badge
+                variant="secondary"
+                data-testid="bike-shock-badge"
+                className="gap-1.5 border-rose-500/30 bg-rose-500/10 font-mono text-rose-300"
+              >
+                <Zap className="h-3 w-3" /> shock {tuning.punishFall.toFixed(2)} on fall
               </Badge>
+              {tuning.speedSugar > 0 && (
+                <Badge
+                  variant="secondary"
+                  className="gap-1.5 border-emerald-500/30 bg-emerald-500/10 font-mono text-emerald-300"
+                  title="Speed sugar — dopamine per metre-per-second. Pays for riding FAST, not just far."
+                >
+                  <Gauge className="h-3 w-3" /> speed +{tuning.speedSugar.toFixed(3)} / m·s
+                </Badge>
+              )}
+              {Math.round(tuning.episodeCapS) !== 90 && (
+                <Badge variant="secondary" className="gap-1.5 border-border/60 bg-black/40 font-mono text-foreground/80">
+                  <Flag className="h-3 w-3" /> cap {Math.round(tuning.episodeCapS)} s
+                </Badge>
+              )}
             </div>
           </div>
         </CardHeader>
@@ -1165,10 +1258,29 @@ export function BicycleTrainer() {
 
               {/* paused veil (training only — a challenge runs real-time) */}
               {!running && !challengeActive && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/35 backdrop-blur-[2px]">
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/35 p-4 backdrop-blur-[2px]">
                   <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/60 px-5 py-2.5 text-sm font-medium text-white/90">
-                    <Pause className="h-4 w-4" /> Paused — the flies are resting
+                    {neverStarted ? (
+                      <>
+                        <Play className="h-4 w-4 text-amber-300" aria-hidden />
+                        Generation 1 is ready — start when you are
+                      </>
+                    ) : (
+                      <>
+                        <Pause className="h-4 w-4" aria-hidden /> Paused — the flies are resting
+                      </>
+                    )}
                   </div>
+                  {neverStarted && (
+                    <Button
+                      onClick={toggleRun}
+                      data-testid="bike-start-overlay"
+                      className="h-11 gap-2 bg-amber-500 text-black hover:bg-amber-400"
+                      aria-label="Start training"
+                    >
+                      <Play className="h-4 w-4" aria-hidden /> Start training
+                    </Button>
+                  )}
                 </div>
               )}
             </div>
@@ -1383,10 +1495,11 @@ export function BicycleTrainer() {
                   onClick={toggleRun}
                   className="h-11 flex-1 gap-2 text-sm"
                   variant={running ? "secondary" : "default"}
-                  aria-label={running ? "Pause training" : "Resume training"}
+                  data-testid="bike-run-toggle"
+                  aria-label={running ? "Pause training" : neverStarted ? "Start training" : "Resume training"}
                 >
                   {running ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                  {running ? "Pause" : "Play"}
+                  {running ? "Pause" : neverStarted ? "Start" : "Play"}
                 </Button>
                 <Button
                   onClick={doReset}
@@ -1517,6 +1630,183 @@ export function BicycleTrainer() {
 
               <Separator />
 
+              {/* --- Round 14: live reward shaping ----------------------------- */}
+              <div className="flex flex-col gap-3" data-testid="bike-tuning-panel">
+                <div className="flex items-center justify-between gap-2">
+                  <Label className="flex items-center gap-1.5 text-sm">
+                    <SlidersHorizontal className="h-4 w-4 text-amber-300" aria-hidden /> Reward
+                    tuning
+                  </Label>
+                  <button
+                    type="button"
+                    onClick={resetTuning}
+                    data-testid="bike-tuning-reset"
+                    className="rounded-md border border-border/70 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors hover:border-amber-500/50 hover:text-amber-200"
+                    aria-label="Reset reward tuning to the validated defaults"
+                  >
+                    Reset defaults
+                  </button>
+                </div>
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  Live reward shaping — every dopamine value the flies feel,
+                  applied mid-episode. Tune it like you mean it.
+                </p>
+
+                <div className="flex flex-col gap-3 rounded-lg border border-border/60 bg-black/25 p-3">
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="tune-sugar" className="text-xs text-muted-foreground">
+                        Sugar per metre
+                      </Label>
+                      <span className="font-mono text-xs tabular-nums text-amber-300">
+                        +{tuning.rewardPerMeter.toFixed(3)}
+                      </span>
+                    </div>
+                    <Slider
+                      id="tune-sugar"
+                      data-testid="bike-tuning-sugar"
+                      min={0}
+                      max={0.12}
+                      step={0.005}
+                      value={[tuning.rewardPerMeter]}
+                      onValueChange={(v) => changeTuning({ rewardPerMeter: v[0] })}
+                    />
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="tune-speed" className="text-xs text-muted-foreground">
+                        Speed sugar
+                      </Label>
+                      <span className="font-mono text-xs tabular-nums text-emerald-300">
+                        +{tuning.speedSugar.toFixed(3)} / m·s
+                      </span>
+                    </div>
+                    <Slider
+                      id="tune-speed"
+                      data-testid="bike-tuning-speed"
+                      min={0}
+                      max={0.12}
+                      step={0.005}
+                      value={[tuning.speedSugar]}
+                      onValueChange={(v) => changeTuning({ speedSugar: v[0] })}
+                    />
+                    <p className="text-[10px] leading-snug text-muted-foreground/80">
+                      Pays dopamine for riding <span className="text-emerald-300">fast</span>, not
+                      just far. Without it, evolution learns to crawl (~0.35 m/s) and outlast the
+                      cap — the classic ~31 m plateau. Try 0.02–0.04.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="tune-fall" className="text-xs text-muted-foreground">
+                        Fall shock
+                      </Label>
+                      <span className="font-mono text-xs tabular-nums text-rose-300">
+                        {tuning.punishFall.toFixed(2)}
+                      </span>
+                    </div>
+                    <Slider
+                      id="tune-fall"
+                      data-testid="bike-tuning-fall"
+                      min={-1}
+                      max={0}
+                      step={0.05}
+                      value={[tuning.punishFall]}
+                      onValueChange={(v) => changeTuning({ punishFall: v[0] })}
+                    />
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="tune-offroad" className="text-xs text-muted-foreground">
+                        Off-road shock
+                      </Label>
+                      <span className="font-mono text-xs tabular-nums text-rose-300">
+                        {tuning.punishOffroad.toFixed(2)}
+                      </span>
+                    </div>
+                    <Slider
+                      id="tune-offroad"
+                      data-testid="bike-tuning-offroad"
+                      min={-1}
+                      max={0}
+                      step={0.05}
+                      value={[tuning.punishOffroad]}
+                      onValueChange={(v) => changeTuning({ punishOffroad: v[0] })}
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="flex flex-col gap-1.5">
+                      <div className="flex items-center justify-between">
+                        <Label htmlFor="tune-milestone" className="text-xs text-muted-foreground">
+                          Milestone bonus
+                        </Label>
+                        <span className="font-mono text-xs tabular-nums text-amber-300">
+                          +{tuning.milestoneBonus.toFixed(2)}
+                        </span>
+                      </div>
+                      <Slider
+                        id="tune-milestone"
+                        data-testid="bike-tuning-milestone"
+                        min={0}
+                        max={0.6}
+                        step={0.05}
+                        value={[tuning.milestoneBonus]}
+                        onValueChange={(v) => changeTuning({ milestoneBonus: v[0] })}
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      <div className="flex items-center justify-between">
+                        <Label htmlFor="tune-milestep" className="text-xs text-muted-foreground">
+                          Milestone step
+                        </Label>
+                        <span className="font-mono text-xs tabular-nums text-amber-300">
+                          {Math.round(tuning.milestoneStep)} m
+                        </span>
+                      </div>
+                      <Slider
+                        id="tune-milestep"
+                        data-testid="bike-tuning-milestep"
+                        min={25}
+                        max={200}
+                        step={25}
+                        value={[tuning.milestoneStep]}
+                        onValueChange={(v) => changeTuning({ milestoneStep: v[0] })}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="tune-cap" className="text-xs text-muted-foreground">
+                        Episode cap
+                      </Label>
+                      <span className="font-mono text-xs tabular-nums text-foreground/80">
+                        {Math.round(tuning.episodeCapS)} s
+                      </span>
+                    </div>
+                    <Slider
+                      id="tune-cap"
+                      data-testid="bike-tuning-cap"
+                      min={30}
+                      max={300}
+                      step={15}
+                      value={[tuning.episodeCapS]}
+                      onValueChange={(v) => changeTuning({ episodeCapS: v[0] })}
+                    />
+                    <p className="text-[10px] leading-snug text-muted-foreground/80">
+                      Longer episodes let slow-and-steady riders rack up metres — pair with speed
+                      sugar if you want fast champions.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <Separator />
+
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <Label htmlFor="watch-best" className="flex items-center gap-1.5 text-sm">
@@ -1567,6 +1857,20 @@ export function BicycleTrainer() {
                   {saving ? "Saving…" : "Save best brain"}
                 </Button>
               </div>
+
+              {/* Round 14 — the latest champion as a JSON file, straight from
+                  the trainer (no library round-trip needed to export it) */}
+              <Button
+                variant="outline"
+                onClick={exportChampionJson}
+                disabled={!hud?.hasBest}
+                data-testid="bike-export-brain"
+                className="h-11 w-full gap-2"
+                aria-label="Export the current champion brain as JSON"
+              >
+                <FileJson className="h-4 w-4" aria-hidden />
+                Export champion JSON
+              </Button>
 
               {/* --- session export (Task 12-b) — shareable markdown report
                     or history CSV; disabled until a generation finishes --- */}

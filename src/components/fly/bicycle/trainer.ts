@@ -154,6 +154,17 @@ const TUNING_CLAMP: Record<keyof RewardTuning, [number, number]> = {
   episodeCapS: [30, 300],
 };
 
+/** the validated defaults (Round 14 baseline — identical to pre-round-14 behaviour) */
+export const DEFAULT_TUNING: RewardTuning = {
+  rewardPerMeter: REWARD_PER_METER,
+  punishFall: PUNISH_FALL,
+  punishOffroad: PUNISH_OFFROAD,
+  milestoneBonus: MILESTONE_BONUS,
+  milestoneStep: MILESTONE_STEP,
+  speedSugar: SPEED_SUGAR,
+  episodeCapS: EPISODE_CAP_S,
+};
+
 // --- "You vs the fly" challenge -------------------------------------------
 const CHALLENGE_SURVIVOR_CAP_S = 30; // survivor's grace after the first fall
 const CHALLENGE_TOTAL_CAP_S = 90; // hard cap (same as a training episode)

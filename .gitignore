@@ -56,3 +56,7 @@ server.log
 # agent scratch (worklog.md is the canonical handover)
 /tool-results/
 /agent-ctx/
+
+# SSH keys + push log — NEVER commit
+/upload/
+push-github.log
