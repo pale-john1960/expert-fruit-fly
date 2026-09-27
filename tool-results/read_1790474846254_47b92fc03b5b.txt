@@ -1,0 +1,1055 @@
+     1→/**
+     2→ * FlyBrain — a browser-sized fruit fly connectome simulator.
+     3→ *
+     4→ * Design follows the approach validated by the "fly sim" wave of 2025/2026:
+     5→ *  1. Leaky-integrate-and-fire (LIF) neurons for spiking stages (Shiu et al. 2024)
+     6→ *  2. Graded (non-spiking) early visual stages, like the real fly eye
+     7→ *  3. Mushroom body (Kenyon cells → MBONs) as the learning hub
+     8→ *  4. Dopamine-gated 3-factor plasticity:
+     9→ *        Δw = η · dopamine · eligibility(pre, post)
+    10→ *     reward (dopamine > 0) strengthens recently co-active synapses,
+    11→ *     punishment (dopamine < 0) weakens them. This is how a real fly learns
+    12→ *     to associate odours/vision with sugar or shock.
+    13→ *  5. Neuroevolution on top: whole connectomes mutate + breed across generations.
+    14→ */
+    15→
+    16→import {
+    17→  BrainArchitecture,
+    18→  BrainRegion,
+    19→  BrainSnapshot,
+    20→  Edge,
+    21→  RegionRange,
+    22→  BRAIN_REGIONS,
+    23→} from "./types";
+    24→import { mulberry32, gaussian, clamp } from "./rng";
+    25→
+    26→// ---------------------------------------------------------------------------
+    27→// Tunable parameters (defaults hand-tuned; overridable per brain instance)
+    28→// ---------------------------------------------------------------------------
+    29→export interface BrainParams {
+    30→  vThreshold: number; // spike threshold
+    31→  vLeak: number; // membrane leak per tick
+    32→  pspDecay: number; // post-synaptic potential decay
+    33→  refractory: number; // ticks of refractory period
+    34→  rateDecay: number; // firing-rate smoothing
+    35→  laminaAdapt: number; // adaptation speed → temporal contrast
+    36→  laminaGain: number; // transient contrast gain
+    37→  medullaScale: number; // medulla kernel normalization scale
+    38→  lobulaGain: number; // input gain of lobula neurons
+    39→  kenyonGain: number; // input gain of Kenyon cells (low ⇒ sparse)
+    40→  mbonGain: number; // input gain of MBONs
+    41→  motorGain: number; // input gain of motor neurons
+    42→  eligDecay: number; // eligibility trace decay
+    43→  wMin: number;
+    44→  wMax: number;
+    45→  lrKM: number; // learning rate kenyon→mbon
+    46→  lrMM: number; // learning rate mbon→motor
+    47→  dopamineDecay: number;
+    48→  /** APL (anterior paired lateral) neuron gain — global inhibition of
+    49→   *  Kenyon cells, the mechanism that keeps mushroom-body codes sparse */
+    50→  aplGain: number;
+    51→  /** intrinsic noise σ on spiking neurons — gives smooth firing rates and
+    52→   *  drives action exploration (like real membrane channel noise) */
+    53→  noiseSigma: number;
+    54→}
+    55→
+    56→export const DEFAULT_PARAMS: BrainParams = {
+    57→  vThreshold: 1.0,
+    58→  vLeak: 0.8,
+    59→  pspDecay: 0.72,
+    60→  refractory: 3,
+    61→  rateDecay: 0.82,
+    62→  laminaAdapt: 0.06,
+    63→  laminaGain: 2.2,
+    64→  medullaScale: 2.5,
+    65→  lobulaGain: 0.7,
+    66→  kenyonGain: 1.6,
+    67→  mbonGain: 1.5,
+    68→  motorGain: 2.5,
+    69→  eligDecay: 0.8,
+    70→  wMin: -1.6,
+    71→  wMax: 1.6,
+    72→  lrKM: 0.04,
+    73→  lrMM: 0.08,
+    74→  dopamineDecay: 0.75,
+    75→  aplGain: 3.0,
+    76→  noiseSigma: 0.08,
+    77→};
+    78→
+    79→export interface LayerSizes {
+    80→  retina: number;
+    81→  lamina: number;
+    82→  medulla: number;
+    83→  lobula: number;
+    84→  kenyon: number;
+    85→  mbon: number;
+    86→  motor: number;
+    87→}
+    88→
+    89→const NOISE_BUF = 4096;
+    90→
+    91→export class FlyBrain {
+    92→  readonly arch: BrainArchitecture;
+    93→  readonly p: BrainParams;
+    94→  readonly sizes: LayerSizes;
+    95→  readonly total: number;
+    96→  readonly regions: RegionRange[];
+    97→
+    98→  // --- neural state (ordered by region, see `regions`) ---
+    99→  v: Float32Array; // membrane potential (spiking stages)
+   100→  psp: Float32Array; // accumulated synaptic input
+   101→  spiked: Uint8Array; // 1 if the neuron spiked this tick
+   102→  rates: Float32Array; // smoothed activity 0..1 (graded stages = value)
+   103→  refrac: Uint8Array;
+   104→
+   105→  // graded visual state
+   106→  private retinaV: Float32Array;
+   107→  private laminaV: Float32Array;
+   108→  private laminaAdapt: Float32Array;
+   109→  private medullaV: Float32Array;
+   110→
+   111→  // --- plastic weights (the LEARNED part of the brain) ---
+   112→  kenyonToMbon: Float32Array; // [mbon * kenyonCount + k]
+   113→  mbonToMotor: Float32Array; // [motor * mbonCount + m]
+   114→  lobulaToMotor: Float32Array; // [motor * lobulaCount + l] — the Giant Fiber
+   115→  // escape reflex pathway (visual → motor shortcut, like the real fly's
+   116→  // giant fiber system that triggers escape jumps in 2 synapses)
+   117→  mbonBias: Float32Array;
+   118→  motorBias: Float32Array;
+   119→
+   120→  // eligibility traces + neuromodulation
+   121→  private eligKM: Float32Array;
+   122→  private eligMM: Float32Array;
+   123→  private eligLM: Float32Array;
+   124→  dopamine = 0;
+   125→  /** MBON valence compartments: +1 = appetitive (reward-learning), -1 = aversive
+   126→   *  (punishment-learning) — like the real mushroom body compartments */
+   127→  readonly mbonValence: Int8Array;
+   128→
+   129→  // stats
+   130→  steps = 0;
+   131→  rewards = 0;
+   132→  punishments = 0;
+   133→  /** APL neuron feedback signal (mean Kenyon activity) */
+   134→  private aplActivity = 0;
+   135→  /** pre-generated gaussian noise table (cheap deterministic-ish noise) */
+   136→  private noiseBuf: Float32Array;
+   137→
+   138→  // --- fixed wiring (CSR-style flat arrays) ---
+   139→  // medulla pools: kernel weights over retina cells
+   140→  private medullaKernel: Float32Array; // [pool * retinaSize + cell]
+   141→  private medullaKernelNZ: Int32Array; // non-zero cell indices per pool (grid stride)
+   142→  // lobula ← medulla (random sparse)
+   143→  private lobulaIn: Int32Array; // [lobula * K + i]
+   144→  private lobulaW: Float32Array;
+   145→  private lobulaFanIn: number;
+   146→  // kenyon ← lobula (random sparse, high threshold → sparse coding)
+   147→  private kenyonIn: Int32Array;
+   148→  private kenyonW: Float32Array;
+   149→  private kenyonFanIn: number;
+   150→
+   151→  // --- visualization data ---
+   152→  readonly positions: Float32Array; // xyz per neuron (anatomical layout)
+   153→  private vizEdges: Edge[] | null = null;
+   154→
+   155→  // motor output (smoothed)
+   156→  motorRates: Float32Array;
+   157→
+   158→  constructor(arch: BrainArchitecture, params?: Partial<BrainParams>) {
+   159→    this.arch = { ...arch };
+   160→    this.p = { ...DEFAULT_PARAMS, ...params };
+   161→    const s: LayerSizes = {
+   162→      retina: arch.retinaCols * arch.retinaRows,
+   163→      lamina: arch.retinaCols * arch.retinaRows,
+   164→      medulla: arch.medullaChannels * arch.medullaPools,
+   165→      lobula: arch.lobulaCount,
+   166→      kenyon: arch.kenyonCount,
+   167→      mbon: arch.mbonCount,
+   168→      motor: arch.motorCount,
+   169→    };
+   170→    this.sizes = s;
+   171→    this.total =
+   172→      s.retina + s.lamina + s.medulla + s.lobula + s.kenyon + s.mbon + s.motor;
+   173→
+   174→    let start = 0;
+   175→    this.regions = BRAIN_REGIONS.map((region) => {
+   176→      const count = (s as Record<string, number>)[region] as number;
+   177→      const range = { region, start, count };
+   178→      start += count;
+   179→      return range;
+   180→    });
+   181→
+   182→    this.v = new Float32Array(this.total);
+   183→    this.psp = new Float32Array(this.total);
+   184→    this.spiked = new Uint8Array(this.total);
+   185→    this.rates = new Float32Array(this.total);
+   186→    this.refrac = new Uint8Array(this.total);
+   187→
+   188→    this.retinaV = new Float32Array(s.retina);
+   189→    this.laminaV = new Float32Array(s.retina);
+   190→    this.laminaAdapt = new Float32Array(s.retina);
+   191→    this.medullaV = new Float32Array(s.medulla);
+   192→
+   193→    this.kenyonToMbon = new Float32Array(s.mbon * s.kenyon);
+   194→    this.mbonToMotor = new Float32Array(s.motor * s.mbon);
+   195→    this.lobulaToMotor = new Float32Array(s.motor * s.lobula);
+   196→    this.mbonBias = new Float32Array(s.mbon);
+   197→    this.motorBias = new Float32Array(s.motor);
+   198→    this.eligKM = new Float32Array(s.mbon * s.kenyon);
+   199→    this.eligMM = new Float32Array(s.motor * s.mbon);
+   200→    this.eligLM = new Float32Array(s.motor * s.lobula);
+   201→    this.motorRates = new Float32Array(s.motor);
+   202→    this.mbonValence = new Int8Array(s.mbon);
+   203→    for (let m = 0; m < s.mbon; m++) {
+   204→      this.mbonValence[m] = m < Math.ceil(s.mbon / 2) ? 1 : -1;
+   205→    }
+   206→
+   207→    this.medullaKernel = new Float32Array(s.medulla * s.retina);
+   208→    this.medullaKernelNZ = new Int32Array(s.medulla * s.retina); // 0 = unused
+   209→    this.lobulaFanIn = Math.min(10, s.medulla);
+   210→    this.lobulaIn = new Int32Array(s.lobula * this.lobulaFanIn);
+   211→    this.lobulaW = new Float32Array(s.lobula * this.lobulaFanIn);
+   212→    this.kenyonFanIn = Math.min(6, s.lobula);
+   213→    this.kenyonIn = new Int32Array(s.kenyon * this.kenyonFanIn);
+   214→    this.kenyonW = new Float32Array(s.kenyon * this.kenyonFanIn);
+   215→
+   216→    this.positions = new Float32Array(this.total * 3);
+   217→
+   218→    this.buildFixedWiring();
+   219→    this.initPlasticWeights();
+   220→    this.buildPositions();
+   221→    // pre-generate noise table
+   222→    const nrand = mulberry32(this.arch.seed ^ 0xa0ce);
+   223→    this.noiseBuf = new Float32Array(NOISE_BUF);
+   224→    for (let i = 0; i < NOISE_BUF; i++) {
+   225→      // sum of uniforms ≈ gaussian (Irwin–Hall)
+   226→      this.noiseBuf[i] =
+   227→        (nrand() + nrand() + nrand() + nrand() + nrand() + nrand() - 3) * 0.8;
+   228→    }
+   229→  }
+   230→
+   231→  // -------------------------------------------------------------------------
+   232→  // Construction of the fixed (innate) connectome — deterministic on seed
+   233→  // -------------------------------------------------------------------------
+   234→  private buildFixedWiring() {
+   235→    const rand = mulberry32(this.arch.seed);
+   236→    const { retinaCols: C, retinaRows: R, medullaChannels: CH, medullaPools: P } =
+   237→      this.arch;
+   238→    const retinaSize = this.sizes.retina;
+   239→
+   240→    // --- medulla kernels: 8 fixed feature channels (the fly's "hardware") ---
+   241→    // pools laid out as poolCols × poolRows over the retina grid
+   242→    const poolCols = P === 24 ? 8 : P === 12 ? 4 : Math.ceil(Math.sqrt(P));
+   243→    const poolRows = Math.max(1, Math.round(P / poolCols));
+   244→    const cellW = C / poolCols;
+   245→    const cellH = R / poolRows;
+   246→
+   247→    for (let ch = 0; ch < CH; ch++) {
+   248→      for (let p = 0; p < P; p++) {
+   249→        const pool = ch * P + p;
+   250→        const pc = p % poolCols;
+   251→        const pr = Math.floor(p / poolCols);
+   252→        for (let r = 0; r < R; r++) {
+   253→          // only cells inside this pool's rectangle get kernel weight
+   254→          if (r < pr * cellH || r >= (pr + 1) * cellH) continue;
+   255→          for (let c = 0; c < C; c++) {
+   256→            if (c < pc * cellW || c >= (pc + 1) * cellW) continue;
+   257→            // cell center in pool-local coords, -1..1
+   258→            const lx = ((c - pc * cellW) / cellW) * 2 - 1;
+   259→            const ly = ((r - pr * cellH) / cellH) * 2 - 1;
+   260→            let w = 0;
+   261→            switch (ch) {
+   262→              case 0: // ON center / OFF surround (bright spots)
+   263→                w = (1 - Math.abs(lx) * 1.2) * (1 - Math.abs(ly) * 1.2) * 2 - 0.5;
+   264→                break;
+   265→              case 1: // OFF center / ON surround (dark spots)
+   266→                w = 0.5 - (1 - Math.abs(lx) * 1.2) * (1 - Math.abs(ly) * 1.2) * 2;
+   267→                break;
+   268→              case 2: // horizontal edge (bright left)
+   269→                w = -lx * 0.9;
+   270→                break;
+   271→              case 3: // horizontal edge (bright right)
+   272→                w = lx * 0.9;
+   273→                break;
+   274→              case 4: // vertical edge (bright top)
+   275→                w = -ly * 0.9;
+   276→                break;
+   277→              case 5: // vertical edge (bright bottom)
+   278→                w = ly * 0.9;
+   279→                break;
+   280→              case 6: // local contrast energy
+   281→                w = Math.abs(lx) * Math.abs(ly) * 0.8 + 0.1;
+   282→                break;
+   283→              case 7: // wide brightness (pool luminance)
+   284→                w = 0.35;
+   285→                break;
+   286→            }
+   287→            const idx = pool * retinaSize + r * C + c;
+   288→            this.medullaKernel[idx] = w;
+   289→            this.medullaKernelNZ[idx] = Math.abs(w) > 0.05 ? 1 : 0;
+   290→          }
+   291→        }
+   292→      }
+   293→    }
+   294→
+   295→    // --- lobula ← medulla: RETINOTOPIC sparse sampling (fixed) ---
+   296→    // each lobula neuron only "looks at" one region of the visual field
+   297→    // (like the real optic lobe), so position information survives
+   298→    for (let l = 0; l < this.sizes.lobula; l++) {
+   299→      const homePool = l % P; // retinotopic home
+   300→      const hpCol = homePool % poolCols;
+   301→      const hpRow = Math.floor(homePool / poolCols);
+   302→      for (let k = 0; k < this.lobulaFanIn; k++) {
+   303→        // sample from home pool or immediate neighbors
+   304→        let pc = hpCol;
+   305→        let pr = hpRow;
+   306→        const jitter = Math.floor(rand() * 3) - 1;
+   307→        if (k % 3 === 1) pc = Math.min(poolCols - 1, Math.max(0, hpCol + jitter));
+   308→        if (k % 3 === 2) pr = Math.min(poolRows - 1, Math.max(0, hpRow + jitter));
+   309→        const pool = pr * poolCols + pc;
+   310→        const ch = Math.floor(rand() * CH);
+   311→        const src = ch * P + pool;
+   312→        this.lobulaIn[l * this.lobulaFanIn + k] = src;
+   313→        this.lobulaW[l * this.lobulaFanIn + k] = 0.5 + rand() * 0.7;
+   314→      }
+   315→    }
+   316→
+   317→    // --- kenyon ← lobula: SPATIALLY-STRUCTURED divergent wiring ---
+   318→    // each Kenyon cell looks at a small window of the visual field (like the
+   319→    // real fly's projection neurons), so the mushroom body keeps a coarse
+   320→    // map of WHERE things happened — essential for learning place/task cues
+   321→    const lobulaByPool: number[][] = Array.from({ length: P }, () => []);
+   322→    for (let l = 0; l < this.sizes.lobula; l++) {
+   323→      lobulaByPool[l % P].push(l);
+   324→    }
+   325→    for (let k = 0; k < this.sizes.kenyon; k++) {
+   326→      const homePool = Math.floor(rand() * P);
+   327→      const candidates: number[] = [];
+   328→      for (let dp = -1; dp <= 1; dp++) {
+   329→        const p = (homePool + dp + P) % P;
+   330→        candidates.push(...lobulaByPool[p]);
+   331→      }
+   332→      for (let j = 0; j < this.kenyonFanIn; j++) {
+   333→        const src = candidates[Math.floor(rand() * candidates.length)] ?? 0;
+   334→        this.kenyonIn[k * this.kenyonFanIn + j] = src;
+   335→        this.kenyonW[k * this.kenyonFanIn + j] = 0.45 + rand() * 0.6;
+   336→      }
+   337→    }
+   338→  }
+   339→
+   340→  private initPlasticWeights() {
+   341→    const rand = mulberry32(this.arch.seed ^ 0x5eed);
+   342→    // Kenyon→MBON: small modulatory weights on top of tonic MBON firing
+   343→    for (let i = 0; i < this.kenyonToMbon.length; i++) {
+   344→      this.kenyonToMbon[i] = (rand() - 0.5) * 0.5;
+   345→    }
+   346→    // MBON→motor: APPROACH pathway (appetitive MBONs excite motors) vs
+   347→    // AVOIDANCE pathway (aversive MBONs inhibit motors — real MBONs are
+   348→    // largely GABAergic/inhibitory). Reward potentiates approach,
+   349→    // punishment potentiates avoidance. Behavior = the balance.
+   350→    for (let o = 0; o < this.sizes.motor; o++) {
+   351→      for (let m = 0; m < this.sizes.mbon; m++) {
+   352→        const mag = 0.25 + rand() * 0.45;
+   353→        this.mbonToMotor[o * this.sizes.mbon + m] =
+   354→          this.mbonValence[m] > 0 ? mag : -mag;
+   355→      }
+   356→    }
+   357→    // Giant-fiber reflex (lobula→motor): small random seeds — evolution
+   358→    // sculpts this fast pathway (it's how a fly "knows" to escape-jump)
+   359→    for (let i = 0; i < this.lobulaToMotor.length; i++) {
+   360→      this.lobulaToMotor[i] = (rand() - 0.5) * 0.8;
+   361→    }
+   362→    // tonic biases near threshold: noise-driven baseline firing
+   363→    // (real MBONs and motor neurons fire tonically at rest)
+   364→    for (let m = 0; m < this.sizes.mbon; m++) this.mbonBias[m] = 1.0;
+   365→    for (let m = 0; m < this.sizes.motor; m++) this.motorBias[m] = 1.28;
+   366→  }
+   367→
+   368→  // -------------------------------------------------------------------------
+   369→  // Anatomical 3D layout (for the visualizer) — eyes front, motor rear/bottom
+   370→  // -------------------------------------------------------------------------
+   371→  private buildPositions() {
+   372→    const rand = mulberry32(this.arch.seed ^ 0xbee);
+   373→    const set = (i: number, x: number, y: number, z: number) => {
+   374→      this.positions[i * 3] = x;
+   375→      this.positions[i * 3 + 1] = y;
+   376→      this.positions[i * 3 + 2] = z;
+   377→    };
+   378→    const { retinaCols: C, retinaRows: R, medullaChannels: CH, medullaPools: P } =
+   379→      this.arch;
+   380→
+   381→    // retina: wide plane at the front (the compound eyes)
+   382→    const rr = this.range("retina");
+   383→    for (let r = 0; r < R; r++) {
+   384→      for (let c = 0; c < C; c++) {
+   385→        const i = rr.start + r * C + c;
+   386→        const x = (c / (C - 1) - 0.5) * 3.6;
+   387→        const y = (r / (R - 1) - 0.5) * 1.25;
+   388→        set(i, x, y, 2.2);
+   389→      }
+   390→    }
+   391→
+   392→    // lamina: slightly behind, narrower
+   393→    const la = this.range("lamina");
+   394→    for (let r = 0; r < R; r++) {
+   395→      for (let c = 0; c < C; c++) {
+   396→        const i = la.start + r * C + c;
+   397→        const x = (c / (C - 1) - 0.5) * 3.1;
+   398→        const y = (r / (R - 1) - 0.5) * 1.1;
+   399→        set(i, x, y, 1.75);
+   400→      }
+   401→    }
+   402→
+   403→    // medulla: two mirrored slabs (left/right hemispheres), channels stacked
+   404→    const me = this.range("medulla");
+   405→    const poolCols = P === 24 ? 8 : P === 12 ? 4 : Math.ceil(Math.sqrt(P));
+   406→    for (let ch = 0; ch < CH; ch++) {
+   407→      for (let p = 0; p < P; p++) {
+   408→        const i = me.start + ch * P + p;
+   409→        const pc = p % poolCols;
+   410→        const pr = Math.floor(p / poolCols);
+   411→        const poolRows = Math.max(1, Math.round(P / poolCols));
+   412→        const side = pc < poolCols / 2 ? -1 : 1;
+   413→        const x = side * (0.55 + (ch / CH) * 0.85 + (rand() - 0.5) * 0.06);
+   414→        const y = (pr / Math.max(1, poolRows - 1) - 0.5) * 1.5;
+   415→        set(i, x, y, 1.0 - (ch / CH) * 0.35);
+   416→      }
+   417→    }
+   418→
+   419→    // lobula: two tight clusters
+   420→    const lo = this.range("lobula");
+   421→    for (let l = 0; l < this.sizes.lobula; l++) {
+   422→      const i = lo.start + l;
+   423→      const side = l % 2 === 0 ? -1 : 1;
+   424→      const t = rand() * Math.PI * 2;
+   425→      const u = rand();
+   426→      const rad = 0.32 * Math.cbrt(u);
+   427→      set(
+   428→        i,
+   429→        side * 0.72 + Math.cos(t) * rad,
+   430→        Math.sin(t) * rad * 0.8,
+   431→        0.45 + (rand() - 0.5) * 0.3
+   432→      );
+   433→    }
+   434→
+   435→    // kenyon: twin mushroom bodies (calyx ellipsoids + vertical stalk hint)
+   436→    const ke = this.range("kenyon");
+   437→    for (let k = 0; k < this.sizes.kenyon; k++) {
+   438→      const i = ke.start + k;
+   439→      const side = k % 2 === 0 ? -1 : 1;
+   440→      const t = rand() * Math.PI * 2;
+   441→      const u = rand();
+   442→      const rad = 0.42 * Math.cbrt(u);
+   443→      const stalk = rand() < 0.25;
+   444→      if (stalk) {
+   445→        // peduncle / vertical lobe descending
+   446→        set(
+   447→          i,
+   448→          side * 0.42 + (rand() - 0.5) * 0.08,
+   449→          -0.35 - rand() * 0.55,
+   450→          -0.15 + (rand() - 0.5) * 0.08
+   451→        );
+   452→      } else {
+   453→        // calyx
+   454→        set(
+   455→          i,
+   456→          side * 0.42 + Math.cos(t) * rad,
+   457→          0.3 + Math.sin(t) * rad * 0.55,
+   458→          -0.15 + (rand() - 0.5) * 0.3
+   459→        );
+   460→      }
+   461→    }
+   462→
+   463→    // mbon: arc wrapping under the mushroom bodies
+   464→    const mb = this.range("mbon");
+   465→    for (let m = 0; m < this.sizes.mbon; m++) {
+   466→      const i = mb.start + m;
+   467→      const a = (m / this.sizes.mbon) * Math.PI - Math.PI / 2;
+   468→      set(i, Math.sin(a) * 0.85, -0.55 + Math.cos(a) * 0.18, -0.5);
+   469→    }
+   470→
+   471→    // motor: bottom rear, spread on a line
+   472→    const mo = this.range("motor");
+   473→    for (let m = 0; m < this.sizes.motor; m++) {
+   474→      const i = mo.start + m;
+   475→      const x =
+   476→        this.sizes.motor === 1
+   477→          ? 0
+   478→          : (m / (this.sizes.motor - 1) - 0.5) * 0.9;
+   479→      set(i, x, -0.95, -0.75);
+   480→    }
+   481→  }
+   482→
+   483→  range(region: BrainRegion): RegionRange {
+   484→    return this.regions.find((r) => r.region === region)!;
+   485→  }
+   486→
+   487→  // -------------------------------------------------------------------------
+   488→  // Simulation
+   489→  // -------------------------------------------------------------------------
+   490→
+   491→  /**
+   492→   * Advance the whole brain by one tick.
+   493→   * @param input  retinal input currents, length = retinaCols*retinaRows,
+   494→   *               values roughly 0..1 (brightness)
+   495→   * @param dopamineDelta  neuromodulation injected this tick
+   496→   *               ( > 0 reward / sugar, < 0 punishment / shock )
+   497→   * @returns motor firing rates 0..1 (smoothed)
+   498→   */
+   499→  step(input: ArrayLike<number>, dopamineDelta = 0): Float32Array {
+   500→    this.steps++;
+   501→    const s = this.sizes;
+   502→
+   503→    // --- decay dopaminergic tone ---
+   504→    this.dopamine = clamp(
+   505→      this.dopamine * this.p.dopamineDecay + dopamineDelta,
+   506→      -1,
+   507→      1
+   508→    );
+   509→    if (dopamineDelta > 0.01) this.rewards += dopamineDelta;
+   510→    if (dopamineDelta < -0.01) this.punishments += -dopamineDelta;
+   511→
+   512→    // === 1. RETINA (graded photoreceptors with contrast normalization) ===
+   513→    // like real photoreceptor adaptation: subtract the mean luminance so the
+   514→    // brain encodes CONTRAST (what stands out), not absolute brightness
+   515→    const rr = this.range("retina");
+   516→    let mean = 0;
+   517→    for (let i = 0; i < s.retina; i++) mean += input[i] ?? 0;
+   518→    mean /= s.retina;
+   519→    for (let i = 0; i < s.retina; i++) {
+   520→      const val = clamp((input[i] ?? 0) - mean * 0.85, 0, 1.2);
+   521→      this.retinaV[i] = val;
+   522→      this.rates[rr.start + i] = val;
+   523→      this.spiked[rr.start + i] = 0;
+   524→    }
+   525→
+   526→    // === 2. LAMINA (graded: sustained + transient contrast, like real
+   527→    //     photoreceptor→lamina channels that keep both components) ===
+   528→    const la = this.range("lamina");
+   529→    for (let i = 0; i < s.retina; i++) {
+   530→      this.laminaAdapt[i] += this.p.laminaAdapt * (this.retinaV[i] - this.laminaAdapt[i]);
+   531→      // sustained component keeps static patterns visible…
+   532→      const sustained = 0.18 + 0.62 * this.retinaV[i];
+   533→      // …transient component emphasizes changes (motion/onsets)
+   534→      const transient = (this.retinaV[i] - this.laminaAdapt[i]) * this.p.laminaGain;
+   535→      const val = clamp(sustained + transient, 0, 1);
+   536→      this.laminaV[i] = val;
+   537→      this.rates[la.start + i] = val;
+   538→      this.spiked[la.start + i] = 0;
+   539→    }
+   540→
+   541→    // === 3. MEDULLA (fixed feature channels + cross-pool normalization) ===
+   542→    // each channel is centered across pools (like lateral inhibition in the
+   543→    // real medulla) so pools report CONTRAST vs the rest of the visual field
+   544→    const me = this.range("medulla");
+   545→    const retinaSize = s.retina;
+   546→    const poolArea = Math.max(1, Math.round(retinaSize / this.arch.medullaPools));
+   547→    const P = this.arch.medullaPools;
+   548→    for (let p = 0; p < s.medulla; p++) {
+   549→      let acc = 0;
+   550→      const base = p * retinaSize;
+   551→      for (let cell = 0; cell < retinaSize; cell++) {
+   552→        if (this.medullaKernelNZ[base + cell]) {
+   553→          acc += this.medullaKernel[base + cell] * this.laminaV[cell];
+   554→        }
+   555→      }
+   556→      this.medullaV[p] = acc / poolArea * this.p.medullaScale;
+   557→    }
+   558→    // center each channel across its pools
+   559→    for (let ch = 0; ch < this.arch.medullaChannels; ch++) {
+   560→      let cmean = 0;
+   561→      for (let p = 0; p < P; p++) cmean += this.medullaV[ch * P + p];
+   562→      cmean /= P;
+   563→      for (let p = 0; p < P; p++) {
+   564→        const idx = ch * P + p;
+   565→        const val = clamp(0.5 + (this.medullaV[idx] - cmean) * 1.8, 0, 1);
+   566→        this.medullaV[idx] = val;
+   567→        this.rates[me.start + idx] = val;
+   568→        this.spiked[me.start + idx] = 0;
+   569→      }
+   570→    }
+   571→
+   572→    // === 4..7. SPIKING STAGES, layer by layer ===
+   573→    // lobula
+   574→    const lo = this.range("lobula");
+   575→    this.updateLIFLayer(lo.start, s.lobula, (l) => {
+   576→      let acc = 0;
+   577→      const base = l * this.lobulaFanIn;
+   578→      for (let k = 0; k < this.lobulaFanIn; k++) {
+   579→        // deviation-from-baseline: lobula encodes visual EVENTS, not the
+   580→        // constant background (keeps the layer in its dynamic range)
+   581→        acc += this.lobulaW[base + k] * (this.medullaV[this.lobulaIn[base + k]] - 0.5);
+   582→      }
+   583→      return acc * this.p.lobulaGain;
+   584→    });
+   585→
+   586→    // kenyon (mushroom body intrinsic cells) — sparse coding enforced by the
+   587→    // APL neuron: global feedback inhibition proportional to total KC activity
+   588→    const ke = this.range("kenyon");
+   589→    const lobulaRates = this.rates.subarray(lo.start, lo.start + s.lobula);
+   590→    const aplInhib = this.aplActivity * this.p.aplGain;
+   591→    this.updateLIFLayer(ke.start, s.kenyon, (k) => {
+   592→      let acc = 0;
+   593→      const base = k * this.kenyonFanIn;
+   594→      for (let j = 0; j < this.kenyonFanIn; j++) {
+   595→        acc += this.kenyonW[base + j] * lobulaRates[this.kenyonIn[base + j]];
+   596→      }
+   597→      return acc * this.p.kenyonGain - aplInhib;
+   598→    });
+   599→    // update APL activity (mean Kenyon rate, smoothed)
+   600→    {
+   601→      let sum = 0;
+   602→      for (let k = 0; k < s.kenyon; k++) sum += this.rates[ke.start + k];
+   603→      const mean = sum / s.kenyon;
+   604→      this.aplActivity = this.aplActivity * 0.85 + mean * 0.15;
+   605→    }
+   606→
+   607→    // mbon (mushroom body output neurons) — plastic input
+   608→    const mb = this.range("mbon");
+   609→    const kenyonRates = this.rates.subarray(ke.start, ke.start + s.kenyon);
+   610→    this.updateLIFLayer(mb.start, s.mbon, (m) => {
+   611→      let acc = 0;
+   612→      const base = m * s.kenyon;
+   613→      for (let k = 0; k < s.kenyon; k++) {
+   614→        acc += this.kenyonToMbon[base + k] * kenyonRates[k];
+   615→      }
+   616→      return this.mbonBias[m] + acc * this.p.mbonGain;
+   617→    });
+   618→
+   619→    // motor — plastic input from mbon + the giant-fiber escape reflex
+   620→    // (lobula → motor shortcut for fast visual actions)
+   621→    const mo = this.range("motor");
+   622→    const mbonRates = this.rates.subarray(mb.start, mb.start + s.mbon);
+   623→    const lobulaRates2 = this.rates.subarray(lo.start, lo.start + s.lobula);
+   624→    this.updateLIFLayer(mo.start, s.motor, (m) => {
+   625→      let acc = 0;
+   626→      const base = m * s.mbon;
+   627→      for (let j = 0; j < s.mbon; j++) {
+   628→        acc += this.mbonToMotor[base + j] * mbonRates[j];
+   629→      }
+   630→      const lbase = m * s.lobula;
+   631→      for (let l = 0; l < s.lobula; l++) {
+   632→        acc += this.lobulaToMotor[lbase + l] * lobulaRates2[l];
+   633→      }
+   634→      return this.motorBias[m] + acc * this.p.motorGain;
+   635→    });
+   636→
+   637→    // smoothed motor output
+   638→    for (let m = 0; m < s.motor; m++) {
+   639→      const idx = mo.start + m;
+   640→      this.motorRates[m] = this.motorRates[m] * 0.7 + this.rates[idx] * 0.3;
+   641→    }
+   642→
+   643→    // === 8. DOPAMINE-GATED PLASTICITY (3-factor rule) ===
+   644→    // eligibility: which synapses were recently co-active… (decays every tick
+   645→    // regardless of dopamine, so credit is assigned to *recent* activity)
+   646→    for (let e = 0; e < this.eligKM.length; e++) this.eligKM[e] *= this.p.eligDecay;
+   647→    for (let e = 0; e < this.eligMM.length; e++) this.eligMM[e] *= this.p.eligDecay;
+   648→    for (let e = 0; e < this.eligLM.length; e++) this.eligLM[e] *= this.p.eligDecay;
+   649→    for (let k = 0; k < s.kenyon; k++) {
+   650→      const pre = kenyonRates[k];
+   651→      if (pre < 0.05) continue;
+   652→      for (let m = 0; m < s.mbon; m++) {
+   653→        const post = mbonRates[m];
+   654→        const e = m * s.kenyon + k;
+   655→        this.eligKM[e] += pre * post;
+   656→      }
+   657→    }
+   658→    for (let m = 0; m < s.mbon; m++) {
+   659→      const pre = mbonRates[m];
+   660→      if (pre < 0.05) continue;
+   661→      for (let o = 0; o < s.motor; o++) {
+   662→        const post = this.rates[mo.start + o];
+   663→        const e = o * s.mbon + m;
+   664→        this.eligMM[e] += pre * post;
+   665→      }
+   666→    }
+   667→    // giant-fiber reflex eligibility (lobula × motor co-activity)
+   668→    for (let l = 0; l < s.lobula; l++) {
+   669→      const pre = lobulaRates2[l];
+   670→      if (pre < 0.05) continue;
+   671→      for (let o = 0; o < s.motor; o++) {
+   672→        const post = this.rates[mo.start + o];
+   673→        const e = o * s.lobula + l;
+   674→        this.eligLM[e] += pre * post;
+   675→      }
+   676→    }
+   677→    // …and dopamine decides if that activity is worth keeping.
+   678→    // Compartment rule (like real mushroom-body compartments):
+   679→    //   reward (d>0) potentiates appetitive MBON synapses, weakens aversive
+   680→    //   punishment (d<0) potentiates aversive MBON synapses, weakens appetitive
+   681→    if (Math.abs(this.dopamine) > 0.005) {
+   682→      const d = this.dopamine;
+   683→      for (let m = 0; m < s.mbon; m++) {
+   684→        const dComp = d * this.mbonValence[m];
+   685→        const base = m * s.kenyon;
+   686→        for (let k = 0; k < s.kenyon; k++) {
+   687→          const e = base + k;
+   688→          const elig = this.eligKM[e];
+   689→          if (elig > 0.001) {
+   690→            this.kenyonToMbon[e] = clamp(
+   691→              this.kenyonToMbon[e] + this.p.lrKM * dComp * elig,
+   692→              this.p.wMin,
+   693→              this.p.wMax
+   694→            );
+   695→          }
+   696→        }
+   697→      }
+   698→      for (let o = 0; o < s.motor; o++) {
+   699→        const base = o * s.mbon;
+   700→        for (let m = 0; m < s.mbon; m++) {
+   701→          const e = base + m;
+   702→          const elig = this.eligMM[e];
+   703→          if (elig > 0.001) {
+   704→            // same compartment logic: reward potentiates links driven by
+   705→            // appetitive MBONs, punishment potentiates aversive-driven links
+   706→            this.mbonToMotor[e] = clamp(
+   707→              this.mbonToMotor[e] + this.p.lrMM * d * this.mbonValence[m] * elig,
+   708→              this.p.wMin,
+   709→              this.p.wMax
+   710→            );
+   711→          }
+   712→        }
+   713→      }
+   714→      // giant-fiber reflex: plain 3-factor rule (no compartments — it's
+   715→      // a hardwired reflex pathway that experience can still tune)
+   716→      for (let e = 0; e < this.eligLM.length; e++) {
+   717→        const elig = this.eligLM[e];
+   718→        if (elig > 0.001) {
+   719→          this.lobulaToMotor[e] = clamp(
+   720→            this.lobulaToMotor[e] + this.p.lrMM * d * elig,
+   721→            this.p.wMin,
+   722→            this.p.wMax
+   723→          );
+   724→        }
+   725→      }
+   726→    }
+   727→
+   728→    return this.motorRates;
+   729→  }
+   730→
+   731→  /** LIF update for one spiking layer with an input-current closure.
+   732→   *  Inputs are in "steady-state potential" units: a sustained input of 1.0
+   733→   *  brings the membrane exactly to threshold (leak-compensated). */
+   734→  private updateLIFLayer(
+   735→    start: number,
+   736→    count: number,
+   737→    inputOf: (i: number) => number
+   738→  ) {
+   739→    const inputScale = 1 - this.p.vLeak;
+   740→    const noise = this.p.noiseSigma;
+   741→    const nz = noise > 0 ? this.noiseBuf : null;
+   742→    for (let i = 0; i < count; i++) {
+   743→      const idx = start + i;
+   744→      let v = this.v[idx];
+   745→      // apply pending psp (pokes / external current)
+   746→      v = v * this.p.vLeak + this.psp[idx] * inputScale;
+   747→      this.psp[idx] *= this.p.pspDecay;
+   748→
+   749→      if (this.refrac[idx] > 0) {
+   750→        this.refrac[idx]--;
+   751→        this.spiked[idx] = 0;
+   752→        this.v[idx] = 0;
+   753→        this.rates[idx] *= this.p.rateDecay;
+   754→        continue;
+   755→      }
+   756→
+   757→      // incoming current + intrinsic membrane noise
+   758→      v += inputOf(i) * inputScale;
+   759→      if (nz) v += (nz[idx & (NOISE_BUF - 1)] + nz[(idx * 7 + this.steps) & (NOISE_BUF - 1)]) * noise;
+   760→
+   761→      if (v >= this.p.vThreshold) {
+   762→        this.spiked[idx] = 1;
+   763→        this.v[idx] = 0;
+   764→        this.refrac[idx] = this.p.refractory;
+   765→        this.rates[idx] = this.rates[idx] * this.p.rateDecay + (1 - this.p.rateDecay);
+   766→      } else {
+   767→        this.spiked[idx] = 0;
+   768→        this.v[idx] = v;
+   769→        this.rates[idx] *= this.p.rateDecay;
+   770→      }
+   771→    }
+   772→  }
+   773→
+   774→  /** Inject current straight into a neuron (Brain Lab "poke" feature). */
+   775→  poke(neuronIndex: number, strength = 1.5) {
+   776→    if (neuronIndex < 0 || neuronIndex >= this.total) return;
+   777→    const region = this.regionOf(neuronIndex);
+   778→    if (region === "retina" || region === "lamina" || region === "medulla") {
+   779→      // graded layers: boost their stored value via psp/v (visual approximation)
+   780→      this.psp[neuronIndex] += strength * 0.8;
+   781→    } else {
+   782→      this.psp[neuronIndex] += strength;
+   783→    }
+   784→  }
+   785→
+   786→  regionOf(neuronIndex: number): BrainRegion | null {
+   787→    for (const r of this.regions) {
+   788→      if (neuronIndex >= r.start && neuronIndex < r.start + r.count) {
+   789→        return r.region;
+   790→      }
+   791→    }
+   792→    return null;
+   793→  }
+   794→
+   795→  /** Current dopamine tone −1..1 (for visualization). */
+   796→  getDopamine(): number {
+   797→    return this.dopamine;
+   798→  }
+   799→
+   800→  // -------------------------------------------------------------------------
+   801→  // Neuroevolution
+   802→  // -------------------------------------------------------------------------
+   803→
+   804→  clone(): FlyBrain {
+   805→    const b = new FlyBrain(this.arch, this.p);
+   806→    b.kenyonToMbon.set(this.kenyonToMbon);
+   807→    b.mbonToMotor.set(this.mbonToMotor);
+   808→    b.lobulaToMotor.set(this.lobulaToMotor);
+   809→    b.mbonBias.set(this.mbonBias);
+   810→    b.motorBias.set(this.motorBias);
+   811→    b.steps = this.steps;
+   812→    b.rewards = this.rewards;
+   813→    b.punishments = this.punishments;
+   814→    return b;
+   815→  }
+   816→
+   817→  /** Gaussian mutation of every evolvable parameter.
+   818→   *  kmRate is separate (default much lower): the dense Kenyon→MBON matrix
+   819→   *  carries learned associations and should drift slowly, while the compact
+   820→   *  giant-fiber and readout pathways evolve quickly. */
+   821→  mutate(rate = 0.1, strength = 0.15, kmRate?: number): void {
+   822→    const rand = mulberry32(
+   823→      (Math.random() * 0xffffffff) >>> 0
+   824→    );
+   825→    const kmr = kmRate ?? rate * 0.12;
+   826→    const go = (arr: Float32Array, r: number) => {
+   827→      for (let i = 0; i < arr.length; i++) {
+   828→        if (rand() < r) {
+   829→          arr[i] = clamp(arr[i] + gaussian(rand) * strength, this.p.wMin, this.p.wMax);
+   830→        }
+   831→      }
+   832→    };
+   833→    go(this.kenyonToMbon, kmr);
+   834→    go(this.mbonToMotor, rate);
+   835→    go(this.lobulaToMotor, rate);
+   836→    // biases evolve within a narrower range
+   837→    for (let i = 0; i < this.mbonBias.length; i++) {
+   838→      if (rand() < rate) this.mbonBias[i] += gaussian(rand) * strength * 0.3;
+   839→    }
+   840→    for (let i = 0; i < this.motorBias.length; i++) {
+   841→      if (rand() < rate) this.motorBias[i] += gaussian(rand) * strength * 0.3;
+   842→    }
+   843→  }
+   844→
+   845→  /** Uniform crossover — each synapse randomly from either parent. */
+   846→  static crossover(a: FlyBrain, b: FlyBrain): FlyBrain {
+   847→    if (
+   848→      a.sizes.mbon !== b.sizes.mbon ||
+   849→      a.sizes.kenyon !== b.sizes.kenyon ||
+   850→      a.sizes.motor !== b.sizes.motor
+   851→    ) {
+   852→      return a.clone();
+   853→    }
+   854→    const child = new FlyBrain(a.arch, a.p);
+   855→    const rand = mulberry32((Math.random() * 0xffffffff) >>> 0);
+   856→    for (let i = 0; i < child.kenyonToMbon.length; i++) {
+   857→      child.kenyonToMbon[i] = rand() < 0.5 ? a.kenyonToMbon[i] : b.kenyonToMbon[i];
+   858→    }
+   859→    for (let i = 0; i < child.mbonToMotor.length; i++) {
+   860→      child.mbonToMotor[i] = rand() < 0.5 ? a.mbonToMotor[i] : b.mbonToMotor[i];
+   861→    }
+   862→    for (let i = 0; i < child.lobulaToMotor.length; i++) {
+   863→      child.lobulaToMotor[i] = rand() < 0.5 ? a.lobulaToMotor[i] : b.lobulaToMotor[i];
+   864→    }
+   865→    for (let i = 0; i < child.mbonBias.length; i++) {
+   866→      child.mbonBias[i] = rand() < 0.5 ? a.mbonBias[i] : b.mbonBias[i];
+   867→    }
+   868→    for (let i = 0; i < child.motorBias.length; i++) {
+   869→      child.motorBias[i] = rand() < 0.5 ? a.motorBias[i] : b.motorBias[i];
+   870→    }
+   871→    return child;
+   872→  }
+   873→
+   874→  // -------------------------------------------------------------------------
+   875→  // Serialization — save / load learned brains
+   876→  // -------------------------------------------------------------------------
+   877→
+   878→  toJSON(task: string, name: string, generation = 0, score = 0): BrainSnapshot {
+   879→    const r4 = (a: Float32Array) => Array.from(a, (x) => Math.round(x * 1e5) / 1e5);
+   880→    return {
+   881→      version: 1,
+   882→      task,
+   883→      name,
+   884→      arch: { ...this.arch },
+   885→      generation,
+   886→      score,
+   887→      createdAt: new Date().toISOString(),
+   888→      weights: {
+   889→        kenyonToMbon: r4(this.kenyonToMbon),
+   890→        mbonToMotor: r4(this.mbonToMotor),
+   891→        lobulaToMotor: r4(this.lobulaToMotor),
+   892→        mbonBias: r4(this.mbonBias),
+   893→        motorBias: r4(this.motorBias),
+   894→      },
+   895→      meta: {
+   896→        steps: this.steps,
+   897→        rewards: Math.round(this.rewards * 10) / 10,
+   898→        punishments: Math.round(this.punishments * 10) / 10,
+   899→      },
+   900→    };
+   901→  }
+   902→
+   903→  static fromJSON(snap: BrainSnapshot): FlyBrain {
+   904→    const brain = new FlyBrain(snap.arch);
+   905→    brain.kenyonToMbon.set(snap.weights.kenyonToMbon);
+   906→    brain.mbonToMotor.set(snap.weights.mbonToMotor);
+   907→    if (snap.weights.lobulaToMotor) {
+   908→      brain.lobulaToMotor.set(snap.weights.lobulaToMotor);
+   909→    }
+   910→    brain.mbonBias.set(snap.weights.mbonBias);
+   911→    brain.motorBias.set(snap.weights.motorBias);
+   912→    brain.steps = snap.meta?.steps ?? 0;
+   913→    brain.rewards = snap.meta?.rewards ?? 0;
+   914→    brain.punishments = snap.meta?.punishments ?? 0;
+   915→    return brain;
+   916→  }
+   917→
+   918→  // -------------------------------------------------------------------------
+   919→  // Visualization helpers
+   920→  // -------------------------------------------------------------------------
+   921→
+   922→  /** A stable, representative sample of edges for the 3D visualizer. */
+   923→  getSampleEdges(maxEdges = 520): Edge[] {
+   924→    if (this.vizEdges) return this.vizEdges;
+   925→    const rand = mulberry32(this.arch.seed ^ 0xed9e);
+   926→    const edges: Edge[] = [];
+   927→    const rr = this.range("retina");
+   928→    const la = this.range("lamina");
+   929→    const me = this.range("medulla");
+   930→    const lo = this.range("lobula");
+   931→    const ke = this.range("kenyon");
+   932→    const mb = this.range("mbon");
+   933→    const mo = this.range("motor");
+   934→    const s = this.sizes;
+   935→
+   936→    // retina → lamina (subsampled identity)
+   937→    for (let i = 0; i < s.retina; i += 3) {
+   938→      edges.push({ from: rr.start + i, to: la.start + i, weight: 1, plastic: false });
+   939→    }
+   940→    // lamina → medulla (random pool cells)
+   941→    for (let p = 0; p < s.medulla; p++) {
+   942→      const from = la.start + Math.floor(rand() * s.retina);
+   943→      edges.push({ from, to: me.start + p, weight: 0.8, plastic: false });
+   944→    }
+   945→    // medulla → lobula
+   946→    for (let l = 0; l < s.lobula; l++) {
+   947→      for (let k = 0; k < 2; k++) {
+   948→        const src = this.lobulaIn[l * this.lobulaFanIn + k];
+   949→        edges.push({
+   950→          from: me.start + src,
+   951→          to: lo.start + l,
+   952→          weight: this.lobulaW[l * this.lobulaFanIn + k],
+   953→          plastic: false,
+   954→        });
+   955→      }
+   956→    }
+   957→    // lobula → kenyon (sparse, the divergent explosion)
+   958→    for (let k = 0; k < s.kenyon; k += 2) {
+   959→      const j = Math.floor(rand() * this.kenyonFanIn);
+   960→      const src = this.kenyonIn[k * this.kenyonFanIn + j];
+   961→      edges.push({
+   962→        from: lo.start + src,
+   963→        to: ke.start + k,
+   964→        weight: this.kenyonW[k * this.kenyonFanIn + j],
+   965→        plastic: false,
+   966→      });
+   967→    }
+   968→    // kenyon → mbon (plastic! sample strongly-weighted ones)
+   969→    const plasticSamples: Edge[] = [];
+   970→    for (let m = 0; m < s.mbon; m++) {
+   971→      const base = m * s.kenyon;
+   972→      // pick top-N by |w|
+   973→      const top: Edge[] = [];
+   974→      const step = Math.max(1, Math.floor(s.kenyon / 40));
+   975→      for (let k = 0; k < s.kenyon; k += step) {
+   976→        top.push({
+   977→          from: ke.start + k,
+   978→          to: mb.start + m,
+   979→          weight: this.kenyonToMbon[base + k],
+   980→          plastic: true,
+   981→        });
+   982→      }
+   983→      top.sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight));
+   984→      plasticSamples.push(...top.slice(0, 14));
+   985→    }
+   986→    edges.push(...plasticSamples);
+   987→    // mbon → motor (plastic)
+   988→    for (let o = 0; o < s.motor; o++) {
+   989→      for (let m = 0; m < s.mbon; m++) {
+   990→        edges.push({
+   991→          from: mb.start + m,
+   992→          to: mo.start + o,
+   993→          weight: this.mbonToMotor[o * s.mbon + m],
+   994→          plastic: true,
+   995→        });
+   996→      }
+   997→    }
+   998→
+   999→    // shuffle lightly and cap
+  1000→    for (let i = edges.length - 1; i > 0; i--) {
+  1001→      if (rand() < 0.3) {
+  1002→        const j = Math.floor(rand() * (i + 1));
+  1003→        [edges[i], edges[j]] = [edges[j], edges[i]];
+  1004→      }
+  1005→    }
+  1006→    this.vizEdges = edges.slice(0, maxEdges);
+  1007→    return this.vizEdges;
+  1008→  }
+  1009→}
+  1010→
+  1011→// ---------------------------------------------------------------------------
+  1012→// Retina encoding helpers
+  1013→// ---------------------------------------------------------------------------
+  1014→
+  1015→/**
+  1016→ * Downsample RGBA image data (from a canvas) into retinal input currents.
+  1017→ * Returns values ~0..1 where 1 = bright.
+  1018→ */
+  1019→export function retinaFromImageData(
+  1020→  data: Uint8ClampedArray,
+  1021→  width: number,
+  1022→  height: number,
+  1023→  cols: number,
+  1024→  rows: number,
+  1025→  invert = false
+  1026→): Float32Array {
+  1027→  const out = new Float32Array(cols * rows);
+  1028→  const cw = width / cols;
+  1029→  const ch = height / rows;
+  1030→  for (let r = 0; r < rows; r++) {
+  1031→    for (let c = 0; c < cols; c++) {
+  1032→      let acc = 0;
+  1033→      let n = 0;
+  1034→      const x0 = Math.floor(c * cw);
+  1035→      const x1 = Math.min(width, Math.floor((c + 1) * cw));
+  1036→      const y0 = Math.floor(r * ch);
+  1037→      const y1 = Math.min(height, Math.floor((r + 1) * ch));
+  1038→      for (let y = y0; y < y1; y++) {
+  1039→        for (let x = x0; x < x1; x++) {
+  1040→          const i = (y * width + x) * 4;
+  1041→          // luminance-ish; alpha compositing on dark background
+  1042→          const a = data[i + 3] / 255;
+  1043→          const lum = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) / 255;
+  1044→          acc += lum * a;
+  1045→          n++;
+  1046→        }
+  1047→      }
+  1048→      let v = n > 0 ? acc / n : 0;
+  1049→      if (invert) v = 1 - v;
+  1050→      out[r * cols + c] = v;
+  1051→    }
+  1052→  }
+  1053→  return out;
+  1054→}
+  1055→
