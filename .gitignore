@@ -52,3 +52,7 @@ prompt
 server.log
 # Skills directory
 /skills/push-github.log
+
+# agent scratch (worklog.md is the canonical handover)
+/tool-results/
+/agent-ctx/
