@@ -5,8 +5,8 @@
  * app ("?" key or the header keyboard button opens it).
  *
  * Groups mirror the tab accents: emerald (global/lab), amber (dino duel),
- * rose (bicycle challenge), lime (dino arena). Kbd chips are exported for
- * reuse (page footer).
+ * rose (bicycle challenge), lime (dino arena), teal (connectome ride). Kbd
+ * chips are exported for reuse (page footer).
  */
 
 import {
@@ -16,7 +16,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Bike, Gamepad2, Sparkles, Swords } from "lucide-react";
+import { Bike, BrainCircuit, Gamepad2, Sparkles, Swords } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 /** Tiny keyboard-key chip (shared with the page footer hints). */
@@ -53,6 +53,7 @@ const GROUPS: ShortcutGroup[] = [
       { keys: ["4"], label: "Brain Library" },
       { keys: ["5"], label: "How It Works" },
       { keys: ["6"], label: "Dino Arena" },
+      { keys: ["7"], label: "Connectome Ride" },
       {
         keys: ["M"],
         label: "Mute / unmute sound",
@@ -104,6 +105,18 @@ const GROUPS: ShortcutGroup[] = [
         keys: ["Space"],
         label: "Pause / resume the race",
         hint: "Only while an arena race is running",
+      },
+    ],
+  },
+  {
+    icon: <BrainCircuit className="h-4 w-4" />,
+    title: "Connectome Ride — the real brain",
+    accent: "text-teal-400",
+    rows: [
+      {
+        keys: ["7"],
+        label: "Open the Connectome Ride",
+        hint: "166,700 real neurons ride the bike — 76 MB loads once, then it's cached",
       },
     ],
   },

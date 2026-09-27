@@ -9,6 +9,7 @@ import { BicycleTrainer } from "@/components/fly/BicycleTrainer";
 import { BrainLibrary } from "@/components/fly/BrainLibrary";
 import { HowItWorks } from "@/components/fly/HowItWorks";
 import { DinoArena } from "@/components/fly/arena/DinoArena";
+import { ConnectomeTrainer } from "@/components/fly/connectome/ConnectomeTrainer";
 import {
   ShortcutsSheet,
   Kbd,
@@ -25,6 +26,7 @@ import {
 import {
   Bike,
   BookOpen,
+  BrainCircuit,
   Bug,
   ChevronUp,
   Gamepad2,
@@ -246,6 +248,15 @@ const TABS: TabDef[] = [
     pill: "border-lime-500/30 bg-lime-500/10",
     hover: "hover:text-lime-300",
   },
+  {
+    value: "connectome",
+    label: "Connectome Ride",
+    Icon: BrainCircuit,
+    activeText:
+      "data-[state=active]:text-teal-400 dark:data-[state=active]:text-teal-400",
+    pill: "border-teal-500/30 bg-teal-500/10",
+    hover: "hover:text-teal-300",
+  },
 ];
 
 const PILL_SPRING = {
@@ -407,7 +418,7 @@ export default function Home() {
     hydrateSoundMuted();
   }, []);
 
-  // ---- keyboard shortcuts: 1–6 switch rooms, M toggles sound ------------
+  // ---- keyboard shortcuts: 1–7 switch rooms, M toggles sound ------------
   // (digits never collide with the Dino duel's arrow/space controls; typing
   // in inputs and modifier combos are ignored)
   useEffect(() => {
@@ -422,7 +433,7 @@ export default function Home() {
       )
         return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key >= "1" && e.key <= "6") {
+      if (e.key >= "1" && e.key <= "7") {
         const next = TABS[Number(e.key) - 1];
         if (next) {
           setTab(next.value);
@@ -660,6 +671,9 @@ export default function Home() {
           <TabsContent value="arena" className="mt-0">
             <DinoArena />
           </TabsContent>
+          <TabsContent value="connectome" className="mt-0">
+            <ConnectomeTrainer />
+          </TabsContent>
         </Tabs>
       </main>
 
@@ -716,7 +730,7 @@ export default function Home() {
               ))}
             </div>
             <p className="flex items-center gap-1.5 leading-relaxed">
-              <Kbd>1</Kbd>–<Kbd>6</Kbd> switch rooms · <Kbd>M</Kbd> sound ·{" "}
+              <Kbd>1</Kbd>–<Kbd>7</Kbd> switch rooms · <Kbd>M</Kbd> sound ·{" "}
               <Kbd>?</Kbd> shortcuts
             </p>
           </nav>
