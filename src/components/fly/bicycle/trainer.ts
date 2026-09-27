@@ -107,13 +107,52 @@ export interface ChallengeState {
   championNodeId: number;
 }
 
+// --------------------------------------------------------------- rewards
+// Reward/punishment shaping (Round 14: every value below is a INSTANCE field
+// on the core, tunable live from the Reward tuning panel — the constants are
+// just the validated defaults). Dopamine magnitudes are trainer-level input,
+// NOT engine constants: the 928-neuron wiring math never changes.
 const PUNISH_FALL = -0.5;
 const PUNISH_OFFROAD = -0.3;
 const REWARD_PER_METER = 0.03;
 const MILESTONE_BONUS = 0.2;
 const MILESTONE_STEP = 100;
+/** NEW (default off): dopamine per (m/s · s) — pays for SPEED, not just
+ *  distance. Without it, evolution converges on "crawl at ~0.35 m/s and
+ *  outlast the episode cap" — the classic ~31 m plateau. */
+const SPEED_SUGAR = 0;
+const EPISODE_CAP_S = EPISODE_TIMEOUT_S;
+
 const MUTATE_RATE = 0.15;
 const MAX_STEPS_PER_FRAME = 600;
+
+/** Live-tunable reward shaping (see the defaults above). */
+export interface RewardTuning {
+  /** dopamine per metre of forward progress (≥ 0) */
+  rewardPerMeter: number;
+  /** dopamine the moment a rider falls (≤ 0) */
+  punishFall: number;
+  /** dopamine when a rider leaves the road (≤ 0) */
+  punishOffroad: number;
+  /** one-shot bonus at every `milestoneStep` metres (≥ 0) */
+  milestoneBonus: number;
+  /** metres between milestone bonuses */
+  milestoneStep: number;
+  /** dopamine per (m/s · s) — pays for speed (≥ 0, default 0) */
+  speedSugar: number;
+  /** hard episode length in sim seconds */
+  episodeCapS: number;
+}
+
+const TUNING_CLAMP: Record<keyof RewardTuning, [number, number]> = {
+  rewardPerMeter: [0, 0.12],
+  punishFall: [-1, 0],
+  punishOffroad: [-1, 0],
+  milestoneBonus: [0, 0.6],
+  milestoneStep: [25, 200],
+  speedSugar: [0, 0.12],
+  episodeCapS: [30, 300],
+};
 
 // --- "You vs the fly" challenge -------------------------------------------
 const CHALLENGE_SURVIVOR_CAP_S = 30; // survivor's grace after the first fall
@@ -227,6 +266,13 @@ export class BicycleTrainerCore {
   steerGain = 1;
   /** sugar per meter ridden — the Steady preset is richer, Frisky leaner */
   rewardPerMeter = REWARD_PER_METER;
+  // --- reward shaping (Round 14: live-tunable, see RewardTuning) ----------
+  punishFall = PUNISH_FALL;
+  punishOffroad = PUNISH_OFFROAD;
+  milestoneBonus = MILESTONE_BONUS;
+  milestoneStep = MILESTONE_STEP;
+  speedSugar = SPEED_SUGAR;
+  episodeCapS = EPISODE_CAP_S;
   bestEverDistance = 0;
   bestBrain: FlyBrain | null = null;
   /** "You vs the fly" challenge — null while normal training runs */
@@ -344,8 +390,8 @@ export class BicycleTrainerCore {
       if (res.fell || res.offRoad) {
         const reason = res.fell ? "fall" : "offroad";
         const punish = finishRider(st, reason, this.simTime, {
-          fall: PUNISH_FALL,
-          offroad: PUNISH_OFFROAD,
+          fall: this.punishFall,
+          offroad: this.punishOffroad,
         });
         r.doneRealT = this.realTime;
         r.brain.step(r.retina, punish); // the shock, at the moment of failure
@@ -366,14 +412,20 @@ export class BicycleTrainerCore {
         r.meterFloor += meters;
         r.pendingReward += this.rewardPerMeter * meters;
       }
-      const mile = Math.floor(st.s / MILESTONE_STEP);
+      // speed = sugar too (Round 14, default off) — pays for riding FAST,
+      // not just far. Without it the GA settles into the "crawl at ~0.35 m/s
+      // and outlast the cap" local optimum (the ~31 m plateau).
+      if (this.speedSugar > 0) {
+        r.pendingReward += this.speedSugar * st.v * DT;
+      }
+      const mile = Math.floor(st.s / this.milestoneStep);
       if (mile > r.milestoneFloor) {
         r.milestoneFloor = mile;
-        r.pendingReward += MILESTONE_BONUS;
+        r.pendingReward += this.milestoneBonus;
         if (this.turbo === 1) playSound("ding", 0.5);
         this.log(
           "milestone",
-          `Rider ${r.idx + 1} reached ${mile * MILESTONE_STEP} m (+${MILESTONE_BONUS})`
+          `Rider ${r.idx + 1} reached ${mile * this.milestoneStep} m (+${this.milestoneBonus})`
         );
       }
 
@@ -393,7 +445,7 @@ export class BicycleTrainerCore {
         this.leaderIdx = r.idx;
       }
     }
-    if (!anyAlive || this.simTime >= EPISODE_TIMEOUT_S) {
+    if (!anyAlive || this.simTime >= this.episodeCapS) {
       this.endEpisode();
     }
   }
@@ -412,7 +464,7 @@ export class BicycleTrainerCore {
     if (survivors.length > 0) {
       this.log(
         "info",
-        `Rider${survivors.length > 1 ? "s" : ""} ${survivors.join(", ")} survived the full 90 s run`
+        `Rider${survivors.length > 1 ? "s" : ""} ${survivors.join(", ")} survived the full ${Math.round(this.episodeCapS)} s run`
       );
     }
 
@@ -608,8 +660,8 @@ export class BicycleTrainerCore {
   ) {
     const reason: "fall" | "offroad" = res.fell ? "fall" : "offroad";
     const punish = finishRider(r.st, reason, ch.simT, {
-      fall: PUNISH_FALL,
-      offroad: PUNISH_OFFROAD,
+      fall: this.punishFall,
+      offroad: this.punishOffroad,
     });
     r.doneRealT = this.realTime;
     if (r.tag === "fly") {
@@ -660,6 +712,43 @@ export class BicycleTrainerCore {
 
   setMutationStrength(s: number) {
     this.mutationStrength = s;
+  }
+
+  /** Live reward shaping — clamped to safe ranges, applied mid-episode.
+   *  Tuning survives resets and adoptions (it describes the TRAINER, not a
+   *  brain), exactly like steerGain / mutationStrength. */
+  setRewardTuning(patch: Partial<RewardTuning>) {
+    const applied: string[] = [];
+    for (const key of Object.keys(TUNING_CLAMP) as (keyof RewardTuning)[]) {
+      const value = patch[key];
+      if (typeof value !== "number" || !Number.isFinite(value)) continue;
+      const [lo, hi] = TUNING_CLAMP[key];
+      const next =
+        key === "milestoneStep"
+          ? Math.round(Math.min(hi, Math.max(lo, value)))
+          : Math.min(hi, Math.max(lo, value));
+      if (next === this[key]) continue;
+      this[key] = next;
+      applied.push(
+        `${key} → ${key === "milestoneStep" ? next : next.toFixed(3)}`,
+      );
+    }
+    if (applied.length > 0) {
+      this.log("info", `Reward tuning: ${applied.join(" · ")}`);
+    }
+  }
+
+  /** immutable copy of the current reward shaping (HUD + panel read this) */
+  tuningSnapshot(): RewardTuning {
+    return {
+      rewardPerMeter: this.rewardPerMeter,
+      punishFall: this.punishFall,
+      punishOffroad: this.punishOffroad,
+      milestoneBonus: this.milestoneBonus,
+      milestoneStep: this.milestoneStep,
+      speedSugar: this.speedSugar,
+      episodeCapS: this.episodeCapS,
+    };
   }
 
   /** Apply a bicycle personality preset — steering authority × sugar richness. */
@@ -804,6 +893,7 @@ export class BicycleTrainerCore {
       turbo: this.turbo,
       popSize: this.queuedPopSize,
       mutationStrength: this.mutationStrength,
+      tuning: this.tuningSnapshot(),
       events: this.events.slice(-8),
       history: this.history.slice(),
       hasBest: this.bestBrain !== null && this.bestEverDistance > 0,
