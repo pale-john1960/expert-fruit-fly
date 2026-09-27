@@ -17,6 +17,12 @@
  *    tournament-of-5 crossover + mutation → next generation, automatically
  *  - cross-component brain loading via useBrainStore, session autosave via
  *    localStorage, best-brain export to the library via POST /api/brains
+ *  - duck-defense metrics ("Pterodactyl report"): every run tracks birds
+ *    seen vs cleared + a death cause (bird/cactus/timeout), aggregated into
+ *    a session progress bar; "bird practice" spawns pterodactyls from
+ *    score 0 so ducking can be trained deliberately
+ *  - sound effects via @/lib/sound (milestone on new HI, gen on evolve,
+ *    crash/jump at real-time speed, ding on save, click on start/resume)
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -24,6 +30,7 @@ import { FlyBrain, retinaFromImageData } from "@/lib/flybrain/engine";
 import { DEFAULT_ARCH_DINO } from "@/lib/flybrain/types";
 import type { BrainSnapshot } from "@/lib/flybrain/types";
 import { useBrainStore } from "@/lib/flybrain/store";
+import { hydrateSoundMuted, playSound } from "@/lib/sound";
 import { BrainActivityPanel } from "./BrainActivityPanel";
 import { evolvePopulation } from "./dino/evolution";
 import {
@@ -44,13 +51,18 @@ import {
   RETINA_ROWS,
   RETINA_W,
   REWARD_CLEAR,
-  collides,
+  birdsClearedCount,
+  birdsSeenCount,
   createWorld,
   drawFly,
   drawWorld,
+  freshDuckCounters,
   freshFly,
+  hitObstacle,
   stepWorld,
+  trackBirdEncounters,
 } from "./dino/game";
+import type { DeathCause, DuckCounters, World } from "./dino/game";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Badge } from "@/components/ui/badge";
@@ -64,6 +76,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
@@ -71,6 +84,7 @@ import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
   Activity,
+  Bird,
   Eye,
   Gamepad2,
   History,
@@ -80,6 +94,7 @@ import {
   RotateCcw,
   Save,
   Sparkles,
+  Sprout,
   Trophy,
   Users,
   X,
@@ -119,10 +134,13 @@ interface SimRunner {
   alive: boolean;
   deathScore: number;
   idx: number;
+  /** per-run duck-defense stats — the "Pterodactyl report" */
+  duck: DuckCounters;
+  deathCause: DeathCause | null;
 }
 
 interface Sim {
-  world: ReturnType<typeof createWorld>;
+  world: World;
   runners: SimRunner[];
   /** population parked while "watch best" replays the champion */
   savedRunners: SimRunner[] | null;
@@ -135,6 +153,15 @@ interface Sim {
   history: GenStat[];
   events: FeedEvent[];
   eventId: number;
+  /** bird practice: pterodactyls spawn from score 0 (read at spawn time) */
+  birdPractice: boolean;
+  /** duck-defense totals folded in from finished generations */
+  sessionBirdsSeen: number;
+  sessionBirdsCleared: number;
+  /** death-cause counts for the CURRENT generation */
+  genBirdDeaths: number;
+  genCactusDeaths: number;
+  genTimeoutDeaths: number;
 }
 
 interface Art {
@@ -167,7 +194,22 @@ function createArt(): Art {
 }
 
 function makeRunner(brain: FlyBrain, idx: number): SimRunner {
-  return { brain, fly: freshFly(), alive: true, deathScore: 0, idx };
+  return {
+    brain,
+    fly: freshFly(),
+    alive: true,
+    deathScore: 0,
+    idx,
+    duck: freshDuckCounters(),
+    deathCause: null,
+  };
+}
+
+/** New world honoring the current bird-practice setting. */
+function freshWorld(sim: Sim): World {
+  const w = createWorld();
+  w.birdPractice = sim.birdPractice;
+  return w;
 }
 
 function pushEvent(
@@ -217,11 +259,23 @@ function autosave(sim: Sim): void {
 }
 
 function endGeneration(sim: Sim, popSize: number, mutStrength: number): void {
-  for (const r of sim.runners) if (r.alive) r.deathScore = sim.world.score;
+  for (const r of sim.runners) {
+    if (r.alive) {
+      r.deathScore = sim.world.score;
+      r.deathCause = "timeout";
+      sim.genTimeoutDeaths += 1;
+    }
+  }
   const scores = sim.runners.map((r) => r.deathScore);
   const best = Math.max(...scores);
   const avg = scores.reduce((a, b) => a + b, 0) / Math.max(1, scores.length);
   sim.history.push({ gen: sim.generation, best, avg });
+
+  // fold this generation's per-run bird encounters into the session totals
+  const genBirdsSeen = sim.runners.reduce((a, r) => a + birdsSeenCount(r.duck), 0);
+  const genBirdsCleared = sim.runners.reduce((a, r) => a + birdsClearedCount(r.duck), 0);
+  sim.sessionBirdsSeen += genBirdsSeen;
+  sim.sessionBirdsCleared += genBirdsCleared;
 
   let bi = 0;
   for (let i = 1; i < scores.length; i++) if (scores[i] > scores[bi]) bi = i;
@@ -229,15 +283,21 @@ function endGeneration(sim: Sim, popSize: number, mutStrength: number): void {
     sim.bestEver = best;
     sim.bestGen = sim.generation;
     sim.bestBrain = sim.runners[bi].brain.clone();
+    playSound("milestone"); // new all-time HI score
   }
+  const duckNote =
+    genBirdsSeen > 0
+      ? ` · duck ${Math.round((100 * genBirdsCleared) / genBirdsSeen)}%`
+      : "";
   pushEvent(
     sim,
-    `Generation ${sim.generation} ended — best ${best}, avg ${avg.toFixed(1)}`,
+    `Generation ${sim.generation} ended — best ${best}, avg ${avg.toFixed(1)}${duckNote}`,
     0,
     "info",
     sim.world.t
   );
   autosave(sim);
+  playSound("gen"); // generation complete → evolve
 
   const brains = evolvePopulation(
     sim.runners.map((r) => r.brain),
@@ -247,7 +307,10 @@ function endGeneration(sim: Sim, popSize: number, mutStrength: number): void {
   );
   sim.generation += 1;
   sim.runners = brains.map((b, i) => makeRunner(b, i));
-  sim.world = createWorld();
+  sim.genBirdDeaths = 0;
+  sim.genCactusDeaths = 0;
+  sim.genTimeoutDeaths = 0;
+  sim.world = freshWorld(sim);
 }
 
 /** One 60Hz simulation step: world → vision → brains → action → collisions. */
@@ -256,7 +319,8 @@ function stepSim(
   art: Art,
   dt: number,
   popSize: number,
-  mutStrength: number
+  mutStrength: number,
+  realTime: boolean
 ): void {
   const w = sim.world;
   const cleared = stepWorld(w, dt);
@@ -297,6 +361,7 @@ function stepSim(
   // brains: dopamine rides along with the regular step
   for (const r of sim.runners) {
     if (!r.alive) continue;
+    trackBirdEncounters(w, r.duck); // duck-defense bookkeeping (alive flies only)
     const delta = cleared.length > 0 ? REWARD_CLEAR : 0;
     const m = r.brain.step(input, delta);
     const f = r.fly;
@@ -304,21 +369,40 @@ function stepSim(
       f.vy = -JUMP_V;
       f.airborne = true;
       f.jumpCooldownMs = JUMP_COOLDOWN_MS;
+      if (realTime) playSound("jump", 0.15);
     }
     if (m[1] > DUCK_THRESHOLD) f.ducking = true;
   }
   if (cleared.length > 0) {
-    pushEvent(sim, "Obstacle cleared", REWARD_CLEAR, "reward", w.t);
+    const dodgedBird = cleared.some((o) => o.type === "bird");
+    pushEvent(
+      sim,
+      dodgedBird ? "Pterodactyl dodged (ducked under)" : "Obstacle cleared",
+      REWARD_CLEAR,
+      "reward",
+      w.t
+    );
   }
 
-  // collisions → death shock
+  // collisions → death shock (+ pterodactyl vs cactus report)
   for (const r of sim.runners) {
     if (!r.alive) continue;
-    if (collides(w, r.fly)) {
+    const hit = hitObstacle(w, r.fly);
+    if (hit) {
       r.alive = false;
       r.deathScore = w.score;
+      r.deathCause = hit.type;
+      if (hit.type === "bird") sim.genBirdDeaths += 1;
+      else sim.genCactusDeaths += 1;
       r.brain.step(input, -PUNISH_CRASH);
-      pushEvent(sim, `Fly #${r.idx + 1} crashed`, -PUNISH_CRASH, "punish", w.t);
+      pushEvent(
+        sim,
+        `Fly #${r.idx + 1} ${hit.type === "bird" ? "hit the bird" : "hit a cactus"}`,
+        -PUNISH_CRASH,
+        "punish",
+        w.t
+      );
+      if (realTime) playSound("crash", 0.25);
     }
   }
 
@@ -332,7 +416,7 @@ function stepSim(
         if (sim.bestBrain) {
           sim.runners = [makeRunner(sim.bestBrain.clone(), 0)];
         }
-        sim.world = createWorld();
+        sim.world = freshWorld(sim);
       }
     } else {
       endGeneration(sim, popSize, mutStrength);
@@ -386,6 +470,7 @@ export function DinoTrainer() {
   const [popSize, setPopSize] = useState(6);
   const [mutStrength, setMutStrength] = useState(0.3);
   const [watchBest, setWatchBest] = useState(false);
+  const [birdPractice, setBirdPractice] = useState(false);
   const [brainName, setBrainName] = useState("");
   const [saving, setSaving] = useState(false);
   const [hud, setHud] = useState({
@@ -396,6 +481,10 @@ export function DinoTrainer() {
     best: 0,
     speed: BASE_SPEED,
     watch: false,
+    birdsSeen: 0,
+    birdsCleared: 0,
+    birdDeaths: 0,
+    cactusDeaths: 0,
   });
   const [feed, setFeed] = useState<FeedEvent[]>([]);
   const [history, setHistory] = useState<GenStat[]>([]);
@@ -433,6 +522,16 @@ export function DinoTrainer() {
 
   /** Push sim state into React at ~4 Hz (keeps 60fps rendering pure canvas). */
   const flush = useCallback((s: Sim) => {
+    // duck-defense aggregate: finished generations + live runs (watch-mode
+    // replays are exhibitions — they don't pollute the training metric)
+    const birdsSeen = s.watchMode
+      ? s.sessionBirdsSeen
+      : s.sessionBirdsSeen +
+        s.runners.reduce((a, r) => a + birdsSeenCount(r.duck), 0);
+    const birdsCleared = s.watchMode
+      ? s.sessionBirdsCleared
+      : s.sessionBirdsCleared +
+        s.runners.reduce((a, r) => a + birdsClearedCount(r.duck), 0);
     setHud({
       gen: s.generation,
       alive: s.runners.filter((r) => r.alive).length,
@@ -441,6 +540,10 @@ export function DinoTrainer() {
       best: s.bestEver,
       speed: s.world.speed,
       watch: s.watchMode,
+      birdsSeen,
+      birdsCleared,
+      birdDeaths: s.genBirdDeaths,
+      cactusDeaths: s.genCactusDeaths,
     });
     setFeed(s.events.slice(-8).reverse());
     setHistory(s.history.slice());
@@ -455,6 +558,7 @@ export function DinoTrainer() {
 
   // --- mount: build the sim + the animation loop ----------------------------
   useEffect(() => {
+    hydrateSoundMuted(); // persisted mute preference (idempotent, SSR-safe)
     const art = createArt();
     artRef.current = art;
     const sim: Sim = {
@@ -475,6 +579,12 @@ export function DinoTrainer() {
       history: [],
       events: [],
       eventId: 0,
+      birdPractice: false,
+      sessionBirdsSeen: 0,
+      sessionBirdsCleared: 0,
+      genBirdDeaths: 0,
+      genCactusDeaths: 0,
+      genTimeoutDeaths: 0,
     };
     simRef.current = sim;
     drawWorld(art.gameCtx, sim.world); // first paint so pause view isn't blank
@@ -493,8 +603,17 @@ export function DinoTrainer() {
       if (runningRef.current) {
         acc += dt * turboRef.current;
         let n = 0;
+        // crash/jump sounds only in real time (turbo ×1) — no audio spam at ×10
+        const realTime = turboRef.current === 1;
         while (acc >= STEP_DT && n < MAX_STEPS_PER_FRAME) {
-          stepSim(s, art, STEP_DT, popSizeRef.current, mutStrengthRef.current);
+          stepSim(
+            s,
+            art,
+            STEP_DT,
+            popSizeRef.current,
+            mutStrengthRef.current,
+            realTime
+          );
           acc -= STEP_DT;
           n += 1;
         }
@@ -555,9 +674,14 @@ export function DinoTrainer() {
       s.history = restoreHistory ?? [];
       s.events = [];
       s.eventId = 0;
+      s.sessionBirdsSeen = 0;
+      s.sessionBirdsCleared = 0;
+      s.genBirdDeaths = 0;
+      s.genCactusDeaths = 0;
+      s.genTimeoutDeaths = 0;
       const n = popSizeRef.current;
       s.runners = Array.from({ length: n }, (_, i) => makeRunner(base.clone(), i));
-      s.world = createWorld();
+      s.world = freshWorld(s);
       setWatchBest(false);
       setRunning(true);
       runningRef.current = true;
@@ -602,6 +726,21 @@ export function DinoTrainer() {
   }, []);
 
   // --- controls --------------------------------------------------------------
+  /** Bird practice only flips the spawn gate — existing obstacles and the
+   *  spawn timer are untouched, so it applies to NEW obstacles only. */
+  const toggleBirdPractice = (on: boolean) => {
+    setBirdPractice(on);
+    const s = simRef.current;
+    if (!s) return;
+    s.birdPractice = on;
+    s.world.birdPractice = on;
+    toast.info(
+      on
+        ? "Bird practice ON — pterodactyls spawn from score 0"
+        : "Bird practice OFF — pterodactyls return after score 100"
+    );
+  };
+
   const toggleWatchMode = (on: boolean) => {
     const s = simRef.current;
     if (!s) return;
@@ -615,7 +754,7 @@ export function DinoTrainer() {
       s.watchMode = true;
       s.watchCooldown = null;
       s.runners = [makeRunner(s.bestBrain.clone(), 0)];
-      s.world = createWorld();
+      s.world = freshWorld(s);
       setRunning(true);
       toast.info("Replaying the best-ever brain — enjoy the show");
     } else {
@@ -628,10 +767,13 @@ export function DinoTrainer() {
           alive: true,
           deathScore: 0,
           idx: i,
+          // keep each fly's duck-defense bookkeeping (bird ids stay unique)
+          duck: r.duck,
+          deathCause: null,
         }));
       }
       s.savedRunners = null;
-      s.world = createWorld();
+      s.world = freshWorld(s);
     }
     flush(s);
   };
@@ -650,6 +792,11 @@ export function DinoTrainer() {
     s.history = [];
     s.events = [];
     s.eventId = 0;
+    s.sessionBirdsSeen = 0;
+    s.sessionBirdsCleared = 0;
+    s.genBirdDeaths = 0;
+    s.genCactusDeaths = 0;
+    s.genTimeoutDeaths = 0;
     const n = popSizeRef.current;
     s.runners = Array.from({ length: n }, (_, i) =>
       makeRunner(
@@ -657,7 +804,7 @@ export function DinoTrainer() {
         i
       )
     );
-    s.world = createWorld();
+    s.world = freshWorld(s);
     flush(s);
     toast.info(`Fresh random population of ${n} flies — generation 1`);
   };
@@ -685,6 +832,7 @@ export function DinoTrainer() {
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
+      playSound("ding"); // saved to the library
       toast.success(`Saved "${name}" to the brain library`);
       setBrainName("");
     } catch (err) {
@@ -695,6 +843,27 @@ export function DinoTrainer() {
   };
 
   const lastGenAvg = history.length > 0 ? history[history.length - 1].avg : null;
+
+  // duck-defense color band: rose < 33% ≤ amber < 66% ≤ emerald
+  const duckRate =
+    hud.birdsSeen > 0 ? hud.birdsCleared / Math.max(1, hud.birdsSeen) : 0;
+  const duckColor =
+    hud.birdsSeen === 0
+      ? { text: "text-muted-foreground", bar: "" }
+      : duckRate < 0.33
+        ? {
+            text: "text-rose-300",
+            bar: "[&_[data-slot=progress-indicator]]:bg-rose-500",
+          }
+        : duckRate < 0.66
+          ? {
+              text: "text-amber-300",
+              bar: "[&_[data-slot=progress-indicator]]:bg-amber-500",
+            }
+          : {
+              text: "text-emerald-300",
+              bar: "[&_[data-slot=progress-indicator]]:bg-emerald-500",
+            };
 
   // --- render ----------------------------------------------------------------
   return (
@@ -726,7 +895,10 @@ export function DinoTrainer() {
           <Button
             size="sm"
             className="h-9 border border-amber-400/30 bg-amber-500/20 text-amber-100 hover:bg-amber-500/30"
-            onClick={() => adoptSnapshot(resume.snap, resume.history)}
+            onClick={() => {
+              playSound("click");
+              adoptSnapshot(resume.snap, resume.history);
+            }}
           >
             Resume last session
           </Button>
@@ -771,6 +943,31 @@ export function DinoTrainer() {
                           WATCHING BEST
                         </Badge>
                       )}
+                      {birdPractice && (
+                        <Badge className="gap-1 border-amber-500/40 bg-amber-500/20 font-mono text-[10px] text-amber-200 backdrop-blur-sm sm:text-xs">
+                          <Bird className="h-3 w-3" aria-hidden />
+                          BIRD PRACTICE
+                        </Badge>
+                      )}
+                      {(hud.birdDeaths > 0 || hud.cactusDeaths > 0) && (
+                        <Badge
+                          className="gap-1.5 border-border/60 bg-black/50 font-mono text-[10px] tabular-nums backdrop-blur-sm sm:text-xs"
+                          aria-label={`This generation: ${hud.birdDeaths} bird deaths, ${hud.cactusDeaths} cactus deaths`}
+                        >
+                          <span className="flex items-center gap-1 text-rose-300">
+                            <Bird className="h-3 w-3" aria-hidden />
+                            {hud.birdDeaths}
+                          </span>
+                          <span className="text-muted-foreground/50" aria-hidden>
+                            ·
+                          </span>
+                          <span className="flex items-center gap-1 text-emerald-300">
+                            <Sprout className="h-3 w-3" aria-hidden />
+                            {hud.cactusDeaths}
+                          </span>
+                          <span className="sr-only">deaths this gen (bird · cactus)</span>
+                        </Badge>
+                      )}
                     </div>
                     <div className="text-right leading-none">
                       <div className="font-mono text-lg font-bold tabular-nums text-amber-200 [text-shadow:0_0_12px_rgba(245,158,11,0.35)] sm:text-2xl">
@@ -795,7 +992,10 @@ export function DinoTrainer() {
                 {!running && (
                   <button
                     type="button"
-                    onClick={() => setRunning(true)}
+                    onClick={() => {
+                      playSound("click");
+                      setRunning(true);
+                    }}
                     className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/45 backdrop-blur-[1px] transition-colors hover:bg-black/35"
                     aria-label="Start training"
                   >
@@ -916,7 +1116,10 @@ export function DinoTrainer() {
                 <Button
                   className="h-11 flex-1"
                   variant={running ? "secondary" : "default"}
-                  onClick={() => setRunning((r) => !r)}
+                  onClick={() => {
+                    playSound("click");
+                    setRunning((r) => !r);
+                  }}
                 >
                   {running ? (
                     <Pause aria-hidden />
@@ -987,6 +1190,24 @@ export function DinoTrainer() {
                   aria-label="Watch best brain replay"
                 />
               </div>
+
+              <div className="flex min-h-11 items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5">
+                <span className="flex min-w-0 flex-col gap-0.5">
+                  <span className="flex items-center gap-2 text-sm">
+                    <Bird className="h-4 w-4 shrink-0 text-amber-400" aria-hidden />
+                    Bird practice
+                  </span>
+                  <span className="text-[11px] leading-snug text-muted-foreground">
+                    Pterodactyls spawn from score 0
+                  </span>
+                </span>
+                <Switch
+                  checked={birdPractice}
+                  onCheckedChange={toggleBirdPractice}
+                  className="h-6 w-11"
+                  aria-label="Bird practice — spawn birds from score 0"
+                />
+              </div>
             </CardContent>
           </Card>
 
@@ -1015,6 +1236,31 @@ export function DinoTrainer() {
                   </div>
                   <div className="mt-1 text-[10px] text-muted-foreground">avg last gen</div>
                 </div>
+              </div>
+
+              {/* duck defense — the "Pterodactyl report" */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className="flex items-center gap-1.5">
+                    <Bird className="h-3.5 w-3.5 text-amber-400" aria-hidden />
+                    Duck defense
+                  </span>
+                  <span className={`font-mono tabular-nums ${duckColor.text}`}>
+                    {hud.birdsSeen > 0
+                      ? `${Math.round((100 * hud.birdsCleared) / hud.birdsSeen)}% (${hud.birdsCleared}/${hud.birdsSeen} birds cleared)`
+                      : "— (0 birds seen)"}
+                  </span>
+                </div>
+                <Progress
+                  value={
+                    hud.birdsSeen > 0 ? (100 * hud.birdsCleared) / hud.birdsSeen : 0
+                  }
+                  className={`h-1.5 ${duckColor.bar}`}
+                  aria-label="Duck defense — share of pterodactyls cleared"
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  Pterodactyls ducked vs seen — this generation + session.
+                </p>
               </div>
               <Separator />
               <div className="space-y-2">

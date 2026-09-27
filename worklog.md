@@ -179,3 +179,82 @@ Work Log:
 - Bicycle balance improves slowly (~9m by gen 27); could tune REWARD_PER_METER or add steering-sensitivity presets
 - Console shows stale pre-fix errors from this dev session history only — current page has no error dialog
 - Could add: sound effects, more stimuli in Brain Lab, brain "family tree" visualization, Pterodactyl duck-training metrics
+
+---
+Task ID: 7-a
+Agent: full-stack-developer (styling polish)
+Task: Visual polish round — animated drosophila logo, per-accent tabs with framer-motion pill, sound toggle, animated banner, 3-column footer, ambient CSS flourishes
+
+Work Log:
+- page.tsx (full rewrite of chrome only; trainer imports untouched): hand-crafted inline SVG drosophila mark (FlyLogo, 48×48 viewBox, useId-namespaced gradients) — round head + red #f87171 compound eye w/ specular dot, amber-gradient thorax/abdomen w/ segment arcs, 3 bent legs, antenna; two translucent wings (parent <g> static rotate, ellipse CSS-animated) flutter at ~3.5 Hz (0.29s) w/ phase-offset back wing; aria-hidden, amber drop-shadow
+- Header: gradient title (bg-gradient-to-r from-amber-400 to-emerald-400 bg-clip-text), emerald→transparent hairline div along header bottom, sticky + backdrop-blur kept; sound toggle (ghost sm, Volume2/VolumeX, Tooltip "Sound on/off", aria-label) added before GitHub — hydrateSoundMuted() in mount effect, playSound("click") on unmute only
+- Tabs: TABS config drives per-tab accents (lab=emerald, dino=amber, bicycle=rose, library=teal, docs=orange); active text/icon color + motion.span layoutId="fly-tab-pill" (bg accent/10 + border accent/30, spring 380/32) rendered inside the active trigger behind a z-10 content span; Radix semantics/keyboard nav preserved; whitespace-nowrap + overflow-x-auto kept; new no-scrollbar utility hides the horizontal scrollbar
+- Banner: AnimatePresence-wrapped motion.div (slide-down+fade in, fade out), dismiss X + emerald styling kept
+- Footer: 3-col grid (md+, sm:2, mobile stacked) — brand w/ mini FlyLogo + one-liner + 928-neuron pipeline line (FIXED 926→928), "Explore" setTab quick-links for all 5 tabs w/ per-accent hover, Credits (FlyWire · MaleCNS, stack, GitHub link); pb-[env(safe-area-inset-bottom)] added; mt-auto sticky-footer mechanics preserved
+- globals.css (append-only, no vars touched): @keyframes fly-wing-flutter + .fly-wing/.fly-wing-back (transform-box: fill-box, prefers-reduced-motion off), @utility no-scrollbar, ultra-faint fixed radial washes on body (emerald 3.5% TL / amber 2.8% BR), emerald ::selection, html smooth-scroll (+ reduced-motion override)
+- layout.tsx: metadata description/OG refreshed to mention 928-neuron count; html/fonts/Toaster untouched
+- ENVIRONMENT INCIDENT: dev server was OOM-killed repeatedly (dmesg: next-server at ~1.8 GB RSS, 4 GB box shared with parallel agents' chrome sessions; also background procs get reaped between tool calls) — recovered with `nohup bun run dev &` restarts; NOTE: long-running server served a STALE css chunk after globals.css edits until a fresh restart (touch/append eventually triggered rebuild) — if CSS edits ever look ignored, restart the dev server and re-fetch the chunk
+- Verified in isolated session task-7a (1280×800 + 390×844): wing animationName=fly-wing-flutter@0.29s, exactly 1 active trigger, pill present w/ correct accent per tab (cycled all 5, content renders: innerText 1035/941/420/6333), sound toggle 2× → lucide-volume-x + ls "1" → lucide-volume-2 + ls "0", banner enter/dismiss via Library Load (AnimatePresence), footer gap=0 with short content (main display:none probe) + footerBottom=docH with real content (natural push), mobile: overflowX=false, tab strip scrollable w/ hidden scrollbar, nowrap intact, footer quick-link navigates; window.__errs stayed [] the whole session (console only shows pre-existing THREE.Clock deprecation warnings); VLM review of header zoom: fly "immediately recognizable… clean, well-rendered", green pill + gradient title confirmed; VLM mobile footer: no overlaps/cut-offs
+- Screenshots: /home/z/scratch/7a-{header-tabs-desktop,header-zoom,tab-dino,tab-bicycle,tab-library,tab-docs,banner-animated,sound-muted,footer-short-content,mobile-header,mobile-docs,mobile-footer}.png
+- bun run lint: exit 0 (whole repo); dev.log clean; browser session closed; dev server left UP
+
+Stage Summary:
+- Styling polish complete and browser-verified: animated fly logo, accent-coded tab pills, sound toggle (sound.ts contract consumed as-is), animated load banner, corrected 928-neuron 3-column footer with safe-area + sticky mechanics, ambient CSS flourishes — all inside my 3 owned files only
+- Deviations: none functional; chose pill-only active treatment (accent text + bordered tint pill) instead of a separate 2px underline to avoid double borders; skipped a global focus-visible override (shadcn per-component rings already present, avoid double outlines); dev server restarts were necessary (OOM kills — not a code issue)
+
+---
+Task ID: 7-b
+Agent: full-stack-developer (brain lab features)
+Task: Four new retina stimulus patterns + classical-conditioning demo wizard (24 A+/B− trials, live HUD, learning chart & verdict) in BrainLab.tsx
+
+Work Log:
+- Read worklog engine contracts (Task 1) + 2-a Brain Lab notes; read BrainLab.tsx (508 lines), types.ts, engine.ts public API (regions/range/mbonValence/motorRates/step), sound.ts contract
+- PRE-VALIDATED the demo measurement offline before touching the UI: /home/z/scratch/7b-sim.ts drives the REAL FlyBrain through the exact wizard timeline (24 × 3.0 s stimulus + 0.5 s dark pause, ±1 dopamine at 1.5 s, sampling in final 1 s). Result: MBON valence index (appetite−aversive mean rates via brain.range("mbon")+mbonValence) stays ~±0.02 noise at 12 pairings; motor approach = mean(motorRates) is the sensitive readout — run1 A 0.10→0.12 / B 0.09→0.05, run2 A 0.13→0.15 / B 0.04→0.03, run3 A 0.15→0.18 / B 0.03→0.04 (learning compounds on the same brain). Decision documented in code comments: plot approach, keep valence per-trial as secondary
+- BrainLab.tsx (only file touched, now ~950 lines):
+  • Patterns: "Bar left (A)" / "Bar right (B)" (steady bright third of retina), "Looming shadow" (bright 0.85 field + expanding dark disc, radius eased 0→9.5 ≈80% coverage over 2 s then snap-reset, thin bright leading rim so the edge reads at 24×9 — heavy ON/OFF transients), "Drum stripes" (3 px on/3 px off vertical stripes scrolling at 4 px/s × speed). All ride the existing pattern-speed slider
+  • Demo wizard Card in right column between Reward & punishment and Live stats: "Run demo (24 trials)" → takes over computeInput from the SAME rAF 30-tick loop (demoPre before brain.step delivers pending dopamine ±1 at mid-trial + playSound sugar/shock 0.8; demoPost after step samples indices); HUD (big A +/B − letter, n/24 counter, stimulus/reward/pause phase dot, thin gradient progress bar) syncs at the existing ~11 Hz cadence; chart+verdict only on finish
+  • Measurement per trial: index = mean motorRates over t∈[2.0,3.0); valence = mean(app MBON rates) − mean(av MBON rates) recorded per point; verdict = first-4 vs last-4 per letter (ΔA/ΔB) + A−B gap early→late; recharts ScatterChart (A emerald #34d399 with joined trend line, B rose #fb7185, amber dashed naive-baseline ReferenceLine, 150 px, memoized so the 11 Hz stat re-renders never churn recharts)
+  • Coexistence: Pause pauses the wizard (clock lives in the tick loop); Reset brain → abortDemo() restores the user's previous pattern, clears stale results, resets run counter; Select disabled while running with amber notice; speed slider fast-forwards the demo clock; "Run again (same brain)" keeps weights; milestone sound on completion; manual Sugar/Shock buttons now playSound("sugar")/("shock")
+- Browser-verified in isolated session task-7b (AGENTS quirk: Radix Select 2.2.6 needs pointerType:"mouse" on pointerdown to open — agent-browser's synthetic clicks don't carry it; workaround = dispatch PointerEvent via eval then .click() the option): all 4 patterns render (pixel-dumped retina grids: bar thirds, loom disc ~16-20 cols dark mid-cycle with lit rim, drum 3/3 stripes), VLM confirms lit optic lobes mid-loom + clean layouts
+- Full 24-trial demo run 3× speed (~28 s): HUD advances A+/B− with correct retina bars, select disabled + restored to previous pattern on finish; verdict "Learned: A now excites approach (+0.02), B suppresses it (−0.06) — the A−B gap went from 0.00 to 0.08 over 24 trials"; chart has 12 emerald + 12 rose symbols (VLM: green stays high, red trends low); fresh-brain run: gap −0.01→0.06, then Run-again on same brain: gap 0.11→0.14 (compounding proven); pause froze counter at 5/24 for 2.5 s+; mid-run Reset returned idle button/gone HUD/enabled select/restored pattern — all with window.__errs === [] the entire session; Sugar/Shock clicks bump Σ counters (25/25) without errors; mobile 390 px: no horizontal overflow, demo card legible (VLM-verified); bun run lint exit 0; dev.log clean
+- Screenshots: /home/z/scratch/7b-{01..19}-*.png (patterns, loom mid/late, drum @3×, demo start/mid/A-trial, finished chart, run-2 start, paused, reset-abort, fresh run, compounded run, mobile)
+
+Stage Summary:
+- Brain Lab now has 8 stimulus patterns (4 new, speed-scaled) and a fully automatic classical-conditioning demo that visibly teaches the same brain A+/B− with sound, live HUD, per-trial measurement, chart and verdict; repeated runs compound (gap −0.01→0.06 then 0.11→0.14), Reset aborts cleanly, Pause pauses everything, no console errors
+- Measurement definition (documented in code): per-trial index = mean motorRates (all 4 motors) sampled over the final 1 s of each 3 s trial; secondary valence = appetitive−aversive MBON mean rates (kept in tooltip data)
+- Gotchas for future agents: Radix Select opens only on pointerdown with pointerType "mouse" (synthetic agent-browser clicks fail silently — dispatch a PointerEvent with pointerType:'mouse' then click the option); the dev server was restarted/OOM-killed externally mid-session (stale page had dead React handlers — reload fixes); demo duration = 24 × 3.5 s / pattern-speed
+- Deviations: trial is 3.0 s stimulus + 0.5 s inter-trial dark pause (spec said "~3.0 s" stimulus with pause as a phase); demo clock is scaled by the pattern-speed slider (spec explicitly allowed if used); chose ScatterChart with per-series joined lines over LineChart (alternating A/B nulls don't connect in LineChart)
+
+---
+Task ID: 7-c
+Agent: full-stack-developer (dino duck metrics + sounds) — entry reconstructed by lead: the agent's code landed completely and passed lead verification, but its final report/worklog append was lost to a network failure (context deadline exceeded)
+
+Task: Dino duck-defense metrics ("Pterodactyl report"), Bird-practice mode, and sound integration
+
+Work Log:
+- game.ts: DuckCounters {seenIds, clearedIds} per run with trackBirdEncounters (globally-unique obstacle ids survive world restarts without double counting); DeathCause = "cactus" | "bird" | "timeout"; birdsSeenCount/birdsClearedCount helpers
+- DinoTrainer.tsx: per-runner deathCause + genBirdDeaths tracking; event feed distinguishes "Fly N hit the bird" vs "hit a cactus"; "Bird practice — spawn birds from score 0" switch in controls (flips only the spawn gate; existing obstacles untouched); "Duck defense: X% (n/m birds cleared)" stat with rose→amber→emerald progress bar (gen + session aggregate); HUD breakdown chip
+- Sounds: new all-time HI → milestone; generation complete → gen; crash (0.25) and jump (0.15) only when turbo === 1; save success → ding; Start/Resume clicks → click — all fired from the 60Hz loop/handlers, never React render
+- Lead browser verification (session task-lead): Bird practice ON + ×10 turbo for ~75s: 145 birds seen, duck defense climbed 0% → 4% → 7% (10/145 cleared — evolution visibly acting on bird-dodging); "hit the bird" message path code-verified (game.ts ObstacleType "bird" → DinoTrainer feed branch); window.__errs === [] throughout; save→POST /api/brains 201 observed in dev.log; lint clean
+
+Stage Summary:
+- Duck-defense metric + bird-practice mode + full sound wiring in Dino trainer, verified end-to-end by the lead after the agent's report was lost
+
+---
+Task ID: 7 (lead integration)
+Agent: main (Z.ai Code)
+Task: Round QA, shared sound engine, parallel build coordination, bicycle sound integration, final verification + commit
+
+Work Log:
+- Full pre-round QA via agent-browser (isolated session): Brain Lab interactions, Dino evolution (GEN 45/HI 76 in 20s @×10), Bicycle evolution (GEN 39, best 17m), Library rows, How It Works render — zero console errors, lint clean; historical scene.tsx "syntax error" in dev.log was stale (verified with od -c)
+- Wrote src/lib/sound.ts BEFORE launching subagents (contract-first to avoid conflicts): fully synthesized Web Audio engine (sugar/shock/jump/crash/milestone/gen/fall/ding/click), per-name rate limiting (60–400ms), zustand mute store persisted to fly-sound-muted, hydrateSoundMuted() effect pattern to avoid hydration mismatch, never throws, SSR-safe
+- Launched 3 parallel agents with exclusive file ownership: 7-a styling (page.tsx/globals.css/layout.tsx), 7-b Brain Lab features (BrainLab.tsx), 7-c Dino duck metrics (DinoTrainer.tsx/dino/game.ts); all landed — 7-c's final report lost to network failure but code complete; agents were told NOT to commit (lead commits centrally)
+- Integrated bicycle sounds myself (BicycleTrainer.tsx + bicycle/trainer.ts): fall → "fall" 0.25 + milestone ding 0.5 at 100m steps (turbo===1 gated), generation complete → "gen", new champion at gen end → "milestone", save success → "ding", Play/Pause + Resume → "click"
+- Integration verification: bicycle trains with sounds (no errors), sound toggle round-trips Volume2↔VolumeX with localStorage persistence, conditioning demo runs in integrated build (trial 3/24 HUD, SUGAR Σ/SHOCK Σ auto-incrementing), VLM review of header/tabs: "highly polished... no significant glitches", tab accents verified in code (emerald/amber/rose/teal/orange — no indigo/purple)
+- bun run lint: exit 0; dev.log clean
+
+Stage Summary:
+- NEW THIS ROUND: (1) synthesized sound engine with global mute + per-trainer wiring, (2) 4 new Brain Lab stimuli (Bar left/right, Looming shadow, Drum stripes), (3) automatic 24-trial classical-conditioning demo with live HUD + learning chart + verdict (compounding on repeated runs: gap −0.01→0.06 → 0.11→0.14), (4) Dino duck-defense metric + Bird practice mode, (5) header/footer/tab restyle (animated SVG fly logo, gradient title, accent pills, 3-col footer, 928-neuron fix)
+- All features verified in-browser with zero console errors; engine constants untouched (locked engine preserved)
+- GitHub push still blocked: /home/z/my-project/upload/ remains empty (SSH key never arrived) — scripts/push-github.ts stays a safe no-op
+- Next-round candidates: bicycle steering-sensitivity presets (REWARD_PER_METER tuning), brain family-tree visualization, keyboard play mode (human vs fly), share/export of conditioning demo results

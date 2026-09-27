@@ -16,7 +16,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "Expert Fruit Fly — a brain that learns",
   description:
-    "A browser-sized fruit fly connectome that learns tasks (Chrome Dino, bicycle balancing) through reward and punishment, with real-time 3D brain visualization and saveable learned brains.",
+    "A 928-neuron connectome-inspired fruit fly brain that learns real tasks — Chrome Dino and bicycle balancing — through dopamine-driven reward and punishment, live in your browser.",
   keywords: [
     "fruit fly",
     "connectome",
@@ -31,7 +31,8 @@ export const metadata: Metadata = {
   },
   openGraph: {
     title: "Expert Fruit Fly",
-    description: "A fruit fly brain that learns by reward & punishment",
+    description:
+      "Watch a 928-neuron fruit fly brain learn by reward & punishment — 3D connectome, Dino training, bicycle balancing, saveable brains.",
     siteName: "Expert Fruit Fly",
     type: "website",
   },

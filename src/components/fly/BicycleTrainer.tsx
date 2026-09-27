@@ -29,6 +29,7 @@ import {
 } from "./bicycle/trainer";
 import { DuskScene } from "./bicycle/scene";
 import { useBrainStore } from "@/lib/flybrain/store";
+import { playSound } from "@/lib/sound";
 import type { BrainSnapshot } from "@/lib/flybrain/types";
 import type { FlyBrain } from "@/lib/flybrain/engine";
 import {
@@ -204,6 +205,7 @@ export function BicycleTrainer() {
     const next = !running;
     setRunning(next);
     core.setRunning(next);
+    playSound("click");
   };
 
   const doReset = () => {
@@ -237,6 +239,7 @@ export function BicycleTrainer() {
 
   const resumeSession = () => {
     if (!session) return;
+    playSound("click");
     core.adoptSnapshot(session.snapshot);
     core.history = session.history;
     core.generation = session.generation;
@@ -276,6 +279,7 @@ export function BicycleTrainer() {
       toast.success(`Saved "${name}"`, {
         description: `Generation ${core.generation} champion · ${score.toFixed(0)} m — find it in the Brain Library.`,
       });
+      playSound("ding");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error("Save failed", {

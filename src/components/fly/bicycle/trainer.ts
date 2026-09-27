@@ -27,6 +27,7 @@ import {
   type BikeState,
 } from "./physics";
 import { buildRetina, RETINA_SIZE } from "./retina";
+import { playSound } from "@/lib/sound";
 
 export interface TrainerEvent {
   id: number;
@@ -190,6 +191,7 @@ export class BicycleTrainerCore {
         r.doneRealT = this.realTime;
         r.brain.step(r.retina, punish); // the shock, at the moment of failure
         if (reason === "fall") this.shake = Math.min(0.9, this.shake + 0.5);
+        if (this.turbo === 1) playSound("fall", 0.25);
         this.log(
           reason,
           `Rider ${r.idx + 1} ${
@@ -209,6 +211,7 @@ export class BicycleTrainerCore {
       if (mile > r.milestoneFloor) {
         r.milestoneFloor = mile;
         r.pendingReward += MILESTONE_BONUS;
+        if (this.turbo === 1) playSound("ding", 0.5);
         this.log(
           "milestone",
           `Rider ${r.idx + 1} reached ${mile * MILESTONE_STEP} m (+${MILESTONE_BONUS})`
@@ -264,6 +267,7 @@ export class BicycleTrainerCore {
     const best = Math.max(...fits);
     const avg = fits.reduce((a, b) => a + b, 0) / fits.length;
     this.history.push({ gen: this.generation, best, avg });
+    playSound("gen");
     this.log(
       "gen",
       `Generation ${this.generation} done — best ${best.toFixed(0)} m · avg ${avg.toFixed(0)} m`
@@ -273,6 +277,7 @@ export class BicycleTrainerCore {
       this.bestEverDistance = best;
       const bi = fits.indexOf(best);
       this.bestBrain = this.riders[bi].brain;
+      playSound("milestone");
       this.log("best", `New champion: ${best.toFixed(0)} m`);
     }
     this.autosave();

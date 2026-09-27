@@ -46,12 +46,21 @@ export const GEN_TIME_CAP_S = 180; // 3 min hard cap per generation
 export const STAND_BOX_H = 21;
 export const DUCK_BOX_H = 11;
 
+/** A bird counts as "seen" once its leading edge is this close to the fly. */
+export const BIRD_SEEN_LEAD = 56;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 export type ObstacleType = "cactus" | "bird";
 
+/** Why a fly's run ended (per-run stat for the duck-defense report). */
+export type DeathCause = "cactus" | "bird" | "timeout";
+
+let OBSTACLE_SEQ = 0;
+
 export interface Obstacle {
+  id: number;
   type: ObstacleType;
   x: number;
   w: number;
@@ -93,6 +102,8 @@ export interface World {
   pebbles: Pebble[];
   nextSpawn: number; // px until the next obstacle
   rng: () => number;
+  /** bird-practice mode: pterodactyls spawn from score 0 (read at spawn time) */
+  birdPractice: boolean;
 }
 
 export interface FlyAvatar {
@@ -121,6 +132,7 @@ export function createWorld(): World {
     pebbles: [],
     nextSpawn: 260 + rng() * 140,
     rng,
+    birdPractice: false,
   };
   for (let i = 0; i < 5; i++) {
     world.clouds.push({
@@ -163,11 +175,13 @@ export function freshFly(): FlyAvatar {
 // Simulation
 // ---------------------------------------------------------------------------
 function spawnObstacle(w: World): void {
-  // Birds (pterodactyl silhouettes) only appear once the run speeds up.
-  // They fly LOW — ducking is mandatory, jumping does not clear them.
-  if (w.score > 100 && w.rng() < 0.22) {
+  // Birds (pterodactyl silhouettes) only appear once the run speeds up —
+  // unless "bird practice" is on, which drops the score gate entirely.
+  // They fly LOW — ducking is mandatory, jumping rarely clears them.
+  if ((w.birdPractice || w.score > 100) && w.rng() < 0.22) {
     const h = 12;
     w.obstacles.push({
+      id: ++OBSTACLE_SEQ,
       type: "bird",
       x: GAME_W + 12,
       w: 52,
@@ -200,6 +214,7 @@ function spawnObstacle(w: World): void {
     variant = 2;
   }
   w.obstacles.push({
+    id: ++OBSTACLE_SEQ,
     type: "cactus",
     x: GAME_W + 12,
     w: ow,
@@ -258,8 +273,10 @@ export function flyBox(f: FlyAvatar): { x: number; y: number; w: number; h: numb
   return { x: FLY_X - 7, y: top, w: 16, h: f.y - 1 - top };
 }
 
-/** AABB collision, obstacle boxes shrunk a few px for forgiveness. */
-export function collides(w: World, f: FlyAvatar): boolean {
+/** AABB collision, obstacle boxes shrunk a few px for forgiveness.
+ *  Returns the obstacle that was hit (null = safe) so callers can tell
+ *  a pterodactyl kill from a cactus kill. */
+export function hitObstacle(w: World, f: FlyAvatar): Obstacle | null {
   const b = flyBox(f);
   for (const o of w.obstacles) {
     const ox = o.x + 3;
@@ -267,10 +284,58 @@ export function collides(w: World, f: FlyAvatar): boolean {
     const ow = o.w - 6;
     const oh = o.h - 6;
     if (b.x < ox + ow && b.x + b.w > ox && b.y < oy + oh && b.y + b.h > oy) {
-      return true;
+      return o;
     }
   }
-  return false;
+  return null;
+}
+
+export function collides(w: World, f: FlyAvatar): boolean {
+  return hitObstacle(w, f) !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Duck-defense stats (the "Pterodactyl report")
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-run bird encounter bookkeeping. Each fly tracks which birds it has
+ * seen (entered the interaction window while it was alive) and which of
+ * those it survived passing. Trackers are only updated while the fly is
+ * alive, so a killer bird stays forever "seen but not cleared".
+ */
+export interface DuckCounters {
+  seenIds: Set<number>;
+  clearedIds: Set<number>;
+}
+
+export function freshDuckCounters(): DuckCounters {
+  return { seenIds: new Set<number>(), clearedIds: new Set<number>() };
+}
+
+export function birdsSeenCount(d: DuckCounters): number {
+  return d.seenIds.size;
+}
+
+export function birdsClearedCount(d: DuckCounters): number {
+  return d.clearedIds.size;
+}
+
+/**
+ * Update a (still-alive) fly's bird encounter stats against the current
+ * world. Obstacle ids are globally unique, so counters survive world
+ * restarts (watch-mode replays, generation swaps) without double counting.
+ */
+export function trackBirdEncounters(w: World, d: DuckCounters): void {
+  for (const o of w.obstacles) {
+    if (o.type !== "bird") continue;
+    if (!d.seenIds.has(o.id) && o.x < FLY_X + BIRD_SEEN_LEAD) {
+      d.seenIds.add(o.id);
+    }
+    if (o.cleared && d.seenIds.has(o.id) && !d.clearedIds.has(o.id)) {
+      d.clearedIds.add(o.id);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

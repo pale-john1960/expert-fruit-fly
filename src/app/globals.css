@@ -120,3 +120,79 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Expert Fruit Fly — styling polish flourishes                        */
+/* ------------------------------------------------------------------ */
+
+/* Drosophila logo: translucent wings flutter (~3.5 Hz) around their base.
+   Static wing placement uses the wrapping <g transform>; this CSS transform
+   animates the ellipse itself (transform-box keeps the origin local). */
+@keyframes fly-wing-flutter {
+  0%,
+  100% {
+    transform: rotate(-3deg);
+    opacity: 0.55;
+  }
+  50% {
+    transform: rotate(6deg);
+    opacity: 0.95;
+  }
+}
+
+.fly-wing {
+  transform-box: fill-box;
+  transform-origin: 12% 88%;
+  animation: fly-wing-flutter 0.29s ease-in-out infinite;
+}
+
+.fly-wing-back {
+  animation-delay: -0.145s;
+}
+
+/* Hide the horizontal scrollbar on the scrollable tab strip (still
+   scrollable via touch / trackpad — see TabsList overflow-x-auto). */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Ambient lab glow — two ultra-faint fixed radial washes (emerald top-left,
+   amber bottom-right). Background color semantics stay untouched. */
+body {
+  background-image:
+    radial-gradient(
+      720px circle at 0% 0%,
+      rgba(52, 211, 153, 0.035),
+      transparent 60%
+    ),
+    radial-gradient(
+      640px circle at 100% 100%,
+      rgba(245, 158, 11, 0.028),
+      transparent 60%
+    );
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+}
+
+/* Emerald-tinted text selection */
+::selection {
+  background-color: rgba(52, 211, 153, 0.28);
+}
+
+/* Calmer scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fly-wing {
+    animation: none;
+    opacity: 0.75;
+  }
+  html {
+    scroll-behavior: auto;
+  }
+}
