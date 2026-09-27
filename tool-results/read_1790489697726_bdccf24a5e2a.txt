@@ -1,0 +1,1231 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * BicycleTrainer — a fly learns to ride a bicycle in a 3D dusk world.
+     5→ *
+     6→ * Owns the whole "Bicycle Training" tab: the R3F canvas with the training
+     7→ * simulation running inside useFrame, the HUD overlay, the fly's retina
+     8→ * mini-canvas, live brain activity, the event feed, evolution controls,
+     9→ * save/load integration and the distance-history chart.
+    10→ *
+    11→ * Also owns the "You vs the fly" CHALLENGE UI: the human balances a bike
+    12→ * with ← / → (or A / D — held keys ramp to full lock) while the champion
+    13→ * fly brain rides beside it on the same road. Falls lose; the survivor
+    14→ * gets 30 s to run up the score. Population training is parked during a
+    15→ * challenge and resumes untouched on exit; the W/L tally persists across
+    16→ * challenges in component state.
+    17→ */
+    18→
+    19→import { useEffect, useMemo, useRef, useState } from "react";
+    20→import { Canvas } from "@react-three/fiber";
+    21→import { toast } from "sonner";
+    22→import { Toaster } from "@/components/ui/sonner";
+    23→import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+    24→import { Button } from "@/components/ui/button";
+    25→import { Input } from "@/components/ui/input";
+    26→import { Slider } from "@/components/ui/slider";
+    27→import { Switch } from "@/components/ui/switch";
+    28→import { Label } from "@/components/ui/label";
+    29→import { Badge } from "@/components/ui/badge";
+    30→import { Separator } from "@/components/ui/separator";
+    31→import { BrainActivityPanel } from "./BrainActivityPanel";
+    32→import {
+    33→  BicycleTrainerCore,
+    34→  type ChallengeResult,
+    35→  type HudSnapshot,
+    36→  type TrainerEvent,
+    37→} from "./bicycle/trainer";
+    38→import { DuskScene } from "./bicycle/scene";
+    39→import { useBrainStore } from "@/lib/flybrain/store";
+    40→import { playSound } from "@/lib/sound";
+    41→import type { BrainSnapshot } from "@/lib/flybrain/types";
+    42→import type { FlyBrain } from "@/lib/flybrain/engine";
+    43→import {
+    44→  Bike,
+    45→  Play,
+    46→  Pause,
+    47→  RotateCcw,
+    48→  Zap,
+    49→  TriangleAlert,
+    50→  Sparkles,
+    51→  Flag,
+    52→  Trophy,
+    53→  Info,
+    54→  Save,
+    55→  Eye,
+    56→  FastForward,
+    57→  History,
+    58→  Swords,
+    59→  ArrowLeft,
+    60→  X,
+    61→} from "lucide-react";
+    62→import {
+    63→  Tooltip as UITooltip,
+    64→  TooltipContent,
+    65→  TooltipTrigger,
+    66→} from "@/components/ui/tooltip";
+    67→import {
+    68→  LineChart,
+    69→  Line,
+    70→  XAxis,
+    71→  YAxis,
+    72→  CartesianGrid,
+    73→  Tooltip,
+    74→  ResponsiveContainer,
+    75→  Legend,
+    76→} from "recharts";
+    77→
+    78→const MAX_RIDERS = 8;
+    79→
+    80→/** Challenge slice pushed into React at the existing ~6 Hz HUD cadence. */
+    81→interface ChallengeHud {
+    82→  you: number; // metres ridden (frozen at fall)
+    83→  fly: number;
+    84→  youAlive: boolean;
+    85→  flyAlive: boolean;
+    86→  phi: number; // human lean (rad)
+    87→  steer: number; // human steer delta (rad, ±0.5)
+    88→  flyDop: number; // champion's live dopamine (it's learning!)
+    89→  ended: boolean;
+    90→  result: ChallengeResult | null;
+    91→  wins: number;
+    92→  losses: number;
+    93→  best: number; // your best challenge distance this session
+    94→}
+    95→
+    96→function eventIcon(kind: TrainerEvent["kind"]) {
+    97→  switch (kind) {
+    98→    case "fall":
+    99→      return <Zap className="h-3.5 w-3.5 text-rose-400" />;
+   100→    case "offroad":
+   101→      return <TriangleAlert className="h-3.5 w-3.5 text-amber-400" />;
+   102→    case "milestone":
+   103→      return <Sparkles className="h-3.5 w-3.5 text-amber-300" />;
+   104→    case "gen":
+   105→      return <Flag className="h-3.5 w-3.5 text-rose-300" />;
+   106→    case "best":
+   107→      return <Trophy className="h-3.5 w-3.5 text-emerald-400" />;
+   108→    case "load":
+   109→      return <Eye className="h-3.5 w-3.5 text-emerald-400" />;
+   110→    default:
+   111→      return <Info className="h-3.5 w-3.5 text-muted-foreground" />;
+   112→  }
+   113→}
+   114→
+   115→function TurboControl({
+   116→  turbo,
+   117→  onChange,
+   118→  size = "sm",
+   119→}: {
+   120→  turbo: number;
+   121→  onChange: (t: number) => void;
+   122→  size?: "sm" | "md";
+   123→}) {
+   124→  return (
+   125→    <div
+   126→      className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-black/45 p-0.5 backdrop-blur-md"
+   127→      role="group"
+   128→      aria-label="Simulation speed"
+   129→    >
+   130→      {[1, 3, 10].map((t) => (
+   131→        <button
+   132→          key={t}
+   133→          onClick={() => onChange(t)}
+   134→          aria-pressed={turbo === t}
+   135→          className={`flex items-center gap-1 rounded-md font-medium transition-colors ${
+   136→            size === "md" ? "h-10 px-3 text-sm" : "h-8 px-2.5 text-xs"
+   137→          } ${
+   138→            turbo === t
+   139→              ? "bg-amber-500/90 text-black"
+   140→              : "text-amber-200/80 hover:bg-white/10 hover:text-amber-100"
+   141→          }`}
+   142→        >
+   143→          {t === 1 ? null : <FastForward className={size === "md" ? "h-3.5 w-3.5" : "h-3 w-3"} />}
+   144→          ×{t}
+   145→        </button>
+   146→      ))}
+   147→    </div>
+   148→  );
+   149→}
+   150→
+   151→function StatChip({
+   152→  label,
+   153→  value,
+   154→  accent,
+   155→  labelAccent,
+   156→}: {
+   157→  label: string;
+   158→  value: string;
+   159→  accent?: string;
+   160→  labelAccent?: string;
+   161→}) {
+   162→  return (
+   163→    <div className="rounded-lg border border-white/10 bg-black/40 px-2.5 py-1.5 backdrop-blur-md">
+   164→      <div className={`text-[10px] uppercase tracking-wide ${labelAccent ?? "text-white/50"}`}>{label}</div>
+   165→      <div className={`text-sm font-semibold tabular-nums ${accent ?? "text-white"}`}>{value}</div>
+   166→    </div>
+   167→  );
+   168→}
+   169→
+   170→export function BicycleTrainer() {
+   171→  const [core] = useState(() => new BicycleTrainerCore(5));
+   172→  const retinaCanvas = useRef<HTMLCanvasElement | null>(null);
+   173→  const [hud, setHud] = useState<HudSnapshot | null>(null);
+   174→  const [leaderBrain, setLeaderBrain] = useState<FlyBrain | null>(null);
+   175→  const [running, setRunning] = useState(true);
+   176→  const [turbo, setTurbo] = useState(1);
+   177→  const [preset, setPresetState] = useState<"steady" | "standard" | "frisky">("standard");
+   178→  const [popQueued, setPopQueued] = useState(5);
+   179→  const [mutation, setMutation] = useState(0.3);
+   180→  const [watchBest, setWatchBest] = useState(false);
+   181→  const [brainName, setBrainName] = useState("Dusk Rider");
+   182→  const [saving, setSaving] = useState(false);
+   183→  const [session, setSession] = useState<{
+   184→    generation: number;
+   185→    bestDistance: number;
+   186→    history: { gen: number; best: number; avg: number }[];
+   187→    snapshot: BrainSnapshot;
+   188→  } | null>(null);
+   189→
+   190→  // --- "You vs the fly" challenge (sim lives on the core; React mirrors) ---
+   191→  const [challengeActive, setChallengeActive] = useState(false);
+   192→  const [challengeHud, setChallengeHud] = useState<ChallengeHud | null>(null);
+   193→  /** session W/L tally — persists across challenges AND population resets */
+   194→  const tallyRef = useRef({ wins: 0, losses: 0, best: 0 });
+   195→  const tallyCountedRef = useRef(false);
+   196→
+   197→  // ---- HUD polling (keeps React renders at ~6 Hz, the scene stays 60 fps)
+   198→  useEffect(() => {
+   199→    const iv = setInterval(() => {
+   200→      setHud(core.hudSnapshot());
+   201→      const ch = core.challenge;
+   202→      if (ch) {
+   203→        // count the tally exactly once per finished challenge
+   204→        if (ch.result && !tallyCountedRef.current) {
+   205→          tallyCountedRef.current = true;
+   206→          if (ch.result.winner === "you") tallyRef.current.wins += 1;
+   207→          else if (ch.result.winner === "fly") tallyRef.current.losses += 1;
+   208→          if (ch.result.youS > tallyRef.current.best) {
+   209→            tallyRef.current.best = ch.result.youS;
+   210→            playSound("milestone"); // new challenge best distance
+   211→          }
+   212→        }
+   213→        const t = tallyRef.current;
+   214→        setChallengeHud({
+   215→          you: ch.human.st.alive ? ch.human.st.s : ch.human.st.finalS,
+   216→          fly: ch.fly.st.alive ? ch.fly.st.s : ch.fly.st.finalS,
+   217→          youAlive: ch.human.st.alive,
+   218→          flyAlive: ch.fly.st.alive,
+   219→          phi: ch.human.st.phi,
+   220→          steer: ch.humanSteer,
+   221→          flyDop: ch.fly.brain.getDopamine(),
+   222→          ended: ch.ended,
+   223→          result: ch.result,
+   224→          wins: t.wins,
+   225→          losses: t.losses,
+   226→          best: t.best,
+   227→        });
+   228→        // the brain panel shows the champion you're racing, not the human
+   229→        setLeaderBrain((prev) => (prev === ch.fly.brain ? prev : ch.fly.brain));
+   230→      } else {
+   231→        setChallengeHud(null);
+   232→        const lead = core.leader;
+   233→        if (lead) {
+   234→          setLeaderBrain((prev) => (prev === lead.brain ? prev : lead.brain));
+   235→        }
+   236→      }
+   237→    }, 160);
+   238→    return () => clearInterval(iv);
+   239→  }, [core]);
+   240→
+   241→  // ---- brain-library load integration + session resume banner
+   242→  useEffect(() => {
+   243→    const tryConsume = () => {
+   244→      const snap = useBrainStore.getState().pending.bicycle;
+   245→      if (snap) {
+   246→        useBrainStore.getState().consumeLoad("bicycle");
+   247→        if (core.challenge) {
+   248→          // adopting replaces the population — leave the challenge first
+   249→          core.endChallenge();
+   250→          setChallengeActive(false);
+   251→          setChallengeHud(null);
+   252→        }
+   253→        core.adoptSnapshot(snap);
+   254→        setSession(null);
+   255→        toast.success(`Loaded "${snap.name}"`, {
+   256→          description: `Gen ${snap.generation} champion (${snap.score.toFixed(0)} m) now seeds the whole population.`,
+   257→        });
+   258→      }
+   259→    };
+   260→    tryConsume();
+   261→    const unsub = useBrainStore.subscribe(tryConsume);
+   262→    const sess = BicycleTrainerCore.loadSession();
+   263→    if (sess && sess.bestDistance > 1) setSession(sess);
+   264→    return () => unsub();
+   265→  }, [core]);
+   266→
+   267→  // ---- keep the R3F subtree out of the HUD re-render loop
+   268→  const canvasElement = useMemo(
+   269→    () => (
+   270→      <Canvas
+   271→        dpr={[1, 1.75]}
+   272→        camera={{ fov: 55, near: 0.1, far: 2200, position: [0, 2.8, -8] }}
+   273→        gl={{ antialias: true, powerPreference: "high-performance" }}
+   274→        style={{ position: "absolute", inset: 0 }}
+   275→      >
+   276→        <DuskScene core={core} retinaCanvas={retinaCanvas} maxRiders={MAX_RIDERS} />
+   277→      </Canvas>
+   278→    ),
+   279→    [core]
+   280→  );
+   281→
+   282→  // ------------------------------------------------------------- controls
+   283→  const toggleRun = () => {
+   284→    const next = !running;
+   285→    setRunning(next);
+   286→    core.setRunning(next);
+   287→    playSound("click");
+   288→  };
+   289→
+   290→  const doReset = () => {
+   291→    core.reset();
+   292→    setWatchBest(false);
+   293→    setHud(core.hudSnapshot());
+   294→    toast.info("Fresh start", { description: "New random brains — Generation 1 rolls out." });
+   295→  };
+   296→
+   297→  const changeTurbo = (t: number) => {
+   298→    setTurbo(t);
+   299→    core.setTurbo(t);
+   300→  };
+   301→
+   302→  const changePreset = (p: "steady" | "standard" | "frisky") => {
+   303→    if (p === preset) return;
+   304→    setPresetState(p);
+   305→    core.setPreset(p);
+   306→    playSound("click");
+   307→  };
+   308→
+   309→  const changePopulation = (v: number[]) => {
+   310→    const n = v[0];
+   311→    setPopQueued(n);
+   312→    core.setQueuedPopulation(n);
+   313→  };
+   314→
+   315→  const changeMutation = (v: number[]) => {
+   316→    const s = v[0];
+   317→    setMutation(s);
+   318→    core.setMutationStrength(s);
+   319→  };
+   320→
+   321→  const toggleWatchBest = (on: boolean) => {
+   322→    setWatchBest(on);
+   323→    core.setWatchBest(on);
+   324→  };
+   325→
+   326→  // ---------------------------------------------- "You vs the fly" challenge
+   327→
+   328→  const enterChallenge = () => {
+   329→    if (!core.bestBrain) return;
+   330→    playSound("click");
+   331→    if (watchBest) {
+   332→      // leave watch-best first so the parked population comes back intact
+   333→      setWatchBest(false);
+   334→      core.setWatchBest(false);
+   335→    }
+   336→    core.startChallenge();
+   337→    tallyCountedRef.current = false;
+   338→    setChallengeActive(true);
+   339→    toast.info("You vs the fly — balance!", {
+   340→      description:
+   341→        "← / → (or A / D) steer · pedal is automatic. Last one rolling wins.",
+   342→    });
+   343→  };
+   344→
+   345→  const rematchChallenge = () => {
+   346→    if (!core.challenge) return;
+   347→    playSound("click");
+   348→    core.startChallenge(); // keeps the parked training population
+   349→    tallyCountedRef.current = false;
+   350→  };
+   351→
+   352→  const exitChallenge = () => {
+   353→    if (!core.challenge) return;
+   354→    playSound("click");
+   355→    core.endChallenge(); // folds the champion's learning back in
+   356→    setChallengeActive(false);
+   357→    setChallengeHud(null);
+   358→  };
+   359→
+   360→  // --- challenge keyboard: window listeners active ONLY while challenging ---
+   361→  useEffect(() => {
+   362→    if (!challengeActive) return;
+   363→    const isEditable = (t: EventTarget | null): boolean => {
+   364→      const el = t as HTMLElement | null;
+   365→      return (
+   366→        !!el &&
+   367→        typeof el.tagName === "string" &&
+   368→        (el.tagName === "INPUT" ||
+   369→          el.tagName === "TEXTAREA" ||
+   370→          el.isContentEditable === true)
+   371→      );
+   372→    };
+   373→    const apply = (key: string, down: boolean) => {
+   374→      const ch = core.challenge;
+   375→      if (!ch || ch.ended) return;
+   376→      if (key === "ArrowLeft" || key === "a" || key === "A") ch.keys.left = down;
+   377→      else if (key === "ArrowRight" || key === "d" || key === "D")
+   378→        ch.keys.right = down;
+   379→    };
+   380→    const down = (e: KeyboardEvent) => {
+   381→      if (isEditable(e.target)) return; // never steal typing
+   382→      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+   383→        e.preventDefault(); // stop page scroll (held keys → repeat is fine)
+   384→      }
+   385→      apply(e.key, true);
+   386→    };
+   387→    const up = (e: KeyboardEvent) => apply(e.key, false);
+   388→    const blur = () => {
+   389→      // alt-tab mid-steer would otherwise stick the key down forever
+   390→      const ch = core.challenge;
+   391→      if (ch) {
+   392→        ch.keys.left = false;
+   393→        ch.keys.right = false;
+   394→      }
+   395→    };
+   396→    window.addEventListener("keydown", down);
+   397→    window.addEventListener("keyup", up);
+   398→    window.addEventListener("blur", blur);
+   399→    return () => {
+   400→      window.removeEventListener("keydown", down);
+   401→      window.removeEventListener("keyup", up);
+   402→      window.removeEventListener("blur", blur);
+   403→    };
+   404→  }, [challengeActive, core]);
+   405→
+   406→  const resumeSession = () => {
+   407→    if (!session) return;
+   408→    playSound("click");
+   409→    if (core.challenge) {
+   410→      // resuming replaces the population — leave the challenge first
+   411→      core.endChallenge();
+   412→      setChallengeActive(false);
+   413→      setChallengeHud(null);
+   414→    }
+   415→    core.adoptSnapshot(session.snapshot);
+   416→    core.history = session.history;
+   417→    core.generation = session.generation;
+   418→    setSession(null);
+   419→    setHud(core.hudSnapshot());
+   420→    toast.success("Session resumed", {
+   421→      description: `Continuing from generation ${session.generation} (best ${session.bestDistance.toFixed(0)} m).`,
+   422→    });
+   423→  };
+   424→
+   425→  const saveBest = async () => {
+   426→    const brain = core.bestBrain ?? core.leader?.brain;
+   427→    if (!brain) {
+   428→      toast.error("Nothing to save yet", { description: "Let at least one generation finish." });
+   429→      return;
+   430→    }
+   431→    const name = brainName.trim() || "Dusk Rider";
+   432→    const score = core.bestEverDistance;
+   433→    setSaving(true);
+   434→    try {
+   435→      const snapshot = brain.toJSON("bicycle", name, core.generation, score);
+   436→      const res = await fetch("/api/brains", {
+   437→        method: "POST",
+   438→        headers: { "Content-Type": "application/json" },
+   439→        body: JSON.stringify({
+   440→          name,
+   441→          task: "bicycle",
+   442→          generation: core.generation,
+   443→          score,
+   444→          snapshot,
+   445→        }),
+   446→      });
+   447→      if (!res.ok) {
+   448→        const detail = await res.text().catch(() => "");
+   449→        throw new Error(detail || `HTTP ${res.status}`);
+   450→      }
+   451→      toast.success(`Saved "${name}"`, {
+   452→        description: `Generation ${core.generation} champion · ${score.toFixed(0)} m — find it in the Brain Library.`,
+   453→      });
+   454→      playSound("ding");
+   455→    } catch (err) {
+   456→      const msg = err instanceof Error ? err.message : String(err);
+   457→      toast.error("Save failed", {
+   458→        description: msg.includes("404")
+   459→          ? "The brain library API is not available yet — try again in a moment."
+   460→          : msg,
+   461→      });
+   462→    } finally {
+   463→      setSaving(false);
+   464→    }
+   465→  };
+   466→
+   467→  // ----------------------------------------------------------------- HUD
+   468→  const alive = hud?.alive ?? 0;
+   469→  const total = hud?.total ?? 5;
+   470→  const gen = hud?.gen ?? 1;
+   471→  const bestEver = hud?.bestEver ?? 0;
+   472→  const leaderS = hud?.leaderS ?? 0;
+   473→  const leaderV = hud?.leaderV ?? 0;
+   474→  const leaderPhi = hud?.leaderPhi ?? 0;
+   475→  const dop = hud?.leaderDop ?? 0;
+   476→  const dopPct = Math.min(1, Math.abs(dop));
+   477→  const events = hud?.events ?? [];
+   478→  const history = hud?.history ?? [];
+   479→  const popApplied = (hud?.popSize ?? popQueued) === popQueued;
+   480→
+   481→  return (
+   482→    <section className="flex flex-col gap-4">
+   483→      <Toaster theme="dark" position="bottom-right" closeButton />
+   484→
+   485→      {/* ------------------------------------------------------- header */}
+   486→      <Card className="border-border/70 bg-gradient-to-br from-[#2a1224] via-card to-[#241a20]">
+   487→        <CardHeader className="pb-3">
+   488→          <div className="flex flex-wrap items-center gap-3">
+   489→            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-gradient-to-br from-rose-500 to-amber-500 text-white shadow-lg shadow-rose-900/40">
+   490→              <Bike className="h-5 w-5" />
+   491→            </div>
+   492→            <div className="min-w-0 flex-1">
+   493→              <CardTitle className="text-lg">Bicycle Training</CardTitle>
+   494→              <CardDescription className="mt-0.5 text-sm">
+   495→                Each fly rides the same dusk road. Distance = sugar. Falling or
+   496→                leaving the road = shock. The best riders breed, generation by
+   497→                generation.
+   498→              </CardDescription>
+   499→            </div>
+   500→            <div className="flex items-center gap-2">
+   501→              <Badge variant="secondary" className="gap-1.5 border-amber-500/30 bg-amber-500/10 text-amber-300">
+   502→                <Sparkles className="h-3 w-3" /> reward +0.03 / m
+   503→              </Badge>
+   504→              <Badge variant="secondary" className="gap-1.5 border-rose-500/30 bg-rose-500/10 text-rose-300">
+   505→                <Zap className="h-3 w-3" /> shock −0.5 on fall
+   506→              </Badge>
+   507→            </div>
+   508→          </div>
+   509→        </CardHeader>
+   510→      </Card>
+   511→
+   512→      {/* ------------------------------------------------ resume banner */}
+   513→      {session && (
+   514→        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+   515→          <History className="h-4 w-4 shrink-0" />
+   516→          <span className="min-w-0 flex-1">
+   517→            Previous dusk ride found — generation {session.generation}, best{" "}
+   518→            {session.bestDistance.toFixed(0)} m. Continue breeding from that champion?
+   519→          </span>
+   520→          <Button
+   521→            size="sm"
+   522→            onClick={resumeSession}
+   523→            className="h-9 bg-amber-500 text-black hover:bg-amber-400"
+   524→          >
+   525→            Resume last session
+   526→          </Button>
+   527→          <button
+   528→            onClick={() => setSession(null)}
+   529→            className="rounded-md p-1.5 opacity-60 hover:opacity-100"
+   530→            aria-label="Dismiss session banner"
+   531→          >
+   532→            <X className="h-4 w-4" />
+   533→          </button>
+   534→        </div>
+   535→      )}
+   536→
+   537→      {/* ------------------------------------------------- main + side */}
+   538→      <div className="flex flex-col gap-4 lg:flex-row">
+   539→        {/* 3D canvas card */}
+   540→        <Card className="min-w-0 flex-1 overflow-hidden p-0">
+   541→          <div className="relative aspect-video min-h-[420px] w-full bg-[#150a1e]">
+   542→            {canvasElement}
+   543→
+   544→            {/* HUD overlay */}
+   545→            <div className="pointer-events-none absolute inset-0 select-none">
+   546→              <div
+   547→                className="absolute left-3 top-3 flex flex-wrap items-center gap-2"
+   548→                data-duel={
+   549→                  challengeHud
+   550→                    ? `you:${challengeHud.you.toFixed(1)}|fly:${challengeHud.fly.toFixed(1)}|youAlive:${challengeHud.youAlive ? 1 : 0}|flyAlive:${challengeHud.flyAlive ? 1 : 0}|phi:${challengeHud.phi.toFixed(3)}|steer:${challengeHud.steer.toFixed(3)}|ended:${challengeHud.ended ? 1 : 0}${challengeHud.result ? `|winner:${challengeHud.result.winner}` : ""}`
+   551→                    : undefined
+   552→                }
+   553→              >
+   554→                {challengeHud ? (
+   555→                  <>
+   556→                    <StatChip
+   557→                      label="YOU"
+   558→                      labelAccent="text-amber-300/90"
+   559→                      value={`${challengeHud.you.toFixed(0)} m${challengeHud.youAlive ? "" : " ✕"}`}
+   560→                      accent="text-amber-200"
+   561→                    />
+   562→                    <StatChip
+   563→                      label="FLY"
+   564→                      labelAccent="text-emerald-300/90"
+   565→                      value={`${challengeHud.fly.toFixed(0)} m${challengeHud.flyAlive ? "" : " ✕"}`}
+   566→                      accent="text-emerald-200"
+   567→                    />
+   568→                    <StatChip
+   569→                      label="Session"
+   570→                      value={`You ${challengeHud.wins} · Fly ${challengeHud.losses}`}
+   571→                    />
+   572→                  </>
+   573→                ) : (
+   574→                  <>
+   575→                    <StatChip
+   576→                      label="Generation"
+   577→                      value={`#${gen}`}
+   578→                      accent="text-rose-300"
+   579→                    />
+   580→                    <StatChip
+   581→                      label="Alive"
+   582→                      value={`${alive} / ${total}`}
+   583→                      accent={alive > 0 ? "text-emerald-300" : "text-rose-300"}
+   584→                    />
+   585→                    {watchBest && (
+   586→                      <StatChip label="Mode" value="watch best" accent="text-amber-300" />
+   587→                    )}
+   588→                  </>
+   589→                )}
+   590→              </div>
+   591→              <div className="absolute right-3 top-3 flex flex-col items-end gap-2">
+   592→                {challengeHud ? (
+   593→                  <StatChip
+   594→                    label="Challenge best"
+   595→                    value={`${challengeHud.best.toFixed(0)} m`}
+   596→                    accent="text-amber-300"
+   597→                  />
+   598→                ) : (
+   599→                  <>
+   600→                    <StatChip
+   601→                      label="Best ever"
+   602→                      value={`${bestEver.toFixed(0)} m`}
+   603→                      accent="text-amber-300"
+   604→                    />
+   605→                    <StatChip label="Leader" value={`${leaderS.toFixed(0)} m`} />
+   606→                    <StatChip label="Speed" value={`${leaderV.toFixed(1)} m/s`} />
+   607→                  </>
+   608→                )}
+   609→              </div>
+   610→
+   611→              {/* lean + steer + dopamine bottom-left */}
+   612→              <div className="absolute bottom-3 left-3 flex items-end gap-3">
+   613→                {challengeHud ? (
+   614→                  <>
+   615→                    <div className="rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
+   616→                      <div className="mb-1 text-[10px] uppercase tracking-wide text-amber-300/90">
+   617→                        Lean · you
+   618→                      </div>
+   619→                      <div className="flex h-9 w-16 items-center justify-center">
+   620→                        <div
+   621→                          className="h-1.5 w-14 rounded-full bg-gradient-to-r from-rose-400 via-white/80 to-amber-300 shadow"
+   622→                          style={{
+   623→                            transform: `rotate(${(challengeHud.phi * (180 / Math.PI)).toFixed(1)}deg)`,
+   624→                          }}
+   625→                        />
+   626→                      </div>
+   627→                      <div className="mb-1 mt-1.5 text-[10px] uppercase tracking-wide text-white/50">
+   628→                        Steer
+   629→                      </div>
+   630→                      <div className="relative h-1.5 w-14 rounded-full bg-white/10">
+   631→                        <div className="absolute left-1/2 top-0 h-full w-px bg-white/40" />
+   632→                        <div
+   633→                          className="absolute top-0 h-full rounded-full bg-amber-300"
+   634→                          style={
+   635→                            challengeHud.steer >= 0
+   636→                              ? {
+   637→                                  left: "50%",
+   638→                                  width: `${(Math.abs(challengeHud.steer) / 0.5) * 50}%`,
+   639→                                }
+   640→                              : {
+   641→                                  right: "50%",
+   642→                                  width: `${(Math.abs(challengeHud.steer) / 0.5) * 50}%`,
+   643→                                }
+   644→                          }
+   645→                        />
+   646→                      </div>
+   647→                    </div>
+   648→                    <div className="w-36 rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
+   649→                      <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wide text-white/50">
+   650→                        <span>Dopamine · fly</span>
+   651→                        <span
+   652→                          className={
+   653→                            challengeHud.flyDop >= 0
+   654→                              ? "text-emerald-300"
+   655→                              : "text-rose-300"
+   656→                          }
+   657→                        >
+   658→                          {challengeHud.flyDop >= 0 ? "+" : ""}
+   659→                          {challengeHud.flyDop.toFixed(2)}
+   660→                        </span>
+   661→                      </div>
+   662→                      <div className="relative h-2 w-full overflow-hidden rounded-full bg-white/10">
+   663→                        <div className="absolute left-1/2 top-0 h-full w-px bg-white/40" />
+   664→                        <div
+   665→                          className={`absolute top-0 h-full ${
+   666→                            challengeHud.flyDop >= 0
+   667→                              ? "bg-emerald-400"
+   668→                              : "bg-rose-400"
+   669→                          }`}
+   670→                          style={
+   671→                            challengeHud.flyDop >= 0
+   672→                              ? {
+   673→                                  left: "50%",
+   674→                                  width: `${Math.min(1, Math.abs(challengeHud.flyDop)) * 50}%`,
+   675→                                }
+   676→                              : {
+   677→                                  right: "50%",
+   678→                                  width: `${Math.min(1, Math.abs(challengeHud.flyDop)) * 50}%`,
+   679→                                }
+   680→                          }
+   681→                        />
+   682→                      </div>
+   683→                    </div>
+   684→                  </>
+   685→                ) : (
+   686→                  <>
+   687→                    <div className="rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
+   688→                      <div className="mb-1 text-[10px] uppercase tracking-wide text-white/50">
+   689→                        Lean
+   690→                      </div>
+   691→                      <div className="flex h-12 w-16 items-center justify-center">
+   692→                        <div
+   693→                          className="h-1.5 w-14 rounded-full bg-gradient-to-r from-rose-400 via-white/80 to-amber-300 shadow"
+   694→                          style={{
+   695→                            transform: `rotate(${(leaderPhi * (180 / Math.PI)).toFixed(1)}deg)`,
+   696→                          }}
+   697→                        />
+   698→                      </div>
+   699→                    </div>
+   700→                    <div className="w-36 rounded-lg border border-white/10 bg-black/40 px-2.5 py-2 backdrop-blur-md">
+   701→                      <div className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wide text-white/50">
+   702→                        <span>Dopamine</span>
+   703→                        <span className={dop >= 0 ? "text-emerald-300" : "text-rose-300"}>
+   704→                          {dop >= 0 ? "+" : ""}
+   705→                          {dop.toFixed(2)}
+   706→                        </span>
+   707→                      </div>
+   708→                      <div className="relative h-2 w-full overflow-hidden rounded-full bg-white/10">
+   709→                        <div className="absolute left-1/2 top-0 h-full w-px bg-white/40" />
+   710→                        <div
+   711→                          className={`absolute top-0 h-full ${
+   712→                            dop >= 0 ? "bg-emerald-400" : "bg-rose-400"
+   713→                          }`}
+   714→                          style={
+   715→                            dop >= 0
+   716→                              ? { left: "50%", width: `${dopPct * 50}%` }
+   717→                              : { right: "50%", width: `${dopPct * 50}%` }
+   718→                          }
+   719→                        />
+   720→                      </div>
+   721→                    </div>
+   722→                  </>
+   723→                )}
+   724→              </div>
+   725→
+   726→              {/* steer hints (challenge) / turbo (training) bottom-right */}
+   727→              {challengeHud ? (
+   728→                <div
+   729→                  className="absolute bottom-3 right-3 flex items-center gap-2 rounded-lg border border-white/10 bg-black/50 px-3 py-2 backdrop-blur-md"
+   730→                  title="Steer with the arrow keys (or A / D) — pedal is automatic"
+   731→                >
+   732→                  <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded border border-border/80 bg-black/50 px-1.5 font-mono text-xs leading-none text-foreground/90">
+   733→                    ←
+   734→                  </kbd>
+   735→                  <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded border border-border/80 bg-black/50 px-1.5 font-mono text-xs leading-none text-foreground/90">
+   736→                    →
+   737→                  </kbd>
+   738→                  <span className="text-xs text-white/80">steer · balance!</span>
+   739→                </div>
+   740→              ) : (
+   741→                <div className="pointer-events-auto absolute bottom-3 right-3">
+   742→                  <TurboControl turbo={turbo} onChange={changeTurbo} />
+   743→                </div>
+   744→              )}
+   745→
+   746→              {/* paused veil (training only — a challenge runs real-time) */}
+   747→              {!running && !challengeActive && (
+   748→                <div className="absolute inset-0 flex items-center justify-center bg-black/35 backdrop-blur-[2px]">
+   749→                  <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/60 px-5 py-2.5 text-sm font-medium text-white/90">
+   750→                    <Pause className="h-4 w-4" /> Paused — the flies are resting
+   751→                  </div>
+   752→                </div>
+   753→              )}
+   754→            </div>
+   755→
+   756→            {/* challenge result overlay */}
+   757→            {challengeHud?.ended && challengeHud.result && (
+   758→              <div
+   759→                role="dialog"
+   760→                aria-label="Challenge result"
+   761→                data-testid="challenge-result"
+   762→                className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2.5 bg-black/60 p-4 backdrop-blur-[2px]"
+   763→              >
+   764→                <Trophy
+   765→                  className={
+   766→                    challengeHud.result.winner === "you"
+   767→                      ? "h-8 w-8 text-amber-400"
+   768→                      : "h-8 w-8 text-muted-foreground"
+   769→                  }
+   770→                  aria-hidden
+   771→                />
+   772→                <p
+   773→                  className={
+   774→                    challengeHud.result.winner === "you"
+   775→                      ? "text-center text-sm font-semibold text-amber-200 sm:text-base"
+   776→                      : "text-center text-sm font-semibold text-foreground/90 sm:text-base"
+   777→                  }
+   778→                >
+   779→                  {challengeHud.result.winner === "you"
+   780→                    ? `🏆 You out-balanced the fly, ${challengeHud.result.youS.toFixed(0)} m vs ${challengeHud.result.flyS.toFixed(0)} m`
+   781→                    : challengeHud.result.winner === "fly"
+   782→                      ? `The fly rides on — ${challengeHud.result.youS.toFixed(0)} m vs ${challengeHud.result.flyS.toFixed(0)} m. Keep breeding!`
+   783→                      : `Dead heat — ${challengeHud.result.youS.toFixed(0)} m each. Rematch?`}
+   784→                </p>
+   785→                <p className="font-mono text-xs tabular-nums text-muted-foreground">
+   786→                  You {challengeHud.wins} · Fly {challengeHud.losses} · your best{" "}
+   787→                  {challengeHud.best.toFixed(0)} m
+   788→                </p>
+   789→                <div className="mt-1.5 flex flex-wrap items-center justify-center gap-2">
+   790→                  <Button className="h-11" onClick={rematchChallenge}>
+   791→                    <RotateCcw aria-hidden />
+   792→                    Rematch
+   793→                  </Button>
+   794→                  <Button variant="outline" className="h-11" onClick={exitChallenge}>
+   795→                    <ArrowLeft aria-hidden />
+   796→                    Back to training
+   797→                  </Button>
+   798→                </div>
+   799→              </div>
+   800→            )}
+   801→          </div>
+   802→        </Card>
+   803→
+   804→        {/* right column */}
+   805→        <div className="flex w-full flex-col gap-4 lg:w-96">
+   806→          {/* what the fly sees */}
+   807→          <Card>
+   808→            <CardHeader className="pb-2">
+   809→              <CardTitle className="flex items-center gap-2 text-sm">
+   810→                <Eye className="h-4 w-4 text-rose-300" />
+   811→                {challengeActive ? "What the champion sees" : "What the fly sees"}
+   812→              </CardTitle>
+   813→              <CardDescription className="text-xs">
+   814→                {challengeActive
+   815→                  ? "The 24×9 retina driving the brain you're racing — live, mid-challenge."
+   816→                  : "The 24×9 retina — road stripe, edge lines, glow posts. Lean shifts the whole view."}
+   817→              </CardDescription>
+   818→            </CardHeader>
+   819→            <CardContent>
+   820→              <div className="overflow-hidden rounded-lg border border-white/10 bg-[#0d0610] p-1.5">
+   821→                <canvas
+   822→                  ref={retinaCanvas}
+   823→                  width={24}
+   824→                  height={9}
+   825→                  className="block w-full"
+   826→                  style={{ imageRendering: "pixelated" }}
+   827→                  aria-label="Live view of the fly's 24 by 9 retina"
+   828→                  role="img"
+   829→                />
+   830→              </div>
+   831→              <div className="mt-1.5 flex justify-between text-[10px] uppercase tracking-wide text-muted-foreground">
+   832→                <span>28 m ahead</span>
+   833→                <span>4 m ahead</span>
+   834→              </div>
+   835→            </CardContent>
+   836→          </Card>
+   837→
+   838→          {/* brain activity */}
+   839→          <Card>
+   840→            <CardHeader className="pb-2">
+   841→              <CardTitle className="text-sm">
+   842→                {challengeActive
+   843→                  ? "Champion fly — live brain"
+   844→                  : "Leader's brain activity"}
+   845→              </CardTitle>
+   846→              <CardDescription className="text-xs">
+   847→                {challengeActive
+   848→                  ? "Retina → optic lobe → mushroom body → motor of the brain you're racing."
+   849→                  : "Retina → optic lobe → mushroom body → motor, live."}
+   850→              </CardDescription>
+   851→            </CardHeader>
+   852→            <CardContent>
+   853→              <BrainActivityPanel brain={leaderBrain} height={150} />
+   854→            </CardContent>
+   855→          </Card>
+   856→
+   857→          {/* event feed */}
+   858→          <Card>
+   859→            <CardHeader className="pb-2">
+   860→              <CardTitle className="flex items-center gap-2 text-sm">
+   861→                <Flag className="h-4 w-4 text-amber-300" />
+   862→                Event feed
+   863→              </CardTitle>
+   864→            </CardHeader>
+   865→            <CardContent>
+   866→              <div
+   867→                className="flex max-h-56 flex-col gap-1 overflow-y-auto pr-1 text-xs [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]"
+   868→                aria-live="polite"
+   869→              >
+   870→                {events.length === 0 && (
+   871→                  <div className="py-4 text-center text-muted-foreground">
+   872→                    Waiting for the first fall…
+   873→                  </div>
+   874→                )}
+   875→                {events.map((e) => (
+   876→                  <div
+   877→                    key={e.id}
+   878→                    className="flex items-center gap-2 rounded-md border border-border/50 bg-muted/25 px-2 py-1.5"
+   879→                  >
+   880→                    {eventIcon(e.kind)}
+   881→                    <span className="min-w-0 flex-1 truncate text-muted-foreground">
+   882→                      {e.text}
+   883→                    </span>
+   884→                  </div>
+   885→                ))}
+   886→              </div>
+   887→            </CardContent>
+   888→          </Card>
+   889→
+   890→          {/* controls */}
+   891→          <Card>
+   892→            <CardHeader className="pb-3">
+   893→              <CardTitle className="flex items-center gap-2 text-sm">
+   894→                {challengeActive ? (
+   895→                  <>
+   896→                    <Swords className="h-4 w-4 text-amber-400" aria-hidden />
+   897→                    You vs the fly
+   898→                  </>
+   899→                ) : (
+   900→                  "Training controls"
+   901→                )}
+   902→              </CardTitle>
+   903→            </CardHeader>
+   904→            {challengeActive ? (
+   905→              <CardContent className="flex flex-col gap-4">
+   906→                <div className="flex flex-wrap items-center gap-2">
+   907→                  <Badge
+   908→                    variant="outline"
+   909→                    className="border-amber-500/40 bg-amber-500/10 font-mono text-xs tabular-nums text-amber-200"
+   910→                  >
+   911→                    You {challengeHud?.wins ?? 0}
+   912→                  </Badge>
+   913→                  <Badge
+   914→                    variant="outline"
+   915→                    className="border-emerald-500/40 bg-emerald-500/10 font-mono text-xs tabular-nums text-emerald-200"
+   916→                  >
+   917→                    Fly {challengeHud?.losses ?? 0}
+   918→                  </Badge>
+   919→                  <Badge
+   920→                    variant="outline"
+   921→                    className="border-border/60 bg-black/40 font-mono text-xs tabular-nums"
+   922→                  >
+   923→                    your best {(challengeHud?.best ?? 0).toFixed(0)} m
+   924→                  </Badge>
+   925→                </div>
+   926→                <p className="text-xs leading-relaxed text-muted-foreground">
+   927→                  Balance with{" "}
+   928→                  <kbd className="inline-flex h-5 min-w-5 items-center justify-center rounded border border-border/80 bg-black/50 px-1 font-mono text-[10px] leading-none text-foreground/90">
+   929→                    ←
+   930→                  </kbd>{" "}
+   931→                  <kbd className="inline-flex h-5 min-w-5 items-center justify-center rounded border border-border/80 bg-black/50 px-1 font-mono text-[10px] leading-none text-foreground/90">
+   932→                    →
+   933→                  </kbd>{" "}
+   934→                  (or A / D) — pedal is automatic. Falls lose; the survivor
+   935→                  gets 30 s to run up the score.
+   936→                </p>
+   937→                <div className="flex gap-2">
+   938→                  <Button
+   939→                    onClick={exitChallenge}
+   940→                    variant="outline"
+   941→                    className="h-11 flex-1 gap-2 text-sm"
+   942→                    aria-label="Leave the challenge and return to population training"
+   943→                  >
+   944→                    <ArrowLeft className="h-4 w-4" /> Back to training
+   945→                  </Button>
+   946→                  <Button
+   947→                    onClick={rematchChallenge}
+   948→                    className="h-11 flex-1 gap-2 text-sm"
+   949→                    aria-label="Restart the challenge with fresh riders"
+   950→                  >
+   951→                    <RotateCcw className="h-4 w-4" /> Rematch
+   952→                  </Button>
+   953→                </div>
+   954→                <p className="text-[11px] leading-relaxed text-muted-foreground">
+   955→                  Challenges also train the champion — it still earns distance
+   956→                  sugar and fall shock, and hands its weights back afterwards.
+   957→                </p>
+   958→              </CardContent>
+   959→            ) : (
+   960→            <CardContent className="flex flex-col gap-4">
+   961→              <div className="flex gap-2">
+   962→                <Button
+   963→                  onClick={toggleRun}
+   964→                  className="h-11 flex-1 gap-2 text-sm"
+   965→                  variant={running ? "secondary" : "default"}
+   966→                  aria-label={running ? "Pause training" : "Resume training"}
+   967→                >
+   968→                  {running ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+   969→                  {running ? "Pause" : "Play"}
+   970→                </Button>
+   971→                <Button
+   972→                  onClick={doReset}
+   973→                  className="h-11 flex-1 gap-2 text-sm"
+   974→                  variant="outline"
+   975→                  aria-label="Reset training"
+   976→                >
+   977→                  <RotateCcw className="h-4 w-4" /> Reset
+   978→                </Button>
+   979→              </div>
+   980→
+   981→              <UITooltip>
+   982→                <TooltipTrigger asChild>
+   983→                  {/* span wrapper: browsers fire no pointer events on a
+   984→                      disabled <button>, so the "train a champion first"
+   985→                      tooltip needs a hoverable parent to appear */}
+   986→                  <span className="block">
+   987→                    <Button
+   988→                      onClick={enterChallenge}
+   989→                      disabled={!hud?.hasBest}
+   990→                      variant="outline"
+   991→                      className="h-11 w-full gap-2 border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20 hover:text-amber-100"
+   992→                      aria-label="Challenge the champion fly to a balance duel"
+   993→                    >
+   994→                      <Swords className="h-4 w-4" aria-hidden /> You vs the fly
+   995→                    </Button>
+   996→                  </span>
+   997→                </TooltipTrigger>
+   998→                <TooltipContent side="top">
+   999→                  {hud?.hasBest
+  1000→                    ? "Balance against the champion brain — same road, same curves"
+  1001→                    : "Train a champion first, then challenge it"}
+  1002→                </TooltipContent>
+  1003→              </UITooltip>
+  1004→
+  1005→              <div>
+  1006→                <div className="mb-2 flex items-center justify-between">
+  1007→                  <Label className="text-xs text-muted-foreground">Turbo</Label>
+  1008→                  <TurboControl turbo={turbo} onChange={changeTurbo} />
+  1009→                </div>
+  1010→              </div>
+  1011→
+  1012→              <div className="flex flex-col gap-2">
+  1013→                <Label className="text-xs text-muted-foreground">
+  1014→                  Bike personality
+  1015→                </Label>
+  1016→                <div
+  1017→                  className="grid grid-cols-3 gap-1 rounded-lg bg-muted/60 p-1"
+  1018→                  role="group"
+  1019→                  aria-label="Bike personality preset"
+  1020→                >
+  1021→                  {(
+  1022→                    [
+  1023→                      { id: "steady", label: "Steady", hint: "Forgiving geometry, richer sugar — balance comes sooner" },
+  1024→                      { id: "standard", label: "Standard", hint: "The validated default setup" },
+  1025→                      { id: "frisky", label: "Frisky", hint: "Twitchy handling, leaner sugar — a real challenge" },
+  1026→                    ] as const
+  1027→                  ).map((p) => (
+  1028→                    <button
+  1029→                      key={p.id}
+  1030→                      type="button"
+  1031→                      title={p.hint}
+  1032→                      aria-pressed={preset === p.id}
+  1033→                      onClick={() => changePreset(p.id)}
+  1034→                      className={`h-9 rounded-md px-2 text-xs font-medium transition-colors ${
+  1035→                        preset === p.id
+  1036→                          ? p.id === "steady"
+  1037→                            ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40"
+  1038→                            : p.id === "frisky"
+  1039→                              ? "bg-rose-500/20 text-rose-300 ring-1 ring-rose-500/40"
+  1040→                              : "bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40"
+  1041→                          : "text-muted-foreground hover:text-foreground"
+  1042→                      }`}
+  1043→                    >
+  1044→                      {p.label}
+  1045→                    </button>
+  1046→                  ))}
+  1047→                </div>
+  1048→                <p className="text-[11px] leading-relaxed text-muted-foreground">
+  1049→                  Steady gives the handlebars more righting authority (+25%) and
+  1050→                  pays 0.045 sugar per meter; Frisky dulls them (−20%) and pays
+  1051→                  0.022. Applies live — no reset needed.
+  1052→                </p>
+  1053→              </div>
+  1054→
+  1055→              <Separator />
+  1056→
+  1057→              <div className="flex flex-col gap-2">
+  1058→                <div className="flex items-center justify-between">
+  1059→                  <Label htmlFor="pop-slider" className="text-xs text-muted-foreground">
+  1060→                    Population
+  1061→                  </Label>
+  1062→                  <span className="text-xs font-medium tabular-nums">
+  1063→                    {popQueued} riders
+  1064→                    {!popApplied && (
+  1065→                      <span className="ml-1 text-amber-400">(next gen)</span>
+  1066→                    )}
+  1067→                  </span>
+  1068→                </div>
+  1069→                <Slider
+  1070→                  id="pop-slider"
+  1071→                  min={3}
+  1072→                  max={8}
+  1073→                  step={1}
+  1074→                  value={[popQueued]}
+  1075→                  onValueChange={changePopulation}
+  1076→                />
+  1077→              </div>
+  1078→
+  1079→              <div className="flex flex-col gap-2">
+  1080→                <div className="flex items-center justify-between">
+  1081→                  <Label htmlFor="mut-slider" className="text-xs text-muted-foreground">
+  1082→                    Mutation strength
+  1083→                  </Label>
+  1084→                  <span className="text-xs font-medium tabular-nums">
+  1085→                    {mutation.toFixed(2)}
+  1086→                  </span>
+  1087→                </div>
+  1088→                <Slider
+  1089→                  id="mut-slider"
+  1090→                  min={0.1}
+  1091→                  max={0.5}
+  1092→                  step={0.05}
+  1093→                  value={[mutation]}
+  1094→                  onValueChange={changeMutation}
+  1095→                />
+  1096→              </div>
+  1097→
+  1098→              <Separator />
+  1099→
+  1100→              <div className="flex items-center justify-between gap-3">
+  1101→                <div className="min-w-0">
+  1102→                  <Label htmlFor="watch-best" className="flex items-center gap-1.5 text-sm">
+  1103→                    <Eye className="h-4 w-4 text-amber-300" /> Watch best rider
+  1104→                  </Label>
+  1105→                  <p className="mt-0.5 text-xs text-muted-foreground">
+  1106→                    Exhibition ride with the all-time champion brain.
+  1107→                  </p>
+  1108→                </div>
+  1109→                <Switch
+  1110→                  id="watch-best"
+  1111→                  checked={watchBest}
+  1112→                  onCheckedChange={toggleWatchBest}
+  1113→                  aria-label="Watch best rider mode"
+  1114→                />
+  1115→              </div>
+  1116→            </CardContent>
+  1117→            )}
+  1118→          </Card>
+  1119→
+  1120→          {/* save */}
+  1121→          <Card>
+  1122→            <CardHeader className="pb-3">
+  1123→              <CardTitle className="text-sm">Save the champion</CardTitle>
+  1124→              <CardDescription className="text-xs">
+  1125→                {hud?.hasBest
+  1126→                  ? `Best brain so far: ${bestEver.toFixed(0)} m — worth keeping?`
+  1127→                  : "Finish a generation to have a champion worth saving."}
+  1128→              </CardDescription>
+  1129→            </CardHeader>
+  1130→            <CardContent className="flex gap-2">
+  1131→              <Input
+  1132→                value={brainName}
+  1133→                onChange={(e) => setBrainName(e.target.value)}
+  1134→                placeholder="Brain name"
+  1135→                maxLength={40}
+  1136→                className="h-11"
+  1137→                aria-label="Name for the saved brain"
+  1138→              />
+  1139→              <Button
+  1140→                onClick={saveBest}
+  1141→                disabled={saving || !hud?.hasBest}
+  1142→                className="h-11 gap-2 whitespace-nowrap"
+  1143→                aria-label="Save best brain to the library"
+  1144→              >
+  1145→                <Save className="h-4 w-4" />
+  1146→                {saving ? "Saving…" : "Save best brain"}
+  1147→              </Button>
+  1148→            </CardContent>
+  1149→          </Card>
+  1150→        </div>
+  1151→      </div>
+  1152→
+  1153→      {/* -------------------------------------------------- history chart */}
+  1154→      <Card>
+  1155→        <CardHeader className="pb-2">
+  1156→          <CardTitle className="flex items-center gap-2 text-sm">
+  1157→            <Flag className="h-4 w-4 text-emerald-300" />
+  1158→            Distance by generation
+  1159→          </CardTitle>
+  1160→          <CardDescription className="text-xs">
+  1161→            Best and average distance per generation — the learning curve of a
+  1162→            evolving fly colony.
+  1163→          </CardDescription>
+  1164→        </CardHeader>
+  1165→        <CardContent>
+  1166→          <div className="h-48 w-full">
+  1167→            {history.length === 0 ? (
+  1168→              <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-border/60 text-sm text-muted-foreground">
+  1169→                The curve begins after the first generation finishes…
+  1170→              </div>
+  1171→            ) : (
+  1172→              <ResponsiveContainer width="100%" height="100%">
+  1173→                <LineChart data={history} margin={{ top: 8, right: 16, bottom: 0, left: -8 }}>
+  1174→                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.08)" />
+  1175→                  <XAxis
+  1176→                    dataKey="gen"
+  1177→                    stroke="rgba(255,255,255,0.35)"
+  1178→                    tick={{ fontSize: 11 }}
+  1179→                    tickLine={false}
+  1180→                    label={{ value: "gen", position: "insideBottomRight", offset: -2, fontSize: 10, fill: "rgba(255,255,255,0.35)" }}
+  1181→                  />
+  1182→                  <YAxis
+  1183→                    stroke="rgba(255,255,255,0.35)"
+  1184→                    tick={{ fontSize: 11 }}
+  1185→                    tickLine={false}
+  1186→                    width={54}
+  1187→                    tickFormatter={(v: number) => `${v} m`}
+  1188→                  />
+  1189→                  <Tooltip
+  1190→                    contentStyle={{
+  1191→                      background: "rgba(20,10,20,0.92)",
+  1192→                      border: "1px solid rgba(255,255,255,0.12)",
+  1193→                      borderRadius: 8,
+  1194→                      fontSize: 12,
+  1195→                    }}
+  1196→                    labelFormatter={(g) => `Generation ${g}`}
+  1197→                    formatter={(value: number | string, name) => [
+  1198→                      `${Number(value).toFixed(0)} m`,
+  1199→                      name as string,
+  1200→                    ]}
+  1201→                  />
+  1202→                  <Legend wrapperStyle={{ fontSize: 11 }} />
+  1203→                  <Line
+  1204→                    type="monotone"
+  1205→                    dataKey="best"
+  1206→                    name="Best"
+  1207→                    stroke="#34d399"
+  1208→                    strokeWidth={2}
+  1209→                    dot={{ r: 2.5, fill: "#34d399" }}
+  1210→                    isAnimationActive={false}
+  1211→                  />
+  1212→                  <Line
+  1213→                    type="monotone"
+  1214→                    dataKey="avg"
+  1215→                    name="Average"
+  1216→                    stroke="#fbbf24"
+  1217→                    strokeWidth={1.6}
+  1218→                    strokeDasharray="4 3"
+  1219→                    dot={false}
+  1220→                    isAnimationActive={false}
+  1221→                  />
+  1222→                </LineChart>
+  1223→              </ResponsiveContainer>
+  1224→            )}
+  1225→          </div>
+  1226→        </CardContent>
+  1227→      </Card>
+  1228→    </section>
+  1229→  );
+  1230→}
+  1231→
