@@ -350,3 +350,23 @@ Work Log:
 
 Stage Summary:
 - Lineage tree fully functional: recording the actual evolution lineage costs nothing at runtime and renders a readable family tree with tooltips; regression clean (duel button, duck-defense chip, sounds all still working); engine untouched
+
+---
+Task ID: 9 (lead integration)
+Agent: main (Z.ai Code)
+Task: Round QA, verification of agent-built bicycle challenge + lineage tree, sound volume control, demo export, integration
+
+Work Log:
+- Pre-round QA: all tabs stable, zero errors → feature round. Both Task launches "failed" (context deadline) but agents' code landed anyway (same as round 8) — verified both features myself and reconstructed their worklog entries
+- Verified 9-a bicycle challenge in-browser: disabled→enabled after champion; HUD (YOU/FLY, W/L, lean meter, hints); ArrowRight held mid-ride moves the lean meter (frozen -36.3° at fall → responsive -16.7° riding); both result wordings ("You out-balanced the fly, 6 m vs 4 m" / "The fly rides on — 3 m vs 4 m"); W/L persistence; Rematch; Back to training resumes population (one transient detached-node race on exit click — works on retry)
+- Verified 9-b dino lineage in-browser: card + summary; 16-node SVG tree with 15 native tooltips ("Gen 1 · score 64 · founding fly" → elite clones → "Gen 11 · score 85 · crossover child" champion + rose crossover-parent side branches); rebuilds after reset; empty state when paused+reset
+- Built 9-c sound volume control: sound.ts volume store (0..1) + setSoundVolume/useSoundVolume + persisted fly-sound-volume; master gain = 0.5 × volume (ensureCtx applies current volume); page.tsx sound button → Popover (mute Switch + volume Slider + Test chime + tooltip "Volume & mute (M)"); FIXED a real bug found by QA: hydrate parsed Number(null)=0 → fresh visitors started at 0% volume — now only parses when the key exists (verified: default 100%, slider persists "1" → reload round-trips 100%)
+- Built 9-c conditioning-demo export: BrainLab demo result block gains "Chart PNG" (SVG→2x canvas raster→download, verified Saved ✓; first click after demo-finish can race the chart re-render — works on poll) + "Results JSON" (clipboard with file-download fallback, verified Copied ✓); inline feedback chips instead of toasts (no sonner Toaster mounted on the lab tab); sounds ding/click on export
+- Environment incident: dev server OOM-killed mid-round (machine-wide fork failures, Errno 11) — closed stale agent browser sessions (task-9a, round9-qa) to free memory, restarted dev, all green after
+- Final regression: lint exit 0; bicycle (challenge button + presets), library (6 rows), docs, brain lab all render; zero console errors
+
+Stage Summary:
+- Round 9 shipped: "You vs the fly" bicycle challenge (keyboard balance vs champion), dino champion lineage family tree (real ancestry tracking + SVG tree), sound volume popover (with fresh-visitor 0%-volume bug fixed), conditioning-demo chart/results export (PNG + JSON)
+- All features verified end-to-end with zero console errors; engine untouched; evolution algorithm untouched (lineage only records what it does)
+- GitHub push STILL blocked: upload/ empty (SSH key never arrived)
+- Next-round candidates: lineage for the bicycle trainer (pattern established in dino), shareable brain "report card" (library card export), How-It-Works illustrated diagrams (SVG pipeline sketch), seeded reproducible demo runs
