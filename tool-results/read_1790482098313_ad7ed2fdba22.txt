@@ -1,0 +1,1079 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * BrainLab — interactive explorer for the fruit fly brain.
+     5→ *
+     6→ * Owns a live demo FlyBrain (DEFAULT_ARCH_LAB, 926 neurons, 4 motors).
+     7→ * - animated visual stimulus fed to the retina at ~30 ticks/sec, drawn into
+     8→ *   a "what the fly sees" canvas (24×9): sweep / two bars / sparkle / dark,
+     9→ *   plus Bar left (A) / Bar right (B) conditioning stimuli, a looming
+    10→ *   shadow (expanding dark disc — escape stimulus) and optomotor drum
+    11→ *   stripes; all animated by the shared pattern-speed slider
+    12→ * - Sugar (+dopamine) and Shock (−dopamine) buttons → classical conditioning
+    13→ *   (with sound effects via @/lib/sound)
+    14→ * - Classical-conditioning demo wizard: 24 automatic A+/B− trials driven
+    15→ *   from the SAME rAF tick loop, with a per-trial learning index chart
+    16→ * - stats row (ticks, spikes/s, dopamine, rewards/punishments) + motor bars
+    17→ * - click neurons in the 3D view to poke them (handled by BrainVisualizer3D)
+    18→ */
+    19→
+    20→import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+    21→import { Card } from "@/components/ui/card";
+    22→import { Button } from "@/components/ui/button";
+    23→import { Badge } from "@/components/ui/badge";
+    24→import { Slider } from "@/components/ui/slider";
+    25→import { Switch } from "@/components/ui/switch";
+    26→import {
+    27→  Select,
+    28→  SelectContent,
+    29→  SelectItem,
+    30→  SelectTrigger,
+    31→  SelectValue,
+    32→} from "@/components/ui/select";
+    33→import { BrainVisualizer3D } from "./BrainVisualizer3D";
+    34→import { BrainActivityPanel } from "./BrainActivityPanel";
+    35→import { FlyBrain } from "@/lib/flybrain/engine";
+    36→import { DEFAULT_ARCH_LAB } from "@/lib/flybrain/types";
+    37→import { playSound } from "@/lib/sound";
+    38→import { cn } from "@/lib/utils";
+    39→import {
+    40→  CartesianGrid,
+    41→  Legend,
+    42→  ReferenceLine,
+    43→  ResponsiveContainer,
+    44→  Scatter,
+    45→  ScatterChart,
+    46→  Tooltip,
+    47→  XAxis,
+    48→  YAxis,
+    49→} from "recharts";
+    50→import { motion } from "framer-motion";
+    51→import {
+    52→  Activity,
+    53→  Candy,
+    54→  Eye,
+    55→  FlaskConical,
+    56→  GraduationCap,
+    57→  Pause,
+    58→  Play,
+    59→  RotateCcw,
+    60→  Zap,
+    61→} from "lucide-react";
+    62→
+    63→export type BrainLabProps = Record<string, never>;
+    64→
+    65→type Pattern =
+    66→  | "sweep"
+    67→  | "two"
+    68→  | "sparkle"
+    69→  | "dark"
+    70→  | "barLeft"
+    71→  | "barRight"
+    72→  | "loom"
+    73→  | "drum";
+    74→
+    75→const TICK_RATE = 30; // brain ticks per second
+    76→const MOTOR_LABELS = ["Jump", "Duck", "Left", "Right"];
+    77→const PATTERN_LABELS: Record<Pattern, string> = {
+    78→  sweep: "Sweep bar",
+    79→  two: "Two bars",
+    80→  sparkle: "Random sparkle",
+    81→  dark: "Dark (silence)",
+    82→  barLeft: "Bar left (A)",
+    83→  barRight: "Bar right (B)",
+    84→  loom: "Looming shadow",
+    85→  drum: "Drum stripes",
+    86→};
+    87→
+    88→/* ---- looming-shadow stimulus ---- */
+    89→const LOOM_PERIOD_S = 2; // one expand → reset cycle (at pattern speed 1×)
+    90→const LOOM_MAX_R = 9.5; // final radius ≈ 80 % of the 24×9 retina area
+    91→
+    92→/* ---- optomotor drum stimulus ---- */
+    93→const DRUM_PERIOD = 6; // px per ON+OFF stripe pair at retina resolution
+    94→const DRUM_PX_S = 4; // scroll speed at pattern speed 1×
+    95→
+    96→/* ---- classical-conditioning demo wizard ---- */
+    97→const DEMO_TRIALS = 24;
+    98→const DEMO_STIM_S = 3.0; // stimulus duration per trial (demo-time seconds)
+    99→const DEMO_PAUSE_S = 0.5; // dark inter-trial pause
+   100→const DEMO_REWARD_AT_S = 1.5; // sugar / shock lands mid-trial
+   101→const DEMO_SAMPLE_FROM_S = 2.0; // measurement window = final 1.0 s of stimulus
+   102→
+   103→const RET_COLS = DEFAULT_ARCH_LAB.retinaCols;
+   104→const RET_ROWS = DEFAULT_ARCH_LAB.retinaRows;
+   105→
+   106→function fmtInt(n: number): string {
+   107→  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+   108→  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+   109→  return `${Math.round(n)}`;
+   110→}
+   111→
+   112→function signed(n: number): string {
+   113→  return `${n >= 0 ? "+" : "−"}${Math.abs(n).toFixed(2)}`;
+   114→}
+   115→
+   116→function Stat({
+   117→  label,
+   118→  value,
+   119→  tone,
+   120→}: {
+   121→  label: string;
+   122→  value: string;
+   123→  tone?: "emerald" | "rose" | "amber";
+   124→}) {
+   125→  return (
+   126→    <div className="rounded-lg border border-border/60 bg-muted/30 px-2 py-1.5 text-center">
+   127→      <div
+   128→        className={cn(
+   129→          "font-mono text-sm tabular-nums",
+   130→          tone === "emerald" && "text-emerald-300",
+   131→          tone === "rose" && "text-rose-300",
+   132→          tone === "amber" && "text-amber-300",
+   133→          !tone && "text-foreground",
+   134→        )}
+   135→      >
+   136→        {value}
+   137→      </div>
+   138→      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
+   139→    </div>
+   140→  );
+   141→}
+   142→
+   143→/* ------------------------------------------------------------------ */
+   144→/* demo wizard types                                                    */
+   145→/* ------------------------------------------------------------------ */
+   146→
+   147→type DemoPhase = "stimulus" | "reward" | "pause";
+   148→type DemoLetter = "A" | "B";
+   149→
+   150→/** One measured trial of the conditioning demo.
+   151→ *
+   152→ *  index    = MEASUREMENT (plotted): mean motor approach drive, i.e. the
+   153→ *             average of all 4 smoothed motorRates sampled across the final
+   154→ *             1 s of the 3 s stimulus. Validated against the real engine
+   155→ *             (see worklog 7-b): it is the sensitive readout — reward-paired
+   156→ *             A holds approach high while shock-paired B suppresses it, and
+   157→ *             the effect compounds on repeated runs. valence = secondary
+   158→ *             index: mean(appetitive MBON rates) − mean(aversive MBON rates)
+   159→ *             (region indices via brain.range("mbon") + brain.mbonValence);
+   160→ *             at only 12 pairings it stays within ±0.02 noise, so it is kept
+   161→ *             for the tooltip/record but not plotted. */
+   162→interface DemoTrialPoint {
+   163→  trial: number; // 1-based
+   164→  letter: DemoLetter;
+   165→  index: number;
+   166→  valence: number;
+   167→}
+   168→
+   169→interface DemoResult {
+   170→  points: DemoTrialPoint[];
+   171→  /** first-4 → last-4 average change per stimulus (the "verdict" numbers) */
+   172→  dA: number;
+   173→  dB: number;
+   174→  gapEarly: number;
+   175→  gapLate: number;
+   176→  baseline: number;
+   177→  run: number;
+   178→}
+   179→
+   180→interface DemoHud {
+   181→  status: "idle" | "running" | "done";
+   182→  trial: number; // 0-based
+   183→  phase: DemoPhase;
+   184→  letter: DemoLetter | null;
+   185→  progress: number; // 0..1
+   186→}
+   187→
+   188→interface DemoRuntime {
+   189→  running: boolean;
+   190→  trial: number; // 0-based
+   191→  t: number; // demo-time seconds inside the current trial
+   192→  delivered: boolean;
+   193→  valSum: number;
+   194→  apprSum: number;
+   195→  n: number;
+   196→  points: DemoTrialPoint[];
+   197→}
+   198→
+   199→const DEMO_HUD_IDLE: DemoHud = {
+   200→  status: "idle",
+   201→  trial: 0,
+   202→  phase: "stimulus",
+   203→  letter: null,
+   204→  progress: 0,
+   205→};
+   206→
+   207→export function BrainLab(_props: BrainLabProps = {}) {
+   208→  // ---- React-visible state (low-frequency sync from the sim loop) ----
+   209→  // brain created with a lazy initializer — FlyBrain construction is pure,
+   210→  // deterministic and DOM-free, so it is safe during render (SSR included).
+   211→  const [brain, setBrain] = useState<FlyBrain>(() => new FlyBrain(DEFAULT_ARCH_LAB));
+   212→  const [running, setRunning] = useState(true);
+   213→  const [pattern, setPattern] = useState<Pattern>("sweep");
+   214→  const [speed, setSpeed] = useState(1);
+   215→  const [autoRotate, setAutoRotate] = useState(true);
+   216→  const [showSynapses, setShowSynapses] = useState(true);
+   217→  const [ui, setUi] = useState({
+   218→    ticks: 0,
+   219→    spikes: 0,
+   220→    da: 0,
+   221→    rewards: 0,
+   222→    punishments: 0,
+   223→  });
+   224→  const [motors, setMotors] = useState<number[]>([0, 0, 0, 0]);
+   225→  const [demoHud, setDemoHud] = useState<DemoHud>(DEMO_HUD_IDLE);
+   226→  const [demoResult, setDemoResult] = useState<DemoResult | null>(null);
+   227→
+   228→  // ---- sim state that must NOT trigger re-renders (refs) ----
+   229→  const brainRef = useRef<FlyBrain>(brain);
+   230→  const runningRef = useRef(true);
+   231→  const patternRef = useRef<Pattern>("sweep");
+   232→  const speedRef = useRef(1);
+   233→  const pendingDaRef = useRef(0);
+   234→  const phaseRef = useRef(0);
+   235→  const sparkleRef = useRef(new Float32Array(RET_COLS * RET_ROWS));
+   236→  const drumRef = useRef(0); // optomotor drum scroll offset (px)
+   237→  const spikeEmaRef = useRef(0);
+   238→  const retCanvasRef = useRef<HTMLCanvasElement | null>(null);
+   239→
+   240→  // ---- demo wizard runtime (refs; HUD syncs at the existing ~11 Hz) ----
+   241→  const demoRef = useRef<DemoRuntime>({
+   242→    running: false,
+   243→    trial: 0,
+   244→    t: 0,
+   245→    delivered: false,
+   246→    valSum: 0,
+   247→    apprSum: 0,
+   248→    n: 0,
+   249→    points: [],
+   250→  });
+   251→  /** the user's stimulus selection before the wizard took over the projector */
+   252→  const demoPrevPatternRef = useRef<Pattern | null>(null);
+   253→  const demoRunsRef = useRef(0);
+   254→
+   255→  // ---- demo wizard control ----
+   256→  const startDemo = useCallback(() => {
+   257→    const d = demoRef.current;
+   258→    if (d.running) return;
+   259→    d.running = true;
+   260→    d.trial = 0;
+   261→    d.t = 0;
+   262→    d.delivered = false;
+   263→    d.valSum = 0;
+   264→    d.apprSum = 0;
+   265→    d.n = 0;
+   266→    d.points = [];
+   267→    demoPrevPatternRef.current = patternRef.current;
+   268→    setDemoResult(null);
+   269→    setDemoHud({ status: "running", trial: 0, phase: "stimulus", letter: "A", progress: 0 });
+   270→    // a paused brain would stall the wizard — bring the sim back with it
+   271→    if (!runningRef.current) {
+   272→      runningRef.current = true;
+   273→      setRunning(true);
+   274→    }
+   275→    playSound("click", 0.6);
+   276→  }, []);
+   277→
+   278→  const abortDemo = useCallback(() => {
+   279→    const d = demoRef.current;
+   280→    if (!d.running) return;
+   281→    d.running = false;
+   282→    const prev = demoPrevPatternRef.current;
+   283→    if (prev) {
+   284→      patternRef.current = prev;
+   285→      setPattern(prev);
+   286→      demoPrevPatternRef.current = null;
+   287→    }
+   288→    // brain state is about to change — old measurements are stale
+   289→    setDemoResult(null);
+   290→    setDemoHud(DEMO_HUD_IDLE);
+   291→  }, []);
+   292→
+   293→  // ---- brain lifecycle (reset button / brain swap) ----
+   294→  const bootBrain = useCallback(() => {
+   295→    abortDemo(); // "Reset brain" during a demo aborts the wizard cleanly
+   296→    const b = new FlyBrain(DEFAULT_ARCH_LAB);
+   297→    brainRef.current = b;
+   298→    setBrain(b);
+   299→    phaseRef.current = 0;
+   300→    drumRef.current = 0;
+   301→    sparkleRef.current.fill(0);
+   302→    pendingDaRef.current = 0;
+   303→    spikeEmaRef.current = 0;
+   304→    demoRunsRef.current = 0;
+   305→    setDemoHud(DEMO_HUD_IDLE);
+   306→    setUi({ ticks: 0, spikes: 0, da: 0, rewards: 0, punishments: 0 });
+   307→    setMotors(new Array(b.sizes.motor).fill(0));
+   308→  }, [abortDemo]);
+   309→
+   310→  // ---- controls ----
+   311→  const toggleRunning = useCallback(() => {
+   312→    const next = !runningRef.current;
+   313→    runningRef.current = next;
+   314→    setRunning(next);
+   315→  }, []);
+   316→
+   317→  const onPatternChange = useCallback((v: string) => {
+   318→    const p = (Object.keys(PATTERN_LABELS) as Pattern[]).includes(v as Pattern)
+   319→      ? (v as Pattern)
+   320→      : "sweep";
+   321→    patternRef.current = p;
+   322→    setPattern(p);
+   323→    if (p === "sparkle") sparkleRef.current.fill(0);
+   324→  }, []);
+   325→
+   326→  const onSpeedChange = useCallback((v: number[]) => {
+   327→    const s = v[0] ?? 1;
+   328→    speedRef.current = s;
+   329→    setSpeed(s);
+   330→  }, []);
+   331→
+   332→  const giveSugar = useCallback(() => {
+   333→    pendingDaRef.current = 1;
+   334→    playSound("sugar");
+   335→  }, []);
+   336→
+   337→  const giveShock = useCallback(() => {
+   338→    pendingDaRef.current = -1;
+   339→    playSound("shock");
+   340→  }, []);
+   341→
+   342→  // ---- simulation loop: rAF accumulator at TICK_RATE ----
+   343→  useEffect(() => {
+   344→    if (!brain) return;
+   345→    const COLS = brain.arch.retinaCols;
+   346→    const ROWS = brain.arch.retinaRows;
+   347→    const input = new Float32Array(COLS * ROWS);
+   348→    const STEP_MS = 1000 / TICK_RATE;
+   349→    let raf = 0;
+   350→    let last = performance.now();
+   351→    let acc = 0;
+   352→    let lastUi = 0;
+   353→    let lastDraw = 0;
+   354→
+   355→    // MBON compartment indices (global neuron ids) for the valence index
+   356→    const mb = brain.range("mbon");
+   357→    const mbonApp: number[] = [];
+   358→    const mbonAve: number[] = [];
+   359→    for (let m = 0; m < brain.sizes.mbon; m++) {
+   360→      (brain.mbonValence[m] === 1 ? mbonApp : mbonAve).push(mb.start + m);
+   361→    }
+   362→
+   363→    const paintBar = (cx: number, w: number) => {
+   364→      for (let c = cx; c < cx + w; c++) {
+   365→        if (c < 0 || c >= COLS) continue;
+   366→        for (let r = 0; r < ROWS; r++) input[r * COLS + c] = 1;
+   367→      }
+   368→    };
+   369→
+   370→    const computeInput = (dtSec: number) => {
+   371→      input.fill(0);
+   372→      let pat = patternRef.current;
+   373→      const d = demoRef.current;
+   374→      if (d.running) {
+   375→        // the wizard owns the projector while it runs: the trial's
+   376→        // conditioning stimulus, or darkness during the inter-trial pause
+   377→        pat =
+   378→          d.t < DEMO_STIM_S
+   379→            ? d.trial % 2 === 0
+   380→              ? "barLeft"
+   381→              : "barRight"
+   382→            : "dark";
+   383→      }
+   384→      if (pat === "sweep" || pat === "two") {
+   385→        phaseRef.current = (phaseRef.current + dtSec * 0.3 * speedRef.current) % 1;
+   386→        paintBar(Math.floor(phaseRef.current * COLS), 2);
+   387→        if (pat === "two") {
+   388→          const p2 = COLS - 1 - Math.floor(((phaseRef.current + 0.5) % 1) * COLS);
+   389→          paintBar(p2 - 1, 2);
+   390→        }
+   391→        // sparse random dots (visual "noise" the fly also sees)
+   392→        for (let d = 0; d < 3; d++) {
+   393→          const i = Math.floor(Math.random() * input.length);
+   394→          input[i] = Math.max(input[i], 0.35 + Math.random() * 0.3);
+   395→        }
+   396→      } else if (pat === "sparkle") {
+   397→        const sp = sparkleRef.current;
+   398→        for (let i = 0; i < sp.length; i++) sp[i] *= 0.85;
+   399→        const n = 2 + Math.floor(Math.random() * 4);
+   400→        for (let d = 0; d < n; d++) {
+   401→          sp[Math.floor(Math.random() * sp.length)] = 0.75 + Math.random() * 0.25;
+   402→        }
+   403→        for (let i = 0; i < input.length; i++) input[i] = sp[i];
+   404→      } else if (pat === "barLeft" || pat === "barRight") {
+   405→        // conditioning stimuli A / B: a steady bright bar filling one
+   406→        // third of the retina (left or right)
+   407→        const third = Math.max(1, Math.round(COLS / 3));
+   408→        paintBar(pat === "barLeft" ? 0 : COLS - third, third);
+   409→      } else if (pat === "loom") {
+   410→        // looming shadow (classic fly escape stimulus): a bright field with
+   411→        // an expanding dark disc. Radius eases 0 → ~80 % coverage over
+   412→        // LOOM_PERIOD_S, then snaps back — the sweep + reset produce heavy
+   413→        // ON/OFF transients that light up the optic lobes. A thin bright
+   414→        // leading rim keeps the expanding edge visible at 24×9 pixels.
+   415→        phaseRef.current += (dtSec * speedRef.current) / LOOM_PERIOD_S;
+   416→        if (phaseRef.current >= 1) phaseRef.current -= 1;
+   417→        const R = LOOM_MAX_R * (1 - Math.pow(1 - phaseRef.current, 2));
+   418→        input.fill(0.85);
+   419→        const cx = (COLS - 1) / 2;
+   420→        const cy = (ROWS - 1) / 2;
+   421→        for (let r = 0; r < ROWS; r++) {
+   422→          const dy = r - cy;
+   423→          for (let c = 0; c < COLS; c++) {
+   424→            const dx = c - cx;
+   425→            const dist = Math.sqrt(dx * dx + dy * dy);
+   426→            if (dist <= R) input[r * COLS + c] = 0;
+   427→            else if (dist <= R + 1.3) input[r * COLS + c] = 1;
+   428→          }
+   429→        }
+   430→      } else if (pat === "drum") {
+   431→        // optomotor drum: alternating vertical stripes (~6 px period)
+   432→        // scrolling horizontally; speed follows the pattern-speed slider
+   433→        drumRef.current =
+   434→          (drumRef.current + dtSec * speedRef.current * DRUM_PX_S) % DRUM_PERIOD;
+   435→        const off = drumRef.current;
+   436→        for (let c = 0; c < COLS; c++) {
+   437→          if ((c + off) % DRUM_PERIOD < DRUM_PERIOD / 2) paintBar(c, 1);
+   438→        }
+   439→      }
+   440→      // "dark" → all zeros
+   441→    };
+   442→
+   443→    const drawRetina = () => {
+   444→      const cv = retCanvasRef.current;
+   445→      if (!cv) return;
+   446→      const ctx = cv.getContext("2d");
+   447→      if (!ctx) return;
+   448→      ctx.fillStyle = "#07060a";
+   449→      ctx.fillRect(0, 0, COLS, ROWS);
+   450→      for (let r = 0; r < ROWS; r++) {
+   451→        for (let c = 0; c < COLS; c++) {
+   452→          const v = input[r * COLS + c];
+   453→          if (v <= 0.03) continue;
+   454→          const rr = Math.round(18 + 233 * v);
+   455→          const gg = Math.round(10 + 181 * v);
+   456→          const bb = Math.round(6 + 30 * v);
+   457→          ctx.fillStyle = `rgb(${rr},${gg},${bb})`;
+   458→          ctx.fillRect(c, r, 1, 1);
+   459→        }
+   460→      }
+   461→    };
+   462→
+   463→    // ---- demo wizard: clock / reward delivery (before brain.step) ----
+   464→    const finishDemo = () => {
+   465→      const d = demoRef.current;
+   466→      d.running = false;
+   467→      // hand the projector back to the user's previous stimulus choice
+   468→      const prev = demoPrevPatternRef.current;
+   469→      if (prev) {
+   470→        patternRef.current = prev;
+   471→        setPattern(prev);
+   472→        demoPrevPatternRef.current = null;
+   473→      }
+   474→      // verdict: first-4 vs last-4 trial averages per stimulus
+   475→      const pts = d.points;
+   476→      const meanIdx = (xs: DemoTrialPoint[]) =>
+   477→        xs.length ? xs.reduce((a, p) => a + p.index, 0) / xs.length : 0;
+   478→      const aPts = pts.filter((p) => p.letter === "A");
+   479→      const bPts = pts.filter((p) => p.letter === "B");
+   480→      setDemoResult({
+   481→        points: pts.slice(),
+   482→        dA: meanIdx(aPts.slice(-4)) - meanIdx(aPts.slice(0, 4)),
+   483→        dB: meanIdx(bPts.slice(-4)) - meanIdx(bPts.slice(0, 4)),
+   484→        gapEarly: meanIdx(aPts.slice(0, 4)) - meanIdx(bPts.slice(0, 4)),
+   485→        gapLate: meanIdx(aPts.slice(-4)) - meanIdx(bPts.slice(-4)),
+   486→        baseline: meanIdx(pts.slice(0, 4)),
+   487→        run: (demoRunsRef.current += 1),
+   488→      });
+   489→      setDemoHud({ status: "done", trial: DEMO_TRIALS, phase: "pause", letter: null, progress: 1 });
+   490→      playSound("milestone", 0.7);
+   491→    };
+   492→
+   493→    const demoPre = (dtSec: number) => {
+   494→      const d = demoRef.current;
+   495→      if (!d.running) return;
+   496→      // the demo clock rides the same pattern-speed slider
+   497→      d.t += dtSec * speedRef.current;
+   498→      const letter: DemoLetter = d.trial % 2 === 0 ? "A" : "B";
+   499→      if (!d.delivered && d.t >= DEMO_REWARD_AT_S && d.t < DEMO_STIM_S) {
+   500→        d.delivered = true;
+   501→        // same mechanism as the Sugar / Shock buttons: pending dopamine
+   502→        pendingDaRef.current = letter === "A" ? 1 : -1;
+   503→        playSound(letter === "A" ? "sugar" : "shock", 0.8);
+   504→      }
+   505→      if (d.t >= DEMO_STIM_S + DEMO_PAUSE_S) {
+   506→        // trial over: freeze the measurement and move on
+   507→        const n = Math.max(1, d.n);
+   508→        d.points.push({
+   509→          trial: d.trial + 1,
+   510→          letter,
+   511→          index: d.apprSum / n,
+   512→          valence: d.valSum / n,
+   513→        });
+   514→        d.trial += 1;
+   515→        d.t = 0;
+   516→        d.delivered = false;
+   517→        d.valSum = 0;
+   518→        d.apprSum = 0;
+   519→        d.n = 0;
+   520→        if (d.trial >= DEMO_TRIALS) finishDemo();
+   521→      }
+   522→    };
+   523→
+   524→    // ---- demo wizard: measurement sampling (after brain.step) ----
+   525→    const demoPost = () => {
+   526→      const d = demoRef.current;
+   527→      if (!d.running) return;
+   528→      if (d.t < DEMO_SAMPLE_FROM_S || d.t >= DEMO_STIM_S) return;
+   529→      let ms = 0;
+   530→      for (let i = 0; i < brain.motorRates.length; i++) ms += brain.motorRates[i];
+   531→      d.apprSum += ms / brain.motorRates.length;
+   532→      let va = 0;
+   533→      for (let i = 0; i < mbonApp.length; i++) va += brain.rates[mbonApp[i]];
+   534→      let vb = 0;
+   535→      for (let i = 0; i < mbonAve.length; i++) vb += brain.rates[mbonAve[i]];
+   536→      d.valSum += va / mbonApp.length - vb / mbonAve.length;
+   537→      d.n++;
+   538→    };
+   539→
+   540→    const tick = (dtSec: number) => {
+   541→      demoPre(dtSec);
+   542→      computeInput(dtSec);
+   543→      const da = pendingDaRef.current;
+   544→      pendingDaRef.current = 0;
+   545→      brain.step(input, da);
+   546→      let sum = 0;
+   547→      for (let i = 0; i < brain.spiked.length; i++) sum += brain.spiked[i];
+   548→      spikeEmaRef.current = spikeEmaRef.current * 0.9 + sum * 0.1;
+   549→      demoPost();
+   550→    };
+   551→
+   552→    const loop = (now: number) => {
+   553→      raf = requestAnimationFrame(loop);
+   554→      const dt = Math.min(120, now - last);
+   555→      last = now;
+   556→      if (runningRef.current) {
+   557→        acc += dt;
+   558→        let guard = 0;
+   559→        while (acc >= STEP_MS && guard < 6) {
+   560→          acc -= STEP_MS;
+   561→          tick(STEP_MS / 1000);
+   562→          guard++;
+   563→        }
+   564→        if (guard >= 6) acc = 0; // don't spiral after a background tab
+   565→        if (now - lastDraw > 33) {
+   566→          lastDraw = now;
+   567→          drawRetina();
+   568→        }
+   569→      }
+   570→      if (now - lastUi > 90) {
+   571→        lastUi = now;
+   572→        setUi({
+   573→          ticks: brain.steps,
+   574→          spikes: Math.round(spikeEmaRef.current * TICK_RATE),
+   575→          da: brain.getDopamine(),
+   576→          rewards: brain.rewards,
+   577→          punishments: brain.punishments,
+   578→        });
+   579→        setMotors(Array.from(brain.motorRates));
+   580→        // demo HUD joins the existing ~11 Hz UI cadence (no extra renders)
+   581→        const d = demoRef.current;
+   582→        if (d.running) {
+   583→          const phase: DemoPhase =
+   584→            d.t >= DEMO_STIM_S
+   585→              ? "pause"
+   586→              : d.t >= DEMO_REWARD_AT_S && d.t < DEMO_REWARD_AT_S + 0.7
+   587→                ? "reward"
+   588→                : "stimulus";
+   589→          const progress = Math.min(
+   590→            1,
+   591→            (d.trial + d.t / (DEMO_STIM_S + DEMO_PAUSE_S)) / DEMO_TRIALS
+   592→          );
+   593→          setDemoHud({
+   594→            status: "running",
+   595→            trial: d.trial,
+   596→            phase,
+   597→            letter: d.trial % 2 === 0 ? "A" : "B",
+   598→            progress,
+   599→          });
+   600→        }
+   601→      }
+   602→    };
+   603→    raf = requestAnimationFrame(loop);
+   604→    drawRetina();
+   605→    return () => cancelAnimationFrame(raf);
+   606→  }, [brain]);
+   607→
+   608→  const da = ui.da;
+   609→
+   610→  // ---- demo result block (memoized: the 11 Hz stat re-renders must not
+   611→  //      churn the recharts tree) ----
+   612→  const demoResultBlock = useMemo(() => {
+   613→    if (!demoResult) return null;
+   614→    const aPts = demoResult.points
+   615→      .filter((p) => p.letter === "A")
+   616→      .map((p) => ({ x: p.trial, y: p.index, valence: p.valence }));
+   617→    const bPts = demoResult.points
+   618→      .filter((p) => p.letter === "B")
+   619→      .map((p) => ({ x: p.trial, y: p.index, valence: p.valence }));
+   620→    const aPhrase =
+   621→      demoResult.dA >= 0
+   622→        ? `A now excites approach (${signed(demoResult.dA)})`
+   623→        : `A now dampens approach (${signed(demoResult.dA)})`;
+   624→    const bPhrase =
+   625→      demoResult.dB <= 0
+   626→        ? `B suppresses it (${signed(demoResult.dB)})`
+   627→        : `B excites it (${signed(demoResult.dB)})`;
+   628→    return (
+   629→      <motion.div
+   630→        key={demoResult.run}
+   631→        initial={{ opacity: 0, y: 6 }}
+   632→        animate={{ opacity: 1, y: 0 }}
+   633→        transition={{ duration: 0.35, ease: "easeOut" }}
+   634→        className="space-y-2.5"
+   635→      >
+   636→        <div
+   637→          className="rounded-lg border border-border/60 bg-[#07060a]/60 p-2"
+   638→          data-testid="demo-chart"
+   639→          role="img"
+   640→          aria-label="Learning index per trial: A trials in emerald, B trials in rose"
+   641→        >
+   642→          <div className="h-[150px] w-full">
+   643→            <ResponsiveContainer width="100%" height="100%">
+   644→              <ScatterChart margin={{ top: 6, right: 6, bottom: 0, left: -22 }}>
+   645→                <CartesianGrid stroke="rgba(255,255,255,0.05)" />
+   646→                <XAxis
+   647→                  type="number"
+   648→                  dataKey="x"
+   649→                  domain={[0.5, DEMO_TRIALS + 0.5]}
+   650→                  allowDecimals={false}
+   651→                  ticks={[1, 4, 8, 12, 16, 20, 24]}
+   652→                  tick={{ fill: "#71717a", fontSize: 10 }}
+   653→                  tickLine={false}
+   654→                  axisLine={{ stroke: "rgba(255,255,255,0.15)" }}
+   655→                  label={{
+   656→                    value: "trial",
+   657→                    position: "insideBottomRight",
+   658→                    offset: -2,
+   659→                    fill: "#71717a",
+   660→                    fontSize: 9,
+   661→                  }}
+   662→                />
+   663→                <YAxis
+   664→                  type="number"
+   665→                  dataKey="y"
+   666→                  domain={[0, "auto"]}
+   667→                  tick={{ fill: "#71717a", fontSize: 10 }}
+   668→                  tickLine={false}
+   669→                  axisLine={{ stroke: "rgba(255,255,255,0.15)" }}
+   670→                  width={38}
+   671→                />
+   672→                <Tooltip
+   673→                  cursor={{ strokeDasharray: "3 3", stroke: "rgba(255,255,255,0.2)" }}
+   674→                  contentStyle={{
+   675→                    background: "#0d0c14",
+   676→                    border: "1px solid rgba(255,255,255,0.12)",
+   677→                    borderRadius: 8,
+   678→                    fontSize: 11,
+   679→                    color: "#e4e4e7",
+   680→                  }}
+   681→                  labelStyle={{ color: "#a1a1aa" }}
+   682→                  itemStyle={{ color: "#e4e4e7" }}
+   683→                />
+   684→                <ReferenceLine
+   685→                  y={demoResult.baseline}
+   686→                  stroke="#fbbf24"
+   687→                  strokeDasharray="4 4"
+   688→                  strokeOpacity={0.45}
+   689→                />
+   690→                <Scatter
+   691→                  name="A (+sugar)"
+   692→                  data={aPts}
+   693→                  fill="#34d399"
+   694→                  fillOpacity={0.95}
+   695→                  line={{ stroke: "#34d399", strokeWidth: 1, strokeOpacity: 0.45 }}
+   696→                  isAnimationActive={false}
+   697→                />
+   698→                <Scatter
+   699→                  name="B (+shock)"
+   700→                  data={bPts}
+   701→                  fill="#fb7185"
+   702→                  fillOpacity={0.95}
+   703→                  line={{ stroke: "#fb7185", strokeWidth: 1, strokeOpacity: 0.45 }}
+   704→                  isAnimationActive={false}
+   705→                />
+   706→              </ScatterChart>
+   707→            </ResponsiveContainer>
+   708→          </div>
+   709→          <div className="flex items-center justify-between px-1 pt-1 text-[10px] text-muted-foreground">
+   710→            <span>
+   711→              <span className="text-emerald-300">●</span> Bar left + sugar
+   712→            </span>
+   713→            <span>
+   714→              <span className="text-amber-300">┄</span> naive baseline
+   715→            </span>
+   716→            <span>
+   717→              <span className="text-rose-300">●</span> Bar right + shock
+   718→            </span>
+   719→          </div>
+   720→        </div>
+   721→        <p className="text-xs leading-relaxed" data-testid="demo-verdict">
+   722→          <span className="font-medium text-foreground">Learned:</span>{" "}
+   723→          <span className="text-emerald-300">{aPhrase}</span>,{" "}
+   724→          <span className="text-rose-300">{bPhrase}</span> — the A−B gap went from{" "}
+   725→          {demoResult.gapEarly.toFixed(2)} to{" "}
+   726→          <span className="text-amber-300">{demoResult.gapLate.toFixed(2)}</span> over 24 trials.
+   727→        </p>
+   728→        <p className="text-[11px] leading-relaxed text-muted-foreground">
+   729→          Run #{demoResult.run} on this brain. Index = mean motor drive (all 4 motors) sampled
+   730→          over the last second of each trial. Run again — weights persist, so learning
+   731→          compounds; <span className="text-foreground/80">Reset brain</span> clears it.
+   732→        </p>
+   733→      </motion.div>
+   734→    );
+   735→  }, [demoResult]);
+   736→
+   737→  const demoRunning = demoHud.status === "running";
+   738→  const phaseDot =
+   739→    demoHud.phase === "pause"
+   740→      ? "bg-muted-foreground/50"
+   741→      : demoHud.phase === "reward"
+   742→        ? demoHud.letter === "A"
+   743→          ? "bg-emerald-400"
+   744→          : "bg-rose-400"
+   745→        : "bg-amber-400";
+   746→
+   747→  return (
+   748→    <div className="space-y-4">
+   749→      {/* ---------- heading ---------- */}
+   750→      <div className="flex flex-wrap items-start justify-between gap-3">
+   751→        <div className="min-w-0">
+   752→          <h2 className="flex items-center gap-2 text-lg font-semibold tracking-tight sm:text-xl">
+   753→            <FlaskConical className="h-5 w-5 text-primary" />
+   754→            Brain Lab
+   755→          </h2>
+   756→          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+   757→            A live {brain ? brain.total : 926}-neuron fruit-fly connectome. Light flows from the
+   758→            retina sheets (front) through the optic lobes into the mushroom bodies (magenta) and
+   759→            out to the motor neurons (rear). Click neurons to inject current; teach the fly with
+   760→            sugar &amp; shock.
+   761→          </p>
+   762→        </div>
+   763→        <div className="flex shrink-0 gap-2">
+   764→          <Button
+   765→            variant="secondary"
+   766→            className="h-11 min-w-28 gap-2"
+   767→            onClick={toggleRunning}
+   768→            data-testid="btn-pause"
+   769→          >
+   770→            {running ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+   771→            {running ? "Pause" : "Play"}
+   772→          </Button>
+   773→          <Button
+   774→            variant="outline"
+   775→            className="h-11 gap-2"
+   776→            onClick={bootBrain}
+   777→            data-testid="btn-reset"
+   778→          >
+   779→            <RotateCcw className="h-4 w-4" />
+   780→            Reset brain
+   781→          </Button>
+   782→        </div>
+   783→      </div>
+   784→
+   785→      <div className="flex flex-col gap-4 lg:flex-row">
+   786→        {/* ---------- main column ---------- */}
+   787→        <div className="min-w-0 flex-1 space-y-4">
+   788→          <BrainVisualizer3D
+   789→            brain={brain}
+   790→            height="clamp(360px, 52vh, 500px)"
+   791→            autoRotate={autoRotate}
+   792→            showSynapses={showSynapses}
+   793→          />
+   794→
+   795→          <Card className="gap-4 rounded-xl p-4">
+   796→            <div className="flex flex-wrap items-center justify-between gap-3">
+   797→              <div className="flex items-center gap-2 text-sm font-medium">
+   798→                <Activity className="h-4 w-4 text-primary" />
+   799→                Neuron activity — every cell, live
+   800→              </div>
+   801→              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
+   802→                <label className="flex cursor-pointer items-center gap-2">
+   803→                  <Switch checked={autoRotate} onCheckedChange={setAutoRotate} />
+   804→                  Auto-rotate
+   805→                </label>
+   806→                <label className="flex cursor-pointer items-center gap-2">
+   807→                  <Switch checked={showSynapses} onCheckedChange={setShowSynapses} />
+   808→                  Synapses
+   809→                </label>
+   810→              </div>
+   811→            </div>
+   812→            <BrainActivityPanel brain={brain} height={148} />
+   813→          </Card>
+   814→        </div>
+   815→
+   816→        {/* ---------- right column ---------- */}
+   817→        <div className="w-full space-y-4 lg:w-80">
+   818→          {/* what the fly sees */}
+   819→          <Card className="gap-4 rounded-xl p-4">
+   820→            <div className="flex items-center gap-2 text-sm font-medium">
+   821→              <Eye className="h-4 w-4 text-primary" />
+   822→              What the fly sees
+   823→            </div>
+   824→            <canvas
+   825→              ref={retCanvasRef}
+   826→              width={RET_COLS}
+   827→              height={RET_ROWS}
+   828→              className="w-full rounded-md border border-border/60 bg-[#07060a] [image-rendering:pixelated]"
+   829→              style={{ aspectRatio: `${RET_COLS} / ${RET_ROWS}` }}
+   830→              role="img"
+   831→              aria-label="Retinal input — 24 by 9 pixel view of the fly's visual world"
+   832→            />
+   833→            <div className="space-y-3">
+   834→              <div className="space-y-1.5">
+   835→                <div className="text-xs text-muted-foreground">Pattern</div>
+   836→                <Select
+   837→                  value={pattern}
+   838→                  onValueChange={onPatternChange}
+   839→                  disabled={demoRunning}
+   840→                >
+   841→                  <SelectTrigger className="h-11 w-full" aria-label="Stimulus pattern">
+   842→                    <SelectValue />
+   843→                  </SelectTrigger>
+   844→                  <SelectContent>
+   845→                    {(Object.keys(PATTERN_LABELS) as Pattern[]).map((p) => (
+   846→                      <SelectItem key={p} value={p} className="py-2">
+   847→                        {PATTERN_LABELS[p]}
+   848→                      </SelectItem>
+   849→                    ))}
+   850→                  </SelectContent>
+   851→                </Select>
+   852→                {demoRunning && (
+   853→                  <p className="text-[10px] leading-snug text-amber-300/80">
+   854→                    The conditioning demo is driving the stimulus — your selection is restored
+   855→                    when it finishes.
+   856→                  </p>
+   857→                )}
+   858→              </div>
+   859→              <div className="space-y-2">
+   860→                <div className="flex items-center justify-between text-xs text-muted-foreground">
+   861→                  <span>Pattern speed</span>
+   862→                  <span className="font-mono text-foreground/80">{speed.toFixed(1)}×</span>
+   863→                </div>
+   864→                <Slider
+   865→                  value={[speed]}
+   866→                  onValueChange={onSpeedChange}
+   867→                  min={0.2}
+   868→                  max={3}
+   869→                  step={0.1}
+   870→                  aria-label="Pattern speed"
+   871→                />
+   872→                <p className="text-[10px] leading-snug text-muted-foreground">
+   873→                  Scales every animation — and fast-forwards the conditioning demo.
+   874→                </p>
+   875→              </div>
+   876→            </div>
+   877→          </Card>
+   878→
+   879→          {/* reward & punishment */}
+   880→          <Card className="gap-4 rounded-xl p-4">
+   881→            <div className="flex items-center justify-between gap-2">
+   882→              <div className="flex items-center gap-2 text-sm font-medium">
+   883→                <Candy className="h-4 w-4 text-primary" />
+   884→                Reward &amp; punishment
+   885→              </div>
+   886→              <Badge variant="outline" className="text-[10px] text-muted-foreground">
+   887→                dopamine-gated
+   888→              </Badge>
+   889→            </div>
+   890→            <div className="grid grid-cols-2 gap-2">
+   891→              <Button
+   892→                className="h-11 gap-1.5 border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25"
+   893→                onClick={giveSugar}
+   894→                data-testid="btn-sugar"
+   895→              >
+   896→                <Candy className="h-4 w-4" />
+   897→                Sugar +1
+   898→              </Button>
+   899→              <Button
+   900→                className="h-11 gap-1.5 border-rose-500/40 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25"
+   901→                onClick={giveShock}
+   902→                data-testid="btn-shock"
+   903→              >
+   904→                <Zap className="h-4 w-4" />
+   905→                Shock −1
+   906→              </Button>
+   907→            </div>
+   908→            {/* dopamine meter */}
+   909→            <div className="space-y-1.5">
+   910→              <div className="flex items-center justify-between text-xs text-muted-foreground">
+   911→                <span>Dopamine tone</span>
+   912→                <span
+   913→                  className={cn(
+   914→                    "font-mono tabular-nums",
+   915→                    da > 0.004 && "text-emerald-300",
+   916→                    da < -0.004 && "text-rose-300",
+   917→                  )}
+   918→                >
+   919→                  {da >= 0 ? "+" : ""}
+   920→                  {da.toFixed(2)}
+   921→                </span>
+   922→              </div>
+   923→              <div className="relative h-3 overflow-hidden rounded-full bg-muted/70">
+   924→                <div className="absolute inset-y-0 left-1/2 w-px bg-foreground/25" />
+   925→                <div
+   926→                  className="absolute inset-y-0 transition-all duration-100 ease-linear"
+   927→                  style={{
+   928→                    left: da >= 0 ? "50%" : `${50 + Math.max(-1, da) * 50}%`,
+   929→                    width: `${Math.min(50, Math.abs(da) * 50)}%`,
+   930→                    background: da >= 0 ? "#34d399" : "#fb7185",
+   931→                  }}
+   932→                />
+   933→              </div>
+   934→            </div>
+   935→            <p className="text-[11px] leading-relaxed text-muted-foreground">
+   936→              Tip: pair <span className="text-emerald-300">sugar</span> with a stimulus and watch
+   937→              the output neurons change — press Sugar just as the bar sweeps past the same spot;
+   938→              after ~10 pairings the motor bars below shift. Pair{" "}
+   939→              <span className="text-rose-300">shock</span> to teach avoidance.
+   940→            </p>
+   941→          </Card>
+   942→
+   943→          {/* classical conditioning demo wizard */}
+   944→          <Card className="gap-4 rounded-xl p-4">
+   945→            <div className="flex items-center justify-between gap-2">
+   946→              <div className="flex items-center gap-2 text-sm font-medium">
+   947→                <GraduationCap className="h-4 w-4 text-primary" />
+   948→                Classical conditioning demo
+   949→              </div>
+   950→              <Badge variant="outline" className="text-[10px] text-muted-foreground">
+   951→                A+ / B− × {DEMO_TRIALS}
+   952→              </Badge>
+   953→            </div>
+   954→            <p className="text-xs leading-relaxed text-muted-foreground">
+   955→              Watch the fly learn to love A and hate B — automatically:{" "}
+   956→              <span className="text-emerald-300">Bar left (A) + sugar</span> vs{" "}
+   957→              <span className="text-rose-300">Bar right (B) + shock</span>, reward landing
+   958→              mid-trial, 24 trials.
+   959→            </p>
+   960→
+   961→            {demoHud.status === "idle" && (
+   962→              <Button
+   963→                className="h-11 gap-2 border-amber-500/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25"
+   964→                onClick={startDemo}
+   965→                data-testid="btn-demo"
+   966→              >
+   967→                <Play className="h-4 w-4" />
+   968→                Run demo ({DEMO_TRIALS} trials)
+   969→              </Button>
+   970→            )}
+   971→
+   972→            {demoRunning && (
+   973→              <div className="space-y-3" data-testid="demo-hud">
+   974→                <div className="flex items-end justify-between gap-3">
+   975→                  <div
+   976→                    className={cn(
+   977→                      "font-mono text-3xl font-bold leading-none tracking-tight",
+   978→                      demoHud.letter === "A" ? "text-emerald-300" : "text-rose-300",
+   979→                    )}
+   980→                    data-testid="demo-letter"
+   981→                  >
+   982→                    {demoHud.letter} {demoHud.letter === "A" ? "+" : "−"}
+   983→                  </div>
+   984→                  <div className="text-right">
+   985→                    <div
+   986→                      className="font-mono text-sm tabular-nums text-foreground"
+   987→                      data-testid="demo-count"
+   988→                    >
+   989→                      {Math.min(demoHud.trial + 1, DEMO_TRIALS)} / {DEMO_TRIALS}
+   990→                    </div>
+   991→                    <div
+   992→                      className="flex items-center justify-end gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground"
+   993→                      data-testid="demo-phase"
+   994→                    >
+   995→                      <span className={cn("h-1.5 w-1.5 rounded-full", phaseDot)} />
+   996→                      {demoHud.phase}
+   997→                    </div>
+   998→                  </div>
+   999→                </div>
+  1000→                <div
+  1001→                  className="h-1.5 overflow-hidden rounded-full bg-muted/70"
+  1002→                  data-testid="demo-progress"
+  1003→                >
+  1004→                  <div
+  1005→                    className="h-full rounded-full bg-gradient-to-r from-emerald-500 via-amber-400 to-rose-400 transition-[width] duration-150 ease-linear"
+  1006→                    style={{ width: `${Math.min(100, demoHud.progress * 100)}%` }}
+  1007→                  />
+  1008→                </div>
+  1009→                <p className="text-[11px] leading-relaxed text-muted-foreground">
+  1010→                  {demoHud.letter === "A"
+  1011→                    ? "Bar left (A) on screen — sugar lands mid-trial."
+  1012→                    : "Bar right (B) on screen — shock lands mid-trial."}{" "}
+  1013→                  Pause also pauses the demo; Reset brain aborts it.
+  1014→                </p>
+  1015→              </div>
+  1016→            )}
+  1017→
+  1018→            {demoHud.status === "done" && (
+  1019→              <>
+  1020→                {demoResultBlock}
+  1021→                <Button
+  1022→                  className="h-11 gap-2 border-amber-500/40 bg-amber-500/15 text-amber-300 hover:bg-amber-500/25"
+  1023→                  onClick={startDemo}
+  1024→                  data-testid="btn-demo-again"
+  1025→                >
+  1026→                  <RotateCcw className="h-4 w-4" />
+  1027→                  Run again (same brain)
+  1028→                </Button>
+  1029→              </>
+  1030→            )}
+  1031→          </Card>
+  1032→
+  1033→          {/* stats + motor output */}
+  1034→          <Card className="gap-4 rounded-xl p-4">
+  1035→            <div className="flex items-center gap-2 text-sm font-medium">
+  1036→              <Activity className="h-4 w-4 text-primary" />
+  1037→              Live stats &amp; motor output
+  1038→            </div>
+  1039→            <div className="grid grid-cols-3 gap-2">
+  1040→              <Stat label="ticks" value={fmtInt(ui.ticks)} />
+  1041→              <Stat label="spikes/s" value={fmtInt(ui.spikes)} />
+  1042→              <Stat
+  1043→                label="dopamine"
+  1044→                value={`${da >= 0 ? "+" : ""}${da.toFixed(2)}`}
+  1045→                tone={da > 0.004 ? "emerald" : da < -0.004 ? "rose" : undefined}
+  1046→              />
+  1047→              <Stat label="sugar Σ" value={fmtInt(ui.rewards)} tone="emerald" />
+  1048→              <Stat label="shock Σ" value={fmtInt(ui.punishments)} tone="rose" />
+  1049→              <Stat label="neurons" value={brain ? `${brain.total}` : "—"} tone="amber" />
+  1050→            </div>
+  1051→            <div className="space-y-2.5">
+  1052→              {motors.map((v, i) => (
+  1053→                <div key={i} className="flex items-center gap-2">
+  1054→                  <span className="w-[84px] shrink-0 text-[11px] text-muted-foreground">
+  1055→                    M{i + 1} · {MOTOR_LABELS[i] ?? "—"}
+  1056→                  </span>
+  1057→                  <div className="h-2.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted/70">
+  1058→                    <div
+  1059→                      className="h-full rounded-full bg-gradient-to-r from-amber-500 to-amber-300 transition-[width] duration-100 ease-linear"
+  1060→                      style={{ width: `${Math.max(1.5, Math.min(100, v * 100))}%` }}
+  1061→                    />
+  1062→                  </div>
+  1063→                  <span className="w-8 shrink-0 text-right font-mono text-[11px] tabular-nums">
+  1064→                    {Math.round(v * 100)}
+  1065→                  </span>
+  1066→                </div>
+  1067→              ))}
+  1068→            </div>
+  1069→            <p className="text-[11px] text-muted-foreground">
+  1070→              Motor output = smoothed firing rates of the 4 motor neurons. In the wild these would
+  1071→              drive jump / duck / turn maneuvers.
+  1072→            </p>
+  1073→          </Card>
+  1074→        </div>
+  1075→      </div>
+  1076→    </div>
+  1077→  );
+  1078→}
+  1079→
