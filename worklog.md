@@ -144,3 +144,38 @@ Work Log:
 Stage Summary:
 - App is feature-complete and browser-verified
 - Remaining: SSH key not yet in /upload (checked multiple times) → GitHub push pending; cron job pending
+
+---
+Task ID: 6
+Agent: main (Z.ai Code)
+Task: Final verification, cron setup, GitHub push preparation
+
+Work Log:
+- Created 15-min webDevReview cron job (job_id 417630) per user requirement
+- Long-run training verified again: dino HI 65 / 12 gens in 60s; bicycle gen 27 best 9m
+- GitHub push pipeline built WITHOUT system ssh (sandbox lacks the ssh binary and sudo):
+  - scripts/ssh-wrapper.ts — git-compatible SSH transport via the pure-JS ssh2 module
+  - scripts/push-github.ts — installs the uploaded key into ~/.ssh and pushes
+  - remote origin already configured: git@github.com:pale-john1960/expert-fruit-fly.git
+- 6 commits ready to push (engine, UIs, docs, push pipeline)
+- THE SSH KEY (upload/zai) HAS NOT ARRIVED YET — the user attached it in chat but the
+  file never landed in /home/z/my-project/upload/. push-github.ts is a safe no-op
+  until it appears.
+
+## ⚠️ FIRST PRIORITY for the next agent (webDevReview cron):
+1. Check if /home/z/my-project/upload/zai now exists → if yes: `bun run scripts/push-github.ts`
+2. If still missing, re-verify app health and continue improving styling/features per the cron instructions
+3. All work must continue to be committed (git add + commit) so the eventual push includes everything
+
+## Project status: COMPLETE & VERIFIED (except GitHub push awaiting key)
+- Brain Lab ✓ 3D connectome, poke, sugar/shock teaching
+- Dino Training ✓ generations, save/load, turbo, charts
+- Bicycle Training ✓ 3D dusk world, physics, evolution
+- Brain Library ✓ full CRUD + import/export + cross-tab load
+- How It Works ✓ plain-language docs
+- Responsive + sticky footer ✓ · lint clean ✓ · dev server healthy ✓
+
+## Known limitations (candidates for future cron rounds):
+- Bicycle balance improves slowly (~9m by gen 27); could tune REWARD_PER_METER or add steering-sensitivity presets
+- Console shows stale pre-fix errors from this dev session history only — current page has no error dialog
+- Could add: sound effects, more stimuli in Brain Lab, brain "family tree" visualization, Pterodactyl duck-training metrics
