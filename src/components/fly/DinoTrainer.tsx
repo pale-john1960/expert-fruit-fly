@@ -97,6 +97,7 @@ import type {
   FlyAvatar,
   World,
 } from "./dino/game";
+import { EvolutionChart } from "./dino/EvolutionChart";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Badge } from "@/components/ui/badge";
@@ -144,16 +145,6 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import {
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -2195,78 +2186,9 @@ export function DinoTrainer() {
         </div>
       </div>
 
-      {/* --- score history chart --- */}
-      <Card className="mt-4">
-        <CardHeader className="pb-2">
-          <CardTitle className="flex items-center gap-2 text-sm">
-            <History className="h-4 w-4 text-emerald-400" aria-hidden />
-            Score by generation
-          </CardTitle>
-          <CardDescription className="text-xs">
-            Best (emerald) and population average (amber) per generation — watch evolution
-            climb.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {history.length === 0 ? (
-            <div className="flex h-[200px] items-center justify-center rounded-lg border border-dashed border-border text-xs text-muted-foreground">
-              No generations finished yet — scores will appear here.
-            </div>
-          ) : (
-            <div className="h-[200px] w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={history} margin={{ top: 8, right: 12, bottom: 0, left: -14 }}>
-                  <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-                  <XAxis
-                    dataKey="gen"
-                    tick={{ fontSize: 10, fill: "#a8a29e" }}
-                    stroke="rgba(255,255,255,0.15)"
-                    tickLine={false}
-                  />
-                  <YAxis
-                    tick={{ fontSize: 10, fill: "#a8a29e" }}
-                    stroke="rgba(255,255,255,0.15)"
-                    tickLine={false}
-                    width={40}
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      background: "#1c1917",
-                      border: "1px solid rgba(255,255,255,0.12)",
-                      borderRadius: 8,
-                      fontSize: 12,
-                      color: "#e7e5e4",
-                    }}
-                    labelStyle={{ color: "#a8a29e" }}
-                    itemStyle={{ color: "#e7e5e4" }}
-                    cursor={{ stroke: "rgba(255,255,255,0.15)" }}
-                  />
-                  <Legend wrapperStyle={{ fontSize: 11 }} />
-                  <Line
-                    type="monotone"
-                    dataKey="best"
-                    name="Best"
-                    stroke="#10b981"
-                    strokeWidth={2}
-                    dot={false}
-                    isAnimationActive={false}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="avg"
-                    name="Average"
-                    stroke="#f59e0b"
-                    strokeWidth={2}
-                    strokeDasharray="4 3"
-                    dot={false}
-                    isAnimationActive={false}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      {/* --- evolution curve — best/avg score telemetry per generation
+            (memoized component: skips the 4Hz identity-only history churn) --- */}
+      <EvolutionChart history={history} bestEver={hud.best} running={running} />
 
       {/* --- champion lineage (family tree) --- */}
       <Card className="mt-4 gap-0 py-0" data-testid="lineage-card">

@@ -160,7 +160,8 @@
 }
 
 /* Ambient lab glow — two ultra-faint fixed radial washes (emerald top-left,
-   amber bottom-right). Background color semantics stay untouched. */
+   amber bottom-right) + a 26px dot-grid, graph-paper texture. Background
+   color semantics stay untouched. */
 body {
   background-image:
     radial-gradient(
@@ -172,14 +173,33 @@ body {
       640px circle at 100% 100%,
       rgba(245, 158, 11, 0.028),
       transparent 60%
-    );
-  background-repeat: no-repeat;
+    ),
+    radial-gradient(rgba(127, 127, 127, 0.05) 1px, transparent 1.3px);
+  background-size: auto, auto, 26px 26px;
+  background-repeat: no-repeat, no-repeat, repeat;
   background-attachment: fixed;
 }
 
 /* Emerald-tinted text selection */
 ::selection {
   background-color: rgba(52, 211, 153, 0.28);
+}
+
+/* Emerald caret in every text field — a tiny lab signature */
+input,
+textarea,
+[contenteditable] {
+  caret-color: #10b981;
+}
+
+/* Tactile press feedback — every enabled button dips 2% while active.
+   Class-level transitions (transition-colors etc.) keep winning where set;
+   this only adds the transform snap. Neutralized under reduced motion. */
+button:not(:disabled):active {
+  transform: scale(0.98);
+}
+button {
+  -webkit-tap-highlight-color: transparent;
 }
 
 /* Tab content entrance — a soft rise+fade as each room's panel mounts
@@ -236,4 +256,8 @@ html {
   html {
     scroll-behavior: auto;
   }
+  button:not(:disabled):active {
+    transform: none;
+  }
 }
+

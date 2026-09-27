@@ -20,6 +20,7 @@ import {
   Download,
   FlaskConical,
   Gamepad2,
+  GitCompareArrows,
   GraduationCap,
   LayoutGrid,
   Loader2,
@@ -67,11 +68,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Toaster } from "@/components/ui/sonner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { playSound } from "@/lib/sound";
 import { useBrainStore } from "@/lib/flybrain/store";
 import type { BrainSnapshot } from "@/lib/flybrain/types";
 import { cn } from "@/lib/utils";
 
+import { BrainDiffDialog } from "./BrainDiffDialog";
 import { BrainReportCard } from "./BrainReportCard";
 
 export type BrainLibraryProps = Record<string, never>;
@@ -215,6 +218,9 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
   const [dragOver, setDragOver] = useState(false);
   /** the brain whose report-card dialog is open (Task 10-b) */
   const [reportRow, setReportRow] = useState<BrainRow | null>(null);
+  /** ordered ids of the brains picked for the genome diff (max 2, Task 11-a) */
+  const [diffIds, setDiffIds] = useState<string[]>([]);
+  const [diffOpen, setDiffOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -240,6 +246,20 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
     void loadList("all");
   }, []);
 
+  // keep the diff selection valid when the list changes (deletes / refresh)
+  useEffect(() => {
+    setDiffIds((ids) => ids.filter((id) => brains.some((b) => b.id === id)));
+  }, [brains]);
+
+  /** toggle a row into the genome-diff selection (max 2, FIFO replacement) */
+  const toggleDiff = useCallback((id: string) => {
+    setDiffIds((prev) => {
+      if (prev.includes(id)) return prev.filter((x) => x !== id);
+      if (prev.length >= 2) return [prev[1], id];
+      return [...prev, id];
+    });
+  }, []);
+
   const handleFilterChange = (task: TaskFilter) => {
     setTaskFilter(task);
     void loadList(task);
@@ -257,6 +277,14 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
   }, [brains, query]);
 
   const totalBytes = useMemo(() => brains.reduce((acc, b) => acc + (b.snapshotBytes ?? 0), 0), [brains]);
+
+  /** the [A, B] pair once exactly two brains are selected for comparison */
+  const diffRows = useMemo(() => {
+    if (diffIds.length !== 2) return null;
+    const a = brains.find((b) => b.id === diffIds[0]);
+    const b = brains.find((b) => b.id === diffIds[1]);
+    return a && b ? ([a, b] as const) : null;
+  }, [diffIds, brains]);
 
   // ----- actions ----------------------------------------------------------
 
@@ -373,6 +401,42 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
   const handleOpenReport = (row: BrainRow) => {
     playSound("click");
     setReportRow(row);
+  };
+
+  // ----- genome diff selection (Task 11-a) ---------------------------------
+
+  /** per-row compare toggle — 44px touch target, aria-pressed, amber when on */
+  const diffToggleButton = (row: BrainRow) => {
+    const selected = diffIds.includes(row.id);
+    const position = selected ? diffIds.indexOf(row.id) : -1;
+    return (
+      <Button
+        variant="outline"
+        size="icon"
+        data-testid="diff-toggle"
+        data-selected={selected}
+        aria-pressed={selected}
+        aria-label={
+          selected
+            ? `Remove ${row.name} from the genome comparison`
+            : `Select ${row.name} for genome comparison`
+        }
+        title={
+          selected
+            ? `In comparison as ${position === 0 ? "A" : "B"} — click to remove`
+            : "Compare genomes"
+        }
+        className={cn(
+          "h-11 w-11 shrink-0 transition-colors",
+          selected
+            ? "border-amber-500/60 bg-amber-500/15 text-amber-500 hover:bg-amber-500/25 hover:text-amber-500 dark:text-amber-400 dark:hover:text-amber-300"
+            : "text-muted-foreground hover:border-amber-500/40 hover:text-amber-500 dark:hover:text-amber-400",
+        )}
+        onClick={() => toggleDiff(row.id)}
+      >
+        <GitCompareArrows className="h-4 w-4" aria-hidden />
+      </Button>
+    );
   };
 
   // ----- render helpers ---------------------------------------------------
@@ -538,6 +602,83 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
             </div>
           </div>
 
+          {/* genome-diff selection bar (Task 11-a) */}
+          {diffIds.length > 0 ? (
+            <div
+              data-testid="diff-select-bar"
+              className="mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/5 px-3 py-2.5"
+            >
+              <GitCompareArrows className="h-4 w-4 shrink-0 text-amber-500 dark:text-amber-400" aria-hidden />
+              <span className="text-xs font-medium text-muted-foreground">Genome diff:</span>
+              {diffIds.map((id, i) => {
+                const row = brains.find((b) => b.id === id);
+                if (!row) return null;
+                return (
+                  <span
+                    key={id}
+                    className={cn(
+                      "inline-flex max-w-[11rem] items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium",
+                      i === 0
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                        : "border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-400",
+                    )}
+                  >
+                    <span aria-hidden>{i === 0 ? "A" : "B"}</span>
+                    <span className="truncate" title={row.name}>
+                      {row.name}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => toggleDiff(id)}
+                      aria-label={`Remove ${row.name} from the comparison`}
+                      className="ml-0.5 rounded-full px-1 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      ×
+                    </button>
+                  </span>
+                );
+              })}
+              {diffIds.length < 2 ? (
+                <span className="text-xs text-muted-foreground" role="status">
+                  pick {2 - diffIds.length} more to diff
+                </span>
+              ) : null}
+              <span className="sr-only" aria-live="polite">
+                {diffIds.length} of 2 brains selected for comparison
+              </span>
+              <div className="ml-auto flex items-center gap-2">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="inline-flex">
+                      <Button
+                        size="sm"
+                        data-testid="diff-open"
+                        className="h-11 gap-1.5 bg-amber-600 px-4 text-white hover:bg-amber-500"
+                        disabled={diffIds.length !== 2}
+                        onClick={() => setDiffOpen(true)}
+                      >
+                        <GitCompareArrows className="h-4 w-4" aria-hidden />
+                        Compare genomes
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    Diff the two selected connectomes — wiring, personality, valence
+                  </TooltipContent>
+                </Tooltip>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-11"
+                  onClick={() => setDiffIds([])}
+                  aria-label="Clear the genome comparison selection"
+                >
+                  Clear
+                </Button>
+              </div>
+            </div>
+          ) : null}
+
           {/* content */}
           <div className="mt-4">
             {error && brains.length === 0 ? (
@@ -616,7 +757,11 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
                   <Table>
                     <TableHeader>
                       <TableRow className="hover:bg-transparent">
-                        <TableHead className="pl-4 text-muted-foreground">Brain</TableHead>
+                        <TableHead className="w-12 pl-4 text-muted-foreground">
+                          <span className="sr-only">Compare genomes</span>
+                          <GitCompareArrows className="h-4 w-4" aria-hidden />
+                        </TableHead>
+                        <TableHead className="text-muted-foreground">Brain</TableHead>
                         <TableHead className="text-muted-foreground">Task</TableHead>
                         <TableHead className="text-muted-foreground">Gen</TableHead>
                         <TableHead className="text-muted-foreground">Score</TableHead>
@@ -630,7 +775,8 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
                     <TableBody>
                       {visible.map((row) => (
                         <TableRow key={row.id} className="group">
-                          <TableCell className="max-w-[220px] py-3 pl-4">
+                          <TableCell className="w-12 py-2.5 pl-4">{diffToggleButton(row)}</TableCell>
+                          <TableCell className="max-w-[220px] py-3">
                             <div className="truncate font-medium">{row.name}</div>
                             {row.note ? (
                               <div className="truncate text-xs text-muted-foreground" title={row.note}>
@@ -687,7 +833,10 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
                             <div className="truncate text-xs text-muted-foreground">{row.note}</div>
                           ) : null}
                         </div>
-                        <TaskBadge task={row.task} />
+                        <div className="flex shrink-0 items-center gap-2">
+                          <TaskBadge task={row.task} />
+                          {diffToggleButton(row)}
+                        </div>
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                         <span className="font-mono">G{row.generation}</span>
@@ -831,6 +980,9 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
           if (!open) setReportRow(null);
         }}
       />
+
+      {/* genome diff — two selected brains (Task 11-a) */}
+      <BrainDiffDialog rows={diffRows} open={diffOpen} onOpenChange={setDiffOpen} />
     </div>
   );
 }

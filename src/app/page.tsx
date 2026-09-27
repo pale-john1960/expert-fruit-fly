@@ -25,6 +25,7 @@ import {
   Bike,
   BookOpen,
   Bug,
+  ChevronUp,
   Gamepad2,
   Github,
   Keyboard,
@@ -242,6 +243,44 @@ const PILL_SPRING = {
 } as const;
 
 /* ------------------------------------------------------------------ */
+/* Floating "back to top" affordance — appears after 700px of scroll,  */
+/* framer-motion entrance, emerald instrument styling                   */
+/* ------------------------------------------------------------------ */
+
+function ScrollTopButton() {
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    const onScroll = () => setShow(window.scrollY > 700);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  return (
+    <AnimatePresence>
+      {show && (
+        <motion.button
+          key="scroll-top"
+          type="button"
+          initial={{ opacity: 0, scale: 0.8, y: 10 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.8, y: 10 }}
+          transition={{ duration: 0.18, ease: "easeOut" }}
+          onClick={() => {
+            window.scrollTo({ top: 0, behavior: "smooth" });
+            playSound("click");
+          }}
+          aria-label="Scroll back to top"
+          title="Back to top"
+          className="fixed bottom-5 right-5 z-30 flex h-11 w-11 items-center justify-center rounded-full border border-emerald-500/30 bg-card/90 text-emerald-500 shadow-lg shadow-black/10 backdrop-blur transition-colors hover:border-emerald-500/60 hover:text-emerald-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <ChevronUp className="h-5 w-5" aria-hidden />
+        </motion.button>
+      )}
+    </AnimatePresence>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -291,8 +330,20 @@ export default function Home() {
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
+      {/* Keyboard-first a11y: skip straight to the room content */}
+      <a
+        href="#main"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-50 focus:rounded-md focus:bg-emerald-600 focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-white focus:shadow-lg"
+      >
+        Skip to main content
+      </a>
       {/* Header */}
       <header className="sticky top-0 z-40 border-b border-border/60 bg-background/80 backdrop-blur-md">
+        {/* amber→emerald hairline along the header's top edge (instrument-panel feel) */}
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-amber-400/60 via-teal-400/25 to-emerald-500/60"
+        />
         {/* faint emerald hairline along the header's bottom edge */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-gradient-to-r from-emerald-500/60 via-emerald-500/10 to-transparent" />
         <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
@@ -477,7 +528,7 @@ export default function Home() {
       </AnimatePresence>
 
       {/* Main */}
-      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6">
+      <main id="main" className="mx-auto w-full max-w-7xl flex-1 px-4 py-6">
         <Tabs value={tab} onValueChange={setTab}>
           <TabsContent value="lab" className="mt-0">
             <BrainLab />
@@ -498,7 +549,12 @@ export default function Home() {
       </main>
 
       {/* Footer */}
-      <footer className="mt-auto border-t border-border/60 bg-muted/30 pb-[env(safe-area-inset-bottom)]">
+      <footer className="relative mt-auto border-t border-border/60 bg-muted/30 pb-[env(safe-area-inset-bottom)]">
+        {/* rose→emerald hairline mirroring the header's top edge */}
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-emerald-500/50 via-transparent to-rose-400/40"
+        />
         <div className="mx-auto grid max-w-7xl gap-8 px-4 py-8 text-xs text-muted-foreground sm:grid-cols-2 md:grid-cols-3">
           {/* Brand */}
           <div className="flex flex-col items-start gap-3">
@@ -572,7 +628,24 @@ export default function Home() {
             </a>
           </div>
         </div>
+        {/* Bottom bar — privacy line + live rev chip */}
+        <div className="border-t border-border/40">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2 px-4 py-3 text-[11px] text-muted-foreground/80">
+            <span>
+              Trains entirely in your browser — nothing leaves this page.
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span
+                aria-hidden="true"
+                className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500/80 motion-safe:animate-pulse"
+              />
+              live · rev 11
+            </span>
+          </div>
+        </div>
       </footer>
+      {/* Floating scroll-to-top (appears past 700px) */}
+      <ScrollTopButton />
       {/* Shortcuts help sheet ("?" or the header keyboard button) */}
       <ShortcutsSheet
         open={shortcutsOpen}

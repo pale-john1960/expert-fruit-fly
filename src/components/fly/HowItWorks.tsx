@@ -19,6 +19,7 @@ import {
   PipelineDiagram,
   REGION_HEX,
 } from "./HowItWorksDiagrams";
+import { DopaminePlayground } from "./DopaminePlayground";
 import {
   Bug,
   Eye,
@@ -186,6 +187,11 @@ export function HowItWorks() {
           connections. When something bad happens (shock — red pulse), it
           weakens them.
         </p>
+        <p className="text-xs text-muted-foreground">
+          Prefer doing to reading? The dopamine playground below hands you the
+          sugar and shock buttons — run the rule on a 6-cell toy brain and
+          watch the wires move.
+        </p>
         <div className="rounded-lg border border-border bg-muted/40 p-4 font-mono text-xs leading-relaxed sm:text-sm">
           Δw = learningRate × <span className="text-emerald-500">dopamine</span> ×
           eligibility
@@ -195,6 +201,7 @@ export function HowItWorks() {
           </div>
         </div>
         <DopamineLoopDiagram />
+        <DopaminePlayground />
         <p>
           This is the same trick the viral fly sims used — a{" "}
           <span className="text-foreground">3-factor learning rule</span>, and

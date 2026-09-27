@@ -110,7 +110,7 @@ export interface FingerprintStats {
  *  are appetitive (+1), the rest aversive (−1) — like real mushroom-body
  *  compartments. kenyonToMbon is MBON-major: [m * kenyonCount + k].
  *  mbonToMotor is motor-major: [motor * mbonCount + m]. */
-function deriveStats(snapshot: BrainSnapshot): FingerprintStats {
+export function deriveStats(snapshot: BrainSnapshot): FingerprintStats {
   const arch = snapshot.arch;
   const mbonCount = arch.mbonCount;
   const appHalf = Math.ceil(mbonCount / 2);
