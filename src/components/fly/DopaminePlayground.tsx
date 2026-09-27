@@ -26,6 +26,10 @@
  * teal, kenyon #e879f9, MBON emerald/rose split), with a scoped `dpg-` style
  * prefix, dark-first but light-mode-safe, and prefers-reduced-motion kills
  * every CSS transition/animation.
+ *
+ * Cross-tab deep link (Task 12-c): the "Run the real experiment" CTA at the
+ * end of the card hands the visitor off to the REAL 928-neuron Brain Lab —
+ * see runRealExperiment below for how the tab switch happens.
  */
 
 import {
@@ -38,6 +42,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
+  ArrowRight,
   Candy,
   FlaskConical,
   Loader2,
@@ -48,6 +53,7 @@ import {
   Zap,
 } from "lucide-react";
 import { playSound } from "@/lib/sound";
+import { useBrainStore } from "@/lib/flybrain/store";
 
 /* ------------------------------------------------------------------ types */
 
@@ -680,6 +686,30 @@ export function DopaminePlayground() {
     setFocus("A");
   }, []);
 
+  /* ------------------------------------------------- cross-tab deep link */
+  /**
+   * "Run the real experiment" — jump straight from this toy to the real
+   * 928-neuron Brain Lab with the 24-trial conditioning wizard armed.
+   *
+   * HOW the tab switch works (page.tsx is lead-owned and not editable this
+   * round, and its tab state is a LOCAL useState): we dispatch a synthetic
+   * keydown for the digit "1" on window. page.tsx's existing window-level
+   * hotkey listener (its PUBLIC 1–5 tab contract, same path a keyboard user
+   * takes) switches to the Brain Lab and plays its own click sound. Radix
+   * Tabs unmounts the inactive content, so BrainLab mounts fresh right after
+   * the switch and consumes the `labIntent` we stored here first.
+   */
+  const runRealExperiment = useCallback(() => {
+    // 1) arm the deep-link intent BEFORE the tab flip so BrainLab's mount
+    //    effect can consume it (order matters — dispatch is synchronous)
+    useBrainStore.getState().requestLabIntent("conditioning");
+    // 2) switch tabs via the app's public "1" hotkey (see comment above)
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+    // 3) our own click feedback (merged with the hotkey's by the sound
+    //    engine's per-name rate limiting)
+    playSound("click");
+  }, []);
+
   /** One-click classic conditioning: A+sugar ×3, then B+shock ×3. */
   const runDemo = useCallback(async () => {
     if (demoRef.current) return;
@@ -1165,6 +1195,27 @@ export function DopaminePlayground() {
               )}
             </div>
           </div>
+        </div>
+
+        {/* cross-tab deep link: hand off from this 6-cell toy to the real
+            928-neuron Brain Lab (see runRealExperiment above) */}
+        <div className="flex flex-col gap-2 border-t border-border/70 pt-4 sm:flex-row sm:items-center sm:gap-3">
+          <Button
+            type="button"
+            variant="outline"
+            className="h-11 w-full gap-2 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 hover:border-emerald-500/70 hover:bg-emerald-500/20 hover:text-emerald-800 focus-visible:border-emerald-500/60 focus-visible:ring-emerald-500/50 dark:border-emerald-500/50 dark:bg-emerald-500/10 dark:text-emerald-300 dark:hover:border-emerald-500/70 dark:hover:bg-emerald-500/20 dark:hover:text-emerald-200 sm:w-auto"
+            onClick={runRealExperiment}
+            aria-label="Run the real conditioning experiment in the Brain Lab — 928 neurons, 24 trials"
+            data-testid="cta-run-real-experiment"
+          >
+            <FlaskConical className="h-4 w-4" aria-hidden="true" />
+            Run the real experiment
+            <ArrowRight className="h-4 w-4" aria-hidden="true" />
+          </Button>
+          <p className="text-[11px] leading-relaxed text-muted-foreground sm:py-1">
+            Same rule, real connectome —{" "}
+            <span className="font-medium text-foreground/80">928 neurons, 24 trials</span>.
+          </p>
         </div>
       </div>
     </div>

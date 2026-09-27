@@ -33,6 +33,13 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { BrainActivityPanel } from "./BrainActivityPanel";
 import {
   BicycleTrainerCore,
@@ -50,6 +57,12 @@ import {
 } from "./bicycle/lineage";
 import { useBrainStore } from "@/lib/flybrain/store";
 import { playSound } from "@/lib/sound";
+import {
+  downloadTextFile,
+  sessionExportFilename,
+  toHistoryCsv,
+  toSessionMarkdown,
+} from "@/lib/session-export";
 import type { BrainSnapshot } from "@/lib/flybrain/types";
 import type { FlyBrain } from "@/lib/flybrain/engine";
 import {
@@ -72,6 +85,8 @@ import {
   X,
   GitBranch,
   ChevronDown,
+  Download,
+  FileText,
 } from "lucide-react";
 import {
   Tooltip as UITooltip,
@@ -765,6 +780,80 @@ export function BicycleTrainer() {
         )}. Bred descendants will grow its family line.`
     : "No champion yet — finish a generation to start the family line.";
 
+  // --- session export (Task 12-b) --------------------------------------------
+  // Pure click-time work: snapshots the CURRENT React state (hud slice +
+  // lineage view + the challenge tally ref) and hands it to the pure helpers
+  // in @/lib/session-export. Never touches the ~6Hz HUD poll or the sim.
+  const exportSession = (kind: "md" | "csv") => {
+    if (history.length === 0) {
+      toast.error("Nothing to export yet", {
+        description: "Finish a generation first — then this session has a story to share.",
+      });
+      return;
+    }
+    if (kind === "csv") {
+      const ok = downloadTextFile(
+        sessionExportFilename("bicycle", "csv"),
+        toHistoryCsv(history),
+        "text/csv"
+      );
+      if (ok) {
+        playSound("ding");
+        toast.success("History CSV downloaded", {
+          description: `${history.length} generations — best/avg metres per generation.`,
+        });
+      } else {
+        toast.error("Download blocked", {
+          description: "The browser refused the file download.",
+        });
+      }
+      return;
+    }
+    const t = tallyRef.current;
+    const challenged = t.wins + t.losses > 0;
+    const lv = lineage.view;
+    const md = toSessionMarkdown({
+      task: "bicycle",
+      history,
+      unit: "m",
+      stats: [
+        { label: "Generation", value: `#${gen}` },
+        { label: "Best ever", value: `${Math.round(bestEver)} m` },
+        { label: "Leader", value: `${Math.round(leaderS)} m` },
+        { label: "Leader speed", value: `${leaderV.toFixed(1)} m/s` },
+        { label: "Population size", value: String(hud?.popSize ?? popQueued) },
+        { label: "Mutation strength", value: mutation.toFixed(2) },
+      ],
+      lineage: lv
+        ? {
+            rootGen: lv.rootGen,
+            rootScore: lv.rootScore,
+            championGen: lv.champion.gen,
+            championScore: lv.champion.score,
+            breedGens: lv.breedGens,
+          }
+        : null,
+      challenge: challenged
+        ? { wins: t.wins, losses: t.losses, bestHuman: t.best }
+        : null,
+    });
+    const ok = downloadTextFile(
+      sessionExportFilename("bicycle", "md"),
+      md,
+      "text/markdown"
+    );
+    if (ok) {
+      playSound("ding");
+      toast.success("Markdown report downloaded", {
+        description: `Generation #${gen} · best ever ${Math.round(bestEver)} m — ready to share.`,
+      });
+    } else {
+      toast.error("Download blocked", {
+        description: "The browser refused the file download.",
+      });
+    }
+  };
+
   return (
     <section className="flex flex-col gap-4">
       <Toaster theme="dark" position="bottom-right" closeButton />
@@ -1414,24 +1503,90 @@ export function BicycleTrainer() {
                   : "Finish a generation to have a champion worth saving."}
               </CardDescription>
             </CardHeader>
-            <CardContent className="flex gap-2">
-              <Input
-                value={brainName}
-                onChange={(e) => setBrainName(e.target.value)}
-                placeholder="Brain name"
-                maxLength={40}
-                className="h-11"
-                aria-label="Name for the saved brain"
-              />
-              <Button
-                onClick={saveBest}
-                disabled={saving || !hud?.hasBest}
-                className="h-11 gap-2 whitespace-nowrap"
-                aria-label="Save best brain to the library"
+            <CardContent className="space-y-2">
+              <div className="flex gap-2">
+                <Input
+                  value={brainName}
+                  onChange={(e) => setBrainName(e.target.value)}
+                  placeholder="Brain name"
+                  maxLength={40}
+                  className="h-11"
+                  aria-label="Name for the saved brain"
+                />
+                <Button
+                  onClick={saveBest}
+                  disabled={saving || !hud?.hasBest}
+                  className="h-11 gap-2 whitespace-nowrap"
+                  aria-label="Save best brain to the library"
+                >
+                  <Save className="h-4 w-4" />
+                  {saving ? "Saving…" : "Save best brain"}
+                </Button>
+              </div>
+
+              {/* --- session export (Task 12-b) — shareable markdown report
+                    or history CSV; disabled until a generation finishes --- */}
+              <DropdownMenu
+                onOpenChange={(open) => {
+                  if (open) playSound("click");
+                }}
               >
-                <Save className="h-4 w-4" />
-                {saving ? "Saving…" : "Save best brain"}
-              </Button>
+                <UITooltip>
+                  <TooltipTrigger asChild>
+                    {/* span wrapper: browsers fire no pointer events on a
+                        disabled <button>, so the "finish a generation first"
+                        tooltip needs a hoverable parent */}
+                    <span className="flex w-full">
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="outline"
+                          className="h-11 w-full gap-2 px-4"
+                          disabled={history.length === 0}
+                          data-testid="bike-export-trigger"
+                          aria-label="Export session"
+                        >
+                          <Download aria-hidden />
+                          <span>Export session</span>
+                          <ChevronDown
+                            className="ml-auto h-4 w-4 opacity-60"
+                            aria-hidden
+                          />
+                        </Button>
+                      </DropdownMenuTrigger>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {history.length > 0
+                      ? "Share this session — markdown report or history CSV"
+                      : "Finish a generation first, then export"}
+                  </TooltipContent>
+                </UITooltip>
+                <DropdownMenuContent align="start" className="w-56">
+                  <DropdownMenuLabel>Export this session</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    className="min-h-11 cursor-pointer"
+                    data-testid="bike-export-md"
+                    onSelect={() => exportSession("md")}
+                  >
+                    <FileText className="h-4 w-4" aria-hidden />
+                    Markdown report
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      .md
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="min-h-11 cursor-pointer"
+                    data-testid="bike-export-csv"
+                    onSelect={() => exportSession("csv")}
+                  >
+                    <Download className="h-4 w-4" aria-hidden />
+                    History CSV
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      .csv
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </CardContent>
           </Card>
         </div>

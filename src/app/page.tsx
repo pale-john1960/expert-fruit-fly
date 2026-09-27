@@ -30,6 +30,7 @@ import {
   Github,
   Keyboard,
   Library,
+  Sparkles,
   Volume2,
   VolumeX,
   X,
@@ -281,6 +282,105 @@ function ScrollTopButton() {
 }
 
 /* ------------------------------------------------------------------ */
+/* "What's new" release notes — compact changelog of recent rounds      */
+/* ------------------------------------------------------------------ */
+
+const RELEASE_NOTES: { rev: string; items: string[] }[] = [
+  {
+    rev: "rev 12",
+    items: [
+      "Learning progress — compare any saved brain against an untrained newborn",
+      "Session export — markdown reports + history CSV in both trainers",
+      "Playground → Brain Lab deep link (run the real experiment)",
+    ],
+  },
+  {
+    rev: "rev 11",
+    items: [
+      "Genome diff — compare two saved brains side-by-side",
+      "Dopamine playground — run the learning rule yourself in the docs",
+      "Dino evolution curve chart + lab-paper styling polish",
+    ],
+  },
+  {
+    rev: "rev 10",
+    items: [
+      "Bicycle champion lineage family tree",
+      "Brain report card with personality fingerprint + PNG export",
+      "Animated science diagrams + keyboard shortcuts sheet",
+    ],
+  },
+  {
+    rev: "rev 9",
+    items: [
+      "You-vs-the-fly duel mode with keyboard controls",
+      "Neuron inspector — click any neuron in the 3D brain",
+      "Bicycle challenge mode + sound volume control",
+    ],
+  },
+];
+
+function WhatsNewButton() {
+  return (
+    <Popover>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label="What's new — recent releases"
+              onClick={() => playSound("click")}
+              className="h-9 w-9 px-0 text-muted-foreground hover:text-amber-400 dark:hover:text-amber-300"
+            >
+              <Sparkles className="h-4 w-4" />
+            </Button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent>What&apos;s new</TooltipContent>
+      </Tooltip>
+      <PopoverContent align="end" className="w-80 p-0">
+        <div className="flex flex-col">
+          <div className="border-b border-border/60 px-4 py-3">
+            <p className="text-sm font-semibold">What&apos;s new</p>
+            <p className="text-xs text-muted-foreground">
+              The lab grows a little every round.
+            </p>
+          </div>
+          <div className="max-h-80 overflow-y-auto px-4 py-3" role="list">
+            {RELEASE_NOTES.map(({ rev, items }) => (
+              <div key={rev} className="mb-4 last:mb-0" role="listitem">
+                <p className="mb-1.5 flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-amber-500 dark:text-amber-400">
+                  <span
+                    aria-hidden="true"
+                    className="inline-block h-1.5 w-1.5 rounded-full bg-amber-400/80"
+                  />
+                  {rev}
+                </p>
+                <ul className="space-y-1.5">
+                  {items.map((item) => (
+                    <li
+                      key={item}
+                      className="flex items-start gap-2 text-xs leading-relaxed text-muted-foreground"
+                    >
+                      <span
+                        aria-hidden="true"
+                        className="mt-1.5 inline-block h-1 w-1 shrink-0 rounded-full bg-emerald-500/70"
+                      />
+                      {item}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -360,6 +460,7 @@ export default function Home() {
             </div>
           </div>
           <div className="ml-auto flex items-center gap-1.5">
+            <WhatsNewButton />
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -639,7 +740,7 @@ export default function Home() {
                 aria-hidden="true"
                 className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500/80 motion-safe:animate-pulse"
               />
-              live · rev 11
+              live · rev 12
             </span>
           </div>
         </div>

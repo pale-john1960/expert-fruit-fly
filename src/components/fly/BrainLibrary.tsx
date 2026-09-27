@@ -29,6 +29,7 @@ import {
   RefreshCw,
   Search,
   Trash2,
+  TrendingUp,
   Upload,
   FileJson,
 } from "lucide-react";
@@ -221,6 +222,8 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
   /** ordered ids of the brains picked for the genome diff (max 2, Task 11-a) */
   const [diffIds, setDiffIds] = useState<string[]>([]);
   const [diffOpen, setDiffOpen] = useState(false);
+  /** the brain whose learning-progress dialog is open (Task 12-a) */
+  const [progressRow, setProgressRow] = useState<BrainRow | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -489,6 +492,13 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
             onSelect={() => void handleExport(row)}
           >
             <Download className="h-4 w-4" /> Export JSON
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className="min-h-11 cursor-pointer"
+            onSelect={() => setProgressRow(row)}
+          >
+            <TrendingUp className="h-4 w-4 text-emerald-500 dark:text-emerald-400" aria-hidden />
+            Progress vs newborn
           </DropdownMenuItem>
           <DropdownMenuItem
             className="min-h-11 cursor-pointer text-rose-400 focus:text-rose-300"
@@ -983,6 +993,19 @@ export function BrainLibrary(_props: BrainLibraryProps = {}) {
 
       {/* genome diff — two selected brains (Task 11-a) */}
       <BrainDiffDialog rows={diffRows} open={diffOpen} onOpenChange={setDiffOpen} />
+
+      {/* learning progress — one trained brain vs a freshly-instantiated
+          untrained newborn (Task 12-a; the dialog plays the click sound on
+          open itself, so the row action stays silent) */}
+      <BrainDiffDialog
+        mode="progress"
+        rows={null}
+        progressRow={progressRow}
+        open={!!progressRow}
+        onOpenChange={(o) => {
+          if (!o) setProgressRow(null);
+        }}
+      />
     </div>
   );
 }

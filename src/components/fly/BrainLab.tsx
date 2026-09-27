@@ -13,6 +13,10 @@
  *   (with sound effects via @/lib/sound)
  * - Classical-conditioning demo wizard: 24 automatic A+/B− trials driven
  *   from the SAME rAF tick loop, with a per-trial learning index chart
+ * - cross-tab deep link (Task 12-c): consumes a one-shot `labIntent` from
+ *   the shared brain store on mount (armed by the Dopamine Playground's
+ *   "Run the real experiment" CTA in the How It Works tab) and auto-arms
+ *   the conditioning wizard + shows a dismissible landing hint
  * - stats row (ticks, spikes/s, dopamine, rewards/punishments) + motor bars
  * - click neurons in the 3D view to poke + inspect them — the Neuron
  *   inspector card shows identity, live activity and the strongest
@@ -37,6 +41,7 @@ import { BrainVisualizer3D, REGION_META } from "./BrainVisualizer3D";
 import { BrainActivityPanel } from "./BrainActivityPanel";
 import { FlyBrain } from "@/lib/flybrain/engine";
 import { DEFAULT_ARCH_LAB, type BrainRegion } from "@/lib/flybrain/types";
+import { useBrainStore } from "@/lib/flybrain/store";
 import { playSound } from "@/lib/sound";
 import { cn } from "@/lib/utils";
 import {
@@ -535,6 +540,13 @@ export function BrainLab(_props: BrainLabProps = {}) {
   /** transient inline feedback for the demo export buttons ("Saved ✓") */
   const [demoExported, setDemoExported] = useState<null | "png" | "json">(null);
 
+  // ---- cross-tab deep link (Dopamine Playground "Run the real experiment")
+  //      — landing hint state + the store's take-and-clear intent action ----
+  const [deepLinkHint, setDeepLinkHint] = useState(false);
+  const deepLinkHintRef = useRef<HTMLDivElement | null>(null);
+  /** stable zustand action; consuming clears the intent (one-shot) */
+  const consumeLabIntent = useBrainStore((s) => s.consumeLabIntent);
+
   // ---- demo exports: chart PNG (SVG → canvas raster) + results JSON -------
   const exportDemoPng = useCallback(() => {
     const holder = document.querySelector('[data-testid="demo-chart"]');
@@ -713,6 +725,50 @@ export function BrainLab(_props: BrainLabProps = {}) {
     setUi({ ticks: 0, spikes: 0, da: 0, rewards: 0, punishments: 0 });
     setMotors(new Array(b.sizes.motor).fill(0));
   }, [abortDemo]);
+
+  // ---- cross-tab deep link: consume the playground's intent (Task 12-c) ----
+  // The Dopamine Playground's "Run the real experiment" CTA (How It Works
+  // tab) stores `labIntent` in the shared brain store and flips the app to
+  // this tab via the app's public "1" hotkey. Radix Tabs unmounts inactive
+  // content, so this component mounts fresh right after the switch: consume
+  // the ONE-SHOT intent here and auto-arm the wizard by calling its REAL
+  // open handler (startDemo — no duplicated arming logic; it also un-pauses
+  // the sim if paused). The arming setState calls are deferred to a
+  // microtask (still before the first paint, so the visitor never sees the
+  // idle wizard) because react-hooks/set-state-in-effect forbids
+  // synchronous setState in an effect body. Consuming clears the intent, so
+  // a manual tab switch without a pending CTA click arms nothing; the
+  // microtask runs exactly once even under StrictMode's double-mount.
+  useEffect(() => {
+    const intent = consumeLabIntent();
+    if (intent !== "conditioning") return;
+    queueMicrotask(() => {
+      startDemo();
+      setDeepLinkHint(true);
+    });
+  }, [consumeLabIntent, startDemo]);
+
+  // Hint lifecycle: land the chip in view (below the sticky header) and
+  // auto-dismiss after ~6 s. Keyed on deepLinkHint so the timeout restarts
+  // cleanly (StrictMode dev double-mount included) and never leaks. Static
+  // styling only — nothing animates, so prefers-reduced-motion is respected
+  // except the scroll itself, which degrades to an instant jump.
+  useEffect(() => {
+    if (!deepLinkHint) return;
+    const reduced =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    deepLinkHintRef.current?.scrollIntoView({
+      behavior: reduced ? "auto" : "smooth",
+      block: "start",
+    });
+    const t = window.setTimeout(() => setDeepLinkHint(false), 6000);
+    return () => window.clearTimeout(t);
+  }, [deepLinkHint]);
+
+  const dismissDeepLinkHint = useCallback(() => {
+    setDeepLinkHint(false);
+  }, []);
 
   // ---- controls ----
   const toggleRunning = useCallback(() => {
@@ -1269,6 +1325,36 @@ export function BrainLab(_props: BrainLabProps = {}) {
           </Button>
         </div>
       </div>
+
+      {/* cross-tab deep-link landing hint (set once when the playground's
+          "Run the real experiment" CTA armed the wizard; auto-dismisses) */}
+      {deepLinkHint && (
+        <div
+          ref={deepLinkHintRef}
+          data-testid="deeplink-hint"
+          className="flex scroll-mt-32 items-center justify-between gap-3 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2.5"
+        >
+          <p
+            role="status"
+            className="flex min-w-0 items-start gap-2 text-xs leading-relaxed text-emerald-700 dark:text-emerald-300"
+          >
+            <GraduationCap className="mt-px h-4 w-4 shrink-0" aria-hidden="true" />
+            <span>
+              Continuing from the playground — the real 928-neuron conditioning
+              demo is armed and running in the{" "}
+              <span className="font-medium">Classical conditioning demo</span> card below.
+            </span>
+          </p>
+          <button
+            type="button"
+            onClick={dismissDeepLinkHint}
+            aria-label="Dismiss hint"
+            className="mt-px flex h-7 w-7 shrink-0 items-center justify-center rounded-md opacity-60 transition-opacity hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            <X className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        </div>
+      )}
 
       <div className="flex flex-col gap-4 lg:flex-row">
         {/* ---------- main column ---------- */}

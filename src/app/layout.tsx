@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
@@ -27,7 +27,7 @@ export const metadata: Metadata = {
   ],
   authors: [{ name: "pale-john1960" }],
   icons: {
-    icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",
+    icon: [{ url: "/fly-icon.svg", type: "image/svg+xml" }],
   },
   openGraph: {
     title: "Expert Fruit Fly",
@@ -36,6 +36,14 @@ export const metadata: Metadata = {
     siteName: "Expert Fruit Fly",
     type: "website",
   },
+};
+
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: dark)", color: "#141518" },
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+  ],
+  colorScheme: "dark light",
 };
 
 export default function RootLayout({

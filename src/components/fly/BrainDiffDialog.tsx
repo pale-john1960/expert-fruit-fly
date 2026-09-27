@@ -1,9 +1,10 @@
 "use client";
 
 /**
- * BrainDiffDialog — "Genome diff" compare dialog for the Brain Library.
- * Opened from the library's compare bar once the user has toggled exactly
- * two brains for comparison:
+ * BrainDiffDialog — the Brain Library's compare dialog, in two flavors:
+ *
+ *   pair (Task 11-a) — opened from the compare bar once the user has toggled
+ *   exactly two brains; the classic A-vs-B genome diff:
  *
  *   1. Header strip      — A name · TaskBadge ⇄ TaskBadge · B name
  *   2. Identity          — compact side-by-side panels (name, task, gen,
@@ -22,6 +23,12 @@
  *   6. Export actions    — "Copy diff" (clipboard + .txt fallback) and
  *                          "Download PNG" (SVG → 2× canvas raster), with
  *                          2-second "Copied ✓" / "Saved ✓" feedback chips
+ *
+ * progress (Task 12-a) — "Learning progress vs newborn": one trained brain
+ * vs a freshly-instantiated UNTRAINED FlyBrain (fixed seed 7) that shares its
+ * architecture. Same aligned strips, re-framed for the story "what training
+ * wrote": B row = newborn baseline, Δ row = the learning signature, plus a
+ * Σ|Δ| total-drift headline rendered INSIDE the SVG so the PNG carries it.
  *
  * The per-brain fingerprint math is the report card's exported
  * deriveStats() — never duplicated here.
@@ -49,6 +56,7 @@ import {
   Sparkles,
   StickyNote,
   Trophy,
+  TrendingUp,
   Zap,
 } from "lucide-react";
 
@@ -63,7 +71,11 @@ import {
 } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
 import { playSound } from "@/lib/sound";
-import type { BrainSnapshot } from "@/lib/flybrain/types";
+// client-side engine import is side-effect free (DinoTrainer does the same);
+// we only ever CONSTRUCT an untrained newborn from it — the engine itself
+// stays locked and untouched
+import { FlyBrain } from "@/lib/flybrain/engine";
+import type { BrainArchitecture, BrainSnapshot } from "@/lib/flybrain/types";
 import { cn } from "@/lib/utils";
 
 // Shared with (and exported by) BrainLibrary — the documented safe module
@@ -81,8 +93,12 @@ import {
 import { deriveStats, type FingerprintStats } from "./BrainReportCard";
 
 export interface BrainDiffDialogProps {
-  /** [A, B] — the two brains to compare, or null while incomplete. */
+  /** pair mode: [A, B] — the two brains to compare, or null while incomplete. */
   rows: readonly [BrainRow, BrainRow] | null;
+  /** progress mode: the single trained brain to measure against a newborn. */
+  progressRow?: BrainRow | null;
+  /** which story the dialog tells — "pair" (default) keeps Task 11-a behavior. */
+  mode?: "pair" | "progress";
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }
@@ -104,6 +120,18 @@ const UNWRITTEN_EDGE = "#3f3f46";
 
 const SVG_W = 560;
 const SVG_H = 212;
+
+// --- "learning progress vs newborn" (Task 12-a) ---------------------------
+// The baseline is a freshly-instantiated UNTRAINED FlyBrain sharing the
+// trained brain's architecture, with a FIXED seed so every newborn is
+// byte-identical and reproducible (the UI says "untrained, seeded").
+const NEWBORN_SEED = 7;
+const NEWBORN_ID = "__newborn__";
+const NEWBORN_NAME = "Newborn fly";
+/** extra SVG band (px) carrying the drift headline inside the exportable panel */
+const PROGRESS_BAND_H = 30;
+/** a newborn's compartment leans sit within ±0.01 of zero — beyond is learned */
+const REWRITE_EPS = 0.01;
 
 // ---------------------------------------------------------------------------
 // tiny formatting helpers
@@ -241,6 +269,173 @@ function buildVerdict(
 }
 
 // ---------------------------------------------------------------------------
+// "learning progress vs newborn" (Task 12-a) — helpers
+// ---------------------------------------------------------------------------
+
+/** library-row-shaped stand-in for the newborn so every existing pair-mode
+ *  surface (identity panel, header strip, sticky rows) renders unchanged */
+function makeNewbornRow(trained: BrainRow): BrainRow {
+  return {
+    id: NEWBORN_ID,
+    name: NEWBORN_NAME,
+    task: trained.task,
+    generation: 0,
+    score: 0,
+    note: "untrained connectome — seeded baseline",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    snapshotBytes: 0,
+  };
+}
+
+/** deterministic snapshot of a freshly-instantiated UNTRAINED fly that shares
+ *  the trained brain's architecture (motor layout included). Only the seed
+ *  differs, so every newborn is identical and reproducible for a given task. */
+function newbornSnapshot(arch: BrainArchitecture, task: string): BrainSnapshot {
+  return new FlyBrain({ ...arch, seed: NEWBORN_SEED }).toJSON(task, NEWBORN_NAME, 0, 0);
+}
+
+export interface LearningProgress {
+  n: number;
+  deltas: number[];
+  /** Σ|Δ| across compartments — the total-drift headline */
+  totalDrift: number;
+  /** compartment index with the biggest |Δ| (−1 when identical) */
+  heaviest: number;
+  heaviestDelta: number;
+  /** channels moved beyond the newborn's ±0.01 noise floor */
+  rewritten: number;
+  /** channels whose lean sign flipped vs birth (both above noise) */
+  flips: number;
+  /** trained balance − newborn balance */
+  valenceShift: number;
+}
+
+function deriveProgress(sa: FingerprintStats, sb: FingerprintStats): LearningProgress {
+  const n = Math.min(sa.leans.length, sb.leans.length);
+  const deltas = sa.leans.slice(0, n).map((v, i) => v - (sb.leans[i] ?? 0));
+  const totalDrift = deltas.reduce((s, d) => s + Math.abs(d), 0);
+  let heaviest = -1;
+  let heaviestDelta = 0;
+  for (let i = 0; i < n; i++) {
+    if (Math.abs(deltas[i]) > Math.abs(heaviestDelta)) {
+      heaviestDelta = deltas[i];
+      heaviest = i;
+    }
+  }
+  let rewritten = 0;
+  let flips = 0;
+  for (let i = 0; i < n; i++) {
+    const a = sa.leans[i] ?? 0;
+    const b = sb.leans[i] ?? 0;
+    if (Math.abs(deltas[i]) > REWRITE_EPS) rewritten++;
+    if (Math.abs(a) > REWRITE_EPS && Math.abs(b) > REWRITE_EPS && a >= 0 !== b >= 0) flips++;
+  }
+  return {
+    n,
+    deltas,
+    totalDrift,
+    heaviest,
+    heaviestDelta,
+    rewritten,
+    flips,
+    valenceShift: sa.balance - sb.balance,
+  };
+}
+
+/** how the brain got trained, for prose: generations if it evolved, raw
+ *  brain-steps otherwise (a lab fly can be gen 0 but deeply trained) */
+function trainingPhrase(row: BrainRow, snap: BrainSnapshot): string {
+  if (row.generation > 0) {
+    return `${row.generation} generation${row.generation === 1 ? "" : "s"} of ${row.task} training`;
+  }
+  const steps = snap.meta?.steps ?? 0;
+  return steps > 0 ? `${nums(steps)} brain-steps of ${row.task} training` : "the training it has had so far";
+}
+
+/** the drift headline sentence: Σ|Δ| in plain language */
+function buildDriftHeadline(row: BrainRow, snap: BrainSnapshot, p: LearningProgress): string {
+  if (p.totalDrift < UNWRITTEN_EPS) {
+    return "training has left no measurable mark — this connectome is still newborn-flat";
+  }
+  return `${trainingPhrase(row, snap)} rewrote ${p.totalDrift.toFixed(3)} of synaptic lean — heaviest in M${
+    p.heaviest + 1
+  }`;
+}
+
+/** progress-mode replacement for biggestGap: describes the compartment
+ *  training moved the most (annotated under the Δ strip, amber ring on it) */
+function heaviestLearning(
+  sa: FingerprintStats,
+  sb: FingerprintStats,
+  p: LearningProgress,
+): GenomeGap | null {
+  if (p.heaviest < 0 || Math.abs(p.heaviestDelta) < UNWRITTEN_EPS) return null;
+  const idx = p.heaviest;
+  const label = `M${idx + 1}`;
+  const a = sa.leans[idx] ?? 0;
+  const b = sb.leans[idx] ?? 0;
+  const side = (sa.valences[idx] ?? 1) > 0 ? "reward-side" : "punishment-side";
+  if (Math.abs(a) < UNWRITTEN_EPS) {
+    return {
+      index: idx,
+      label,
+      text: `${label} — training quieted this ${side} channel back to noise (${fmtLean(b)} at birth)`,
+    };
+  }
+  if (Math.abs(b) < UNWRITTEN_EPS) {
+    return {
+      index: idx,
+      label,
+      text: `${label} — written from near-zero into a ${a >= 0 ? "reward" : "punishment"}-shaped channel (${fmtLean(a)})`,
+    };
+  }
+  if (a >= 0 === b >= 0) {
+    return {
+      index: idx,
+      label,
+      text: `${label} — training ${p.heaviestDelta >= 0 ? "strengthened" : "dampened"} this ${side} channel ${fmtLean(
+        b,
+      )} → ${fmtLean(a)}`,
+    };
+  }
+  return {
+    index: idx,
+    label,
+    text: `${label} — training flipped it from ${b >= 0 ? "reward" : "punishment"}- to ${
+      a >= 0 ? "reward" : "punishment"
+    }-shaped (${fmtLean(b)} → ${fmtLean(a)})`,
+  };
+}
+
+function buildProgressVerdict(
+  row: BrainRow,
+  snapA: BrainSnapshot,
+  sa: FingerprintStats,
+  sb: FingerprintStats,
+  p: LearningProgress,
+): string {
+  if (p.totalDrift < UNWRITTEN_EPS) {
+    return `“${row.name}” is still interchangeable with a newborn — nothing it has lived through has written a measurable trace into its memory channels yet.`;
+  }
+  const became =
+    sa.balance > 0.05
+      ? "a reward-shaped, approach-leaning fly"
+      : sa.balance < -0.05
+        ? "a punishment-shaped, avoidance-leaning fly"
+        : "a fly that weighs reward and punishment almost equally";
+  const valenceBit =
+    Math.abs(p.valenceShift) <= 0.01
+      ? "its valence balance stayed where it was born"
+      : `its valence balance moved ${fmtLean(sb.balance)} → ${fmtLean(sa.balance)}`;
+  return `“${row.name}” was born a flat newborn connectome; ${trainingPhrase(row, snapA)} rewrote ${p.totalDrift.toFixed(
+    3,
+  )} of synaptic lean and taught it to become ${became}. Training writes loudest in M${p.heaviest + 1} (${
+    p.heaviestDelta >= 0 ? "strengthened" : "weakened"
+  } ${fmtLean(p.heaviestDelta)}), and ${valenceBit}.`;
+}
+
+// ---------------------------------------------------------------------------
 // plain-text diff (clipboard / fallback download)
 // ---------------------------------------------------------------------------
 
@@ -303,6 +498,90 @@ function buildDiffText(
   return L.join("\n");
 }
 
+/** progress mode's clipboard text — "learning progress of '<name>' vs
+ *  untrained newborn" with the drift headline, per-channel table and verdict */
+function buildProgressText(
+  row: BrainRow,
+  snapA: BrainSnapshot,
+  sa: FingerprintStats,
+  sb: FingerprintStats,
+  p: LearningProgress,
+  headline: string,
+  verdict: string,
+): string {
+  const n = p.n;
+  const L: string[] = [];
+  L.push("EXPERT FRUIT FLY — LEARNING PROGRESS");
+  L.push("=".repeat(40));
+  L.push("");
+  L.push(`Learning progress of “${row.name}” vs untrained newborn (fixed seed ${NEWBORN_SEED})`);
+  L.push("");
+  L.push("IDENTITY");
+  L.push(
+    `  Trained   ${row.name} — ${row.task} · gen ${row.generation} · ${formatScore(
+      row.task,
+      row.score,
+    )} · ${formatBytes(row.snapshotBytes)} · ${relativeDate(row.createdAt)}`,
+  );
+  if (row.note) L.push(`     note: ${row.note}`);
+  L.push(`  Newborn   ${NEWBORN_NAME} — same architecture, zero training · seeded baseline (seed ${NEWBORN_SEED})`);
+  L.push("");
+  L.push("TOTAL DRIFT");
+  L.push(`  Σ|Δ| across ${n} memory channels = ${p.totalDrift.toFixed(3)}`);
+  L.push(`  ${headline}.`);
+  L.push("");
+  L.push("LEARNED WRITES BY MEMORY CHANNEL (mean Kenyon→MBON × valence)");
+  L.push("  Channel        TRAINED    NEWBORN    Δ (learned)");
+  for (let i = 0; i < n; i++) {
+    const a = sa.leans[i];
+    const b = sb.leans[i];
+    const d = a - b;
+    L.push(
+      `  M${String(i + 1).padEnd(11)} ${(a >= 0 ? "+" : "-") + Math.abs(a).toFixed(3).padStart(6)}  ${
+        (b >= 0 ? "+" : "-") + Math.abs(b).toFixed(3).padStart(6)
+      }  ${(d >= 0 ? "+" : "-") + Math.abs(d).toFixed(3).padStart(6)}`,
+    );
+  }
+  if (p.heaviest >= 0) {
+    L.push(
+      `  Heaviest   M${p.heaviest + 1} — Δ ${fmtLean(p.heaviestDelta)} (${
+        p.heaviestDelta >= 0 ? "strengthened" : "weakened"
+      } by training)`,
+    );
+  }
+  L.push("");
+  L.push("WIRING");
+  L.push(
+    `  Trained   ${nums(sa.total)} total — plastic ${nums(sa.plastic)} (K→M ${nums(sa.kmCount)} · M→motor ${nums(
+      sa.mmCount,
+    )} · giant-fiber ${nums(sa.gfCount)} · biases ${nums(sa.biasCount)}) / innate ${nums(sa.innate)}`,
+  );
+  L.push(`  Newborn   ${nums(sb.total)} total — identical budget: same architecture, seed ${NEWBORN_SEED}`);
+  L.push(
+    `  Training  ${nums(snapA.meta?.steps ?? 0)} steps · ${snapA.meta?.rewards ?? 0} rewards / ${
+      snapA.meta?.punishments ?? 0
+    } punishments (trained brain only)`,
+  );
+  L.push("");
+  L.push("VALENCE");
+  L.push(
+    `  Trained   balance ${fmtLean(sa.balance)} — reward mass ${sa.rewardMass.toFixed(3)} vs punishment ${sa.punishMass.toFixed(3)}`,
+  );
+  L.push(`  Newborn   balance ${fmtLean(sb.balance)} — near zero at birth`);
+  const shift = p.valenceShift;
+  L.push(
+    Math.abs(shift) <= 0.01
+      ? "     → valence balance unchanged from birth"
+      : `     → training pushed the balance ${fmtLean(shift)} toward ${shift > 0 ? "reward" : "punishment"}`,
+  );
+  L.push("");
+  L.push("VERDICT");
+  L.push(`  ${verdict}`);
+  L.push("");
+  L.push(`— Expert Fruit Fly learning progress · generated ${new Date().toISOString()}`);
+  return L.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // aligned fingerprint SVG — strips for A, B and Δ over a shared M axis
 // ---------------------------------------------------------------------------
@@ -313,13 +592,19 @@ function DiffFingerprintChart({
   sa,
   sb,
   gap,
+  mode = "pair",
+  drift,
 }: {
   nameA: string;
   nameB: string;
   sa: FingerprintStats;
   sb: FingerprintStats;
   gap: GenomeGap | null;
+  mode?: "pair" | "progress";
+  /** progress mode: { Σ|Δ|, headline tail } rendered in the exportable band */
+  drift?: { total: number; tail: string } | null;
 }) {
+  const isProgress = mode === "progress";
   const n = Math.min(sa.leans.length, sb.leans.length);
   const appHalf = Math.ceil(n / 2);
   // ONE shared normalization scale across both brains, so cell intensities
@@ -327,6 +612,23 @@ function DiffFingerprintChart({
   const maxAbs = Math.max(UNWRITTEN_EPS, ...sa.leans.map(Math.abs), ...sb.leans.map(Math.abs));
   const deltas = sa.leans.slice(0, n).map((v, i) => v - (sb.leans[i] ?? 0));
   const maxDelta = Math.max(UNWRITTEN_EPS, ...deltas.map(Math.abs));
+
+  // progress mode grows the panel by a headline band; the whole pair-mode
+  // body is wrapped in a <g translate> so nothing else moves (pair mode
+  // renders byte-identically, and the PNG carries the drift headline)
+  const oy = isProgress ? PROGRESS_BAND_H : 0;
+  const H = SVG_H + oy;
+  // strip voice: tooltips and gutters switch from A/B to trained/newborn
+  const chipA = isProgress ? "Trained" : "A";
+  const chipB = isProgress ? "Newborn" : "B";
+  const deltaWord = (d: number) =>
+    isProgress
+      ? d >= 0
+        ? "strengthened by training"
+        : "weakened by training"
+      : d >= 0
+        ? "A stronger"
+        : "B stronger";
 
   // geometry — shared by all three strips so columns align exactly
   const x0 = 118;
@@ -343,14 +645,37 @@ function DiffFingerprintChart({
 
   return (
     <svg
-      viewBox={`0 0 ${SVG_W} ${SVG_H}`}
+      viewBox={`0 0 ${SVG_W} ${H}`}
       className="h-auto w-full"
       role="img"
-      aria-label={`Genome diff fingerprint: rows A (${nameA}) and B (${nameB}) show each memory channel's learned lean — green is reward-shaped, red punishment-shaped. The third row is the per-channel difference: green means A is stronger, red means B is stronger.`}
+      aria-label={
+        isProgress
+          ? `Learning signature: row A (${nameA}) is the trained brain, row B (${nameB}) an untrained newborn baseline. Green cells are reward-shaped memory channels, red punishment-shaped. The difference row shows what training wrote: green means training strengthened that channel, red means it weakened it.`
+          : `Genome diff fingerprint: rows A (${nameA}) and B (${nameB}) show each memory channel's learned lean — green is reward-shaped, red punishment-shaped. The third row is the per-channel difference: green means A is stronger, red means B is stronger.`
+      }
       fontFamily="system-ui, -apple-system, 'Segoe UI', sans-serif"
     >
       {/* panel */}
-      <rect x={0} y={0} width={SVG_W} height={SVG_H} rx={10} fill={INK} />
+      <rect x={0} y={0} width={SVG_W} height={H} rx={10} fill={INK} />
+
+      {/* progress mode: drift headline band — inside the SVG so the PNG
+          export carries the headline */}
+      {isProgress && drift ? (
+        <g>
+          <rect x={3} y={3} width={SVG_W - 6} height={oy - 7} rx={7} fill={EM} opacity={0.07} />
+          <text x={10} y={13} fontSize={7.5} fontWeight={700} letterSpacing={0.8} fill={TEXT_DIM}>
+            TOTAL DRIFT — WHAT TRAINING WROTE
+          </text>
+          <text x={10} y={25.5} fontSize={10.5} fill="#d4d4d8">
+            <tspan fontWeight={700} fill={AMBER}>
+              Σ|Δ| = {drift.total.toFixed(3)}
+            </tspan>
+            <tspan fill={TEXT_MUT}>{` · ${drift.tail}`}</tspan>
+          </text>
+        </g>
+      ) : null}
+
+      <g transform={isProgress ? `translate(0, ${oy})` : undefined}>
 
       {/* compartment group headers + washes (reward-side left, punishment-side right) */}
       <text x={x0 + (appHalf * step - cellGap) / 2} y={15} textAnchor="middle" fontSize={9} fontWeight={600} letterSpacing={0.6} fill={EM_SOFT} opacity={0.9}>
@@ -375,7 +700,7 @@ function DiffFingerprintChart({
         Δ
       </text>
       <text x={21} y={rowD_Y + 14.5} fontSize={8.5} fill={TEXT_MUT}>
-        A − B
+        {isProgress ? "trained − newborn" : "A − B"}
       </text>
 
       {/* ---- row A strip ---- */}
@@ -395,7 +720,7 @@ function DiffFingerprintChart({
             stroke={unwritten ? UNWRITTEN_EDGE : "none"}
             strokeWidth={unwritten ? 0.75 : 0}
           >
-            <title>{`A · M${i + 1} — ${
+            <title>{`${chipA} · M${i + 1} — ${
               unwritten ? "unwritten (no learned lean)" : `lean ${fmtLean(lean)} (${lean >= 0 ? "reward" : "punishment"}-shaped)`
             }`}</title>
           </rect>
@@ -419,7 +744,7 @@ function DiffFingerprintChart({
             stroke={unwritten ? UNWRITTEN_EDGE : "none"}
             strokeWidth={unwritten ? 0.75 : 0}
           >
-            <title>{`B · M${i + 1} — ${
+            <title>{`${chipB} · M${i + 1} — ${
               unwritten ? "unwritten (no learned lean)" : `lean ${fmtLean(lean)} (${lean >= 0 ? "reward" : "punishment"}-shaped)`
             }`}</title>
           </rect>
@@ -445,8 +770,8 @@ function DiffFingerprintChart({
               strokeWidth={unwritten ? 0.75 : 0}
             >
               <title>{`Δ M${i + 1} — ${fmtDelta2(d)} ${
-                unwritten ? "(identical leans)" : d >= 0 ? "(A stronger)" : "(B stronger)"
-              } · A ${fmtLean(sa.leans[i] ?? 0)} vs B ${fmtLean(sb.leans[i] ?? 0)}`}</title>
+                unwritten ? "(identical leans)" : `(${deltaWord(d)})`
+              } · ${chipA} ${fmtLean(sa.leans[i] ?? 0)} vs ${chipB} ${fmtLean(sb.leans[i] ?? 0)}`}</title>
             </rect>
             {isGap ? (
               <rect
@@ -489,21 +814,28 @@ function DiffFingerprintChart({
       </text>
       <rect x={268} y={156} width={8} height={8} rx={2} fill={EM} />
       <text x={280} y={163.5} fontSize={8.5} fill={TEXT_MUT}>
-        Δ row: A stronger
+        {isProgress ? "Δ row: training strengthened" : "Δ row: A stronger"}
       </text>
-      <rect x={376} y={156} width={8} height={8} rx={2} fill={ROSE} />
-      <text x={388} y={163.5} fontSize={8.5} fill={TEXT_MUT}>
-        B stronger
+      <rect x={isProgress ? 428 : 376} y={156} width={8} height={8} rx={2} fill={ROSE} />
+      <text x={isProgress ? 440 : 388} y={163.5} fontSize={8.5} fill={TEXT_MUT}>
+        {isProgress ? "training weakened" : "B stronger"}
       </text>
 
-      {/* ---- biggest-gap annotation ---- */}
+      {/* ---- biggest-gap / heaviest-learning annotation ---- */}
       <text x={6} y={182} fontSize={9} fill={AMBER}>
-        {gap ? `Biggest gap: ${gap.text}` : "These two genomes write identical channel leans — no differences found."}
+        {gap
+          ? `${isProgress ? "Heaviest learning" : "Biggest gap"}: ${gap.text}`
+          : isProgress
+            ? "Training has written nothing measurable — this connectome still matches its newborn baseline."
+            : "These two genomes write identical channel leans — no differences found."}
       </text>
 
       <text x={6} y={200} fontSize={8} fill={TEXT_DIM}>
-        Hover any cell for exact values (mean Kenyon→MBON weight × compartment valence). Deeper color = stronger write.
+        {isProgress
+          ? `Hover any cell for exact values. The newborn baseline is an untrained connectome — same architecture, fixed seed ${NEWBORN_SEED}, zero training.`
+          : "Hover any cell for exact values (mean Kenyon→MBON weight × compartment valence). Deeper color = stronger write."}
       </text>
+      </g>
     </svg>
   );
 }
@@ -534,7 +866,7 @@ function SideChip({ side }: { side: "a" | "b" }) {
   );
 }
 
-function IdentityPanel({ side, row }: { side: "a" | "b"; row: BrainRow }) {
+function IdentityPanel({ side, row, newborn = false }: { side: "a" | "b"; row: BrainRow; newborn?: boolean }) {
   return (
     <div
       data-testid={`diff-identity-${side}`}
@@ -558,11 +890,17 @@ function IdentityPanel({ side, row }: { side: "a" | "b"; row: BrainRow }) {
       <div className="mt-2 flex flex-col gap-1 text-xs text-muted-foreground">
         <span className="flex items-center gap-1.5">
           <Trophy className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          {formatScore(row.task, row.score)}
+          {newborn ? "never scored — untrained" : formatScore(row.task, row.score)}
         </span>
         <span className="flex items-center gap-1.5">
           <Calendar className="h-3.5 w-3.5 shrink-0" aria-hidden />
-          <span title={new Date(row.createdAt).toLocaleString()}>{relativeDate(row.createdAt)}</span>
+          {newborn ? (
+            <span title={`untrained connectome — fixed seed ${NEWBORN_SEED}`}>
+              instantiated fresh · seed {NEWBORN_SEED}
+            </span>
+          ) : (
+            <span title={new Date(row.createdAt).toLocaleString()}>{relativeDate(row.createdAt)}</span>
+          )}
         </span>
         <span className="flex items-start gap-1.5">
           <StickyNote className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
@@ -609,7 +947,15 @@ function SideLine({ side, children }: { side: "a" | "b"; children: ReactNode }) 
 // main component
 // ---------------------------------------------------------------------------
 
-export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogProps) {
+export function BrainDiffDialog({
+  rows,
+  progressRow = null,
+  mode = "pair",
+  open,
+  onOpenChange,
+}: BrainDiffDialogProps) {
+  const isProgress = mode === "progress";
+
   const [snapshots, setSnapshots] = useState<{ a: BrainSnapshot; b: BrainSnapshot } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -619,14 +965,31 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
   const resetTimer = useRef<number | null>(null);
   const fingerprintRef = useRef<HTMLDivElement | null>(null);
 
+  // progress mode synthesizes the newborn's library row next to the trained
+  // brain so every pair-mode surface (identity panels, sticky rows, header
+  // strip) renders unchanged. Memoized — the row identity must stay stable
+  // across renders or the sticky comparison below would never settle.
+  const newbornRow = useMemo(
+    () => (isProgress && progressRow ? makeNewbornRow(progressRow) : null),
+    [isProgress, progressRow],
+  );
+  const pair: readonly [BrainRow, BrainRow] | null = isProgress
+    ? progressRow && newbornRow
+      ? [progressRow, newbornRow]
+      : null
+    : rows;
+
   // sticky rows: keep the last non-null pair so the exit animation has
   // content. React's render-phase "adjust state when a prop changes" pattern
   // (see react.dev/learn/you-might-not-need-an-effect) — no effect needed.
-  const [shown, setShown] = useState<readonly [BrainRow, BrainRow] | null>(rows);
-  const [prevRows, setPrevRows] = useState<readonly [BrainRow, BrainRow] | null>(rows);
-  if (rows !== prevRows) {
-    setPrevRows(rows);
-    if (rows) setShown(rows);
+  // The comparison watches the SOURCE prop (rows / progressRow), never the
+  // pair array that is rebuilt every render.
+  const source: BrainRow | readonly [BrainRow, BrainRow] | null = isProgress ? progressRow : rows;
+  const [shown, setShown] = useState<readonly [BrainRow, BrainRow] | null>(pair);
+  const [prevSource, setPrevSource] = useState<BrainRow | readonly [BrainRow, BrainRow] | null>(source);
+  if (source !== prevSource) {
+    setPrevSource(source);
+    if (pair) setShown(pair);
   }
 
   // click when the dialog opens (fires on every false → true transition)
@@ -634,8 +997,11 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
     if (open) playSound("click");
   }, [open]);
 
-  // ---- fetch BOTH snapshots on open (state resets happen inside the async
-  // task so the effect body stays side-effect free until the microtask runs)
+  // ---- fetch snapshots on open: pair mode fetches BOTH brains; progress
+  // mode fetches only the trained brain and grows the newborn locally (a
+  // fresh untrained FlyBrain sharing its architecture, fixed seed — pure
+  // client-side computation, no side effects). State resets happen inside
+  // the async task so the effect body stays side-effect free.
   useEffect(() => {
     if (!open || !shown) return;
     const [rowA, rowB] = shown;
@@ -645,40 +1011,89 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
       setError(null);
       setSnapshots(null);
       setExported(null);
-      const [resA, resB] = await Promise.allSettled([fetchBrain(rowA.id), fetchBrain(rowB.id)]);
-      if (cancelled) return;
-      if (resA.status === "fulfilled" && resB.status === "fulfilled") {
-        setSnapshots({ a: resA.value.snapshot, b: resB.value.snapshot });
+      if (isProgress) {
+        try {
+          const { snapshot: snapA } = await fetchBrain(rowA.id);
+          if (cancelled) return;
+          setSnapshots({ a: snapA, b: newbornSnapshot(snapA.arch, snapA.task) });
+        } catch (err) {
+          if (cancelled) return;
+          setError(
+            `Couldn't load “${rowA.name}” — ${err instanceof Error ? err.message : "fetch failed"}`,
+          );
+        }
       } else {
-        const failedA = resA.status === "rejected";
-        const name = failedA ? rowA.name : rowB.name;
-        const reason = failedA
-          ? (resA as PromiseRejectedResult).reason
-          : (resB as PromiseRejectedResult).reason;
-        const msg = reason instanceof Error ? reason.message : "fetch failed";
-        setError(`Couldn't load “${name}” — ${msg}`);
+        const [resA, resB] = await Promise.allSettled([fetchBrain(rowA.id), fetchBrain(rowB.id)]);
+        if (cancelled) return;
+        if (resA.status === "fulfilled" && resB.status === "fulfilled") {
+          setSnapshots({ a: resA.value.snapshot, b: resB.value.snapshot });
+        } else {
+          const failedA = resA.status === "rejected";
+          const name = failedA ? rowA.name : rowB.name;
+          const reason = failedA
+            ? (resA as PromiseRejectedResult).reason
+            : (resB as PromiseRejectedResult).reason;
+          const msg = reason instanceof Error ? reason.message : "fetch failed";
+          setError(`Couldn't load “${name}” — ${msg}`);
+        }
       }
-      setLoading(false);
+      if (!cancelled) setLoading(false);
     })();
     return () => {
       cancelled = true;
     };
-  }, [open, shown, retryNonce]);
+  }, [open, shown, retryNonce, isProgress]);
 
   const stats = useMemo(() => {
     if (!snapshots) return null;
     return { a: deriveStats(snapshots.a), b: deriveStats(snapshots.b) };
   }, [snapshots]);
 
+  // progress-mode math: Σ|Δ| drift, heaviest channel, rewrites, valence shift
+  const progress = useMemo(
+    () => (isProgress && stats ? deriveProgress(stats.a, stats.b) : null),
+    [isProgress, stats],
+  );
+
   const gap = useMemo(
     () =>
-      stats && shown ? biggestGap(stats.a, stats.b, shown[0].name, shown[1].name) : null,
-    [stats, shown],
+      stats && shown
+        ? isProgress
+          ? progress
+            ? heaviestLearning(stats.a, stats.b, progress)
+            : null
+          : biggestGap(stats.a, stats.b, shown[0].name, shown[1].name)
+        : null,
+    [stats, shown, isProgress, progress],
+  );
+
+  /** short tail for the SVG drift band (no number — the tspan carries it) */
+  const driftTail = useMemo(() => {
+    if (!isProgress || !progress || !shown || !snapshots) return null;
+    return progress.totalDrift < UNWRITTEN_EPS
+      ? "no measurable writes — this brain is still newborn-flat"
+      : `${trainingPhrase(shown[0], snapshots.a)} — heaviest in M${progress.heaviest + 1}`;
+  }, [isProgress, progress, shown, snapshots]);
+
+  /** full plain-language drift headline for the banner + copy text */
+  const headline = useMemo(
+    () =>
+      isProgress && progress && shown && snapshots
+        ? buildDriftHeadline(shown[0], snapshots.a, progress)
+        : null,
+    [isProgress, progress, shown, snapshots],
   );
 
   const verdict = useMemo(
-    () => (stats && shown ? buildVerdict(shown[0], shown[1], stats.a, stats.b, gap) : null),
-    [stats, shown, gap],
+    () =>
+      stats && shown
+        ? isProgress
+          ? progress && snapshots
+            ? buildProgressVerdict(shown[0], snapshots.a, stats.a, stats.b, progress)
+            : null
+          : buildVerdict(shown[0], shown[1], stats.a, stats.b, gap)
+        : null,
+    [stats, shown, gap, isProgress, progress, snapshots],
   );
 
   // ---- inline feedback chip helper ---------------------------------------
@@ -692,34 +1107,37 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
     };
   }, []);
 
-  // ---- export 1: copy diff (clipboard with file-download fallback) -------
+  // ---- export 1: copy diff / progress (clipboard + file-download fallback)
   const copyDiff = useCallback(async () => {
     if (!shown || !snapshots || !stats) return;
-    const text = buildDiffText(
-      shown[0],
-      shown[1],
-      snapshots.a,
-      snapshots.b,
-      stats.a,
-      stats.b,
-      gap,
-    );
+    const text = isProgress
+      ? progress && headline && verdict
+        ? buildProgressText(shown[0], snapshots.a, stats.a, stats.b, progress, headline, verdict)
+        : null
+      : buildDiffText(shown[0], shown[1], snapshots.a, snapshots.b, stats.a, stats.b, gap);
+    if (!text) return;
+    const base = isProgress
+      ? `fly-progress-${sanitizeFileName(shown[0].name)}-vs-newborn`
+      : `fly-genomediff-${sanitizeFileName(shown[0].name)}-vs-${sanitizeFileName(shown[1].name)}`;
     try {
       await navigator.clipboard.writeText(text);
     } catch {
       // clipboard API unavailable (or denied) → fall back to a file download
       const a = document.createElement("a");
       a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
-      a.download = `fly-genomediff-${sanitizeFileName(shown[0].name)}-vs-${sanitizeFileName(shown[1].name)}.txt`;
+      a.download = `${base}.txt`;
       a.click();
       URL.revokeObjectURL(a.href);
     }
     setExported("text");
     playSound("ding");
     queueReset();
-  }, [shown, snapshots, stats, gap, queueReset]);
+  }, [shown, snapshots, stats, gap, queueReset, isProgress, progress, headline, verdict]);
 
   // ---- export 2: fingerprint PNG (SVG → 2× canvas raster → download) -----
+  // progress mode's panel is taller — the drift headline band is part of the
+  // SVG, so the raster carries it.
+  const svgH = SVG_H + (isProgress ? PROGRESS_BAND_H : 0);
   const exportPng = useCallback(() => {
     if (!shown) return;
     const svg = fingerprintRef.current?.querySelector("svg");
@@ -727,7 +1145,7 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
     try {
       const clone = svg.cloneNode(true) as SVGSVGElement;
       clone.setAttribute("width", String(SVG_W));
-      clone.setAttribute("height", String(SVG_H));
+      clone.setAttribute("height", String(svgH));
       clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
       const xml = new XMLSerializer().serializeToString(clone);
       const url = URL.createObjectURL(new Blob([xml], { type: "image/svg+xml;charset=utf-8" }));
@@ -736,7 +1154,7 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
         const scale = 2;
         const canvas = document.createElement("canvas");
         canvas.width = SVG_W * scale;
-        canvas.height = SVG_H * scale;
+        canvas.height = svgH * scale;
         const c = canvas.getContext("2d");
         if (c) {
           c.fillStyle = INK;
@@ -746,7 +1164,9 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
             if (!blob) return;
             const a = document.createElement("a");
             a.href = URL.createObjectURL(blob);
-            a.download = `fly-genomediff-${sanitizeFileName(shown[0].name)}-vs-${sanitizeFileName(shown[1].name)}.png`;
+            a.download = isProgress
+              ? `fly-progress-${sanitizeFileName(shown[0].name)}-vs-newborn.png`
+              : `fly-genomediff-${sanitizeFileName(shown[0].name)}-vs-${sanitizeFileName(shown[1].name)}.png`;
             a.click();
             URL.revokeObjectURL(a.href);
           });
@@ -761,7 +1181,7 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
     } catch {
       /* rasterization unsupported — ignore */
     }
-  }, [shown, queueReset]);
+  }, [shown, queueReset, isProgress, svgH]);
 
   const reduceMotion = useReducedMotion();
 
@@ -779,6 +1199,25 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
             text: `“${shown?.[1].name ?? "B"}” is more reward-shaped`,
             cls: "border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400",
           };
+
+  /** progress mode: the valence-shift chip replaces the pair-mode verdict chip */
+  const valenceShiftChip =
+    isProgress && progress
+      ? Math.abs(progress.valenceShift) <= 0.01
+        ? {
+            text: "valence unchanged from birth",
+            cls: "border-border/60 bg-muted/40 text-muted-foreground",
+          }
+        : progress.valenceShift > 0
+          ? {
+              text: `training pushed it toward reward ${fmtLean(progress.valenceShift)}`,
+              cls: "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+            }
+          : {
+              text: `training pushed it toward punishment ${fmtLean(progress.valenceShift)}`,
+              cls: "border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400",
+            }
+      : null;
 
   const channelAgreement = useMemo(() => {
     if (!stats) return null;
@@ -804,22 +1243,42 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        data-testid="genome-diff"
+        data-testid={isProgress ? "progress-diff" : "genome-diff"}
         className={cn("max-h-[85vh] overflow-y-auto p-4 sm:max-w-2xl sm:p-6", SCROLLBAR)}
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-left">
-            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-amber-500/30 bg-amber-500/10">
-              <GitCompareArrows className="h-4 w-4 text-amber-500 dark:text-amber-400" aria-hidden />
+            <span
+              className={cn(
+                "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border",
+                isProgress
+                  ? "border-emerald-500/30 bg-emerald-500/10"
+                  : "border-amber-500/30 bg-amber-500/10",
+              )}
+            >
+              {isProgress ? (
+                <TrendingUp className="h-4 w-4 text-emerald-500 dark:text-emerald-400" aria-hidden />
+              ) : (
+                <GitCompareArrows className="h-4 w-4 text-amber-500 dark:text-amber-400" aria-hidden />
+              )}
             </span>
-            Genome diff
+            {isProgress ? "Learning progress" : "Genome diff"}
           </DialogTitle>
           <DialogDescription>
             {shown ? (
-              <>
-                How two learned connectomes differ — A&nbsp;&ldquo;{shown[0].name}&rdquo; vs
-                B&nbsp;&ldquo;{shown[1].name}&rdquo;.
-              </>
+              isProgress ? (
+                <>
+                  What training wrote into &ldquo;{shown[0].name}&rdquo; — measured against a
+                  freshly-instantiated untrained newborn (fixed seed&nbsp;{NEWBORN_SEED}).
+                </>
+              ) : (
+                <>
+                  How two learned connectomes differ — A&nbsp;&ldquo;{shown[0].name}&rdquo; vs
+                  B&nbsp;&ldquo;{shown[1].name}&rdquo;.
+                </>
+              )
+            ) : isProgress ? (
+              "Growing the newborn baseline…"
             ) : (
               "Loading the comparison…"
             )}
@@ -829,7 +1288,9 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
         {loading ? (
           <div className="flex flex-col items-center gap-4 py-10 text-center" data-testid="diff-loading">
             <Loader2 className="h-6 w-6 animate-spin text-amber-500" aria-hidden />
-            <p className="text-sm text-muted-foreground">Fetching two connectomes…</p>
+            <p className="text-sm text-muted-foreground">
+              {isProgress ? "Fetching the trained connectome…" : "Fetching two connectomes…"}
+            </p>
             <div className="grid w-full gap-3 sm:grid-cols-2" aria-hidden>
               <div className="h-28 animate-pulse rounded-xl border border-border/40 bg-muted/30" />
               <div className="h-28 animate-pulse rounded-xl border border-border/40 bg-muted/30" />
@@ -867,7 +1328,11 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
                 </span>
               </span>
               <TaskBadge task={shown[0].task} />
-              <ArrowLeftRight className="h-4 w-4 shrink-0 text-amber-500 dark:text-amber-400" aria-hidden />
+              {isProgress ? (
+                <TrendingUp className="h-4 w-4 shrink-0 text-emerald-500 dark:text-emerald-400" aria-hidden />
+              ) : (
+                <ArrowLeftRight className="h-4 w-4 shrink-0 text-amber-500 dark:text-amber-400" aria-hidden />
+              )}
               <TaskBadge task={shown[1].task} />
               <span className="flex min-w-0 items-center gap-1.5 text-sm font-medium">
                 <span className="max-w-[12rem] truncate" title={shown[1].name}>
@@ -877,44 +1342,99 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
               </span>
             </div>
 
+            {/* 1.5 — progress mode: total-drift headline */}
+            {isProgress && progress && headline ? (
+              <section
+                aria-label="Total drift headline"
+                data-testid="progress-drift"
+                className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 px-4 py-3"
+              >
+                <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                  <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    <TrendingUp className="h-3.5 w-3.5 text-emerald-500 dark:text-emerald-400" aria-hidden />
+                    Total drift
+                  </span>
+                  <span className="font-mono text-lg font-bold leading-none text-emerald-600 dark:text-emerald-400">
+                    Σ|Δ| {progress.totalDrift.toFixed(3)}
+                  </span>
+                  <span className="text-xs text-muted-foreground">across {progress.n} memory channels</span>
+                </div>
+                <p className="mt-1.5 text-sm leading-relaxed">{headline}.</p>
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Newborn baseline: an untrained connectome with the same architecture — fixed
+                  seed&nbsp;{NEWBORN_SEED}, zero training.
+                </p>
+              </section>
+            ) : null}
+
             {/* 2 — side-by-side identity */}
             <section aria-label="Brain identities" data-testid="diff-identity">
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 <IdentityPanel side="a" row={shown[0]} />
-                <IdentityPanel side="b" row={shown[1]} />
+                <IdentityPanel side="b" row={shown[1]} newborn={isProgress} />
               </div>
             </section>
 
             <Separator className="bg-border/60" />
 
-            {/* 3 — aligned personality fingerprint + Δ strip */}
-            <section aria-label="Aligned personality fingerprint">
+            {/* 3 — aligned fingerprint: pair-mode personality, or the learning
+                signature (trained vs newborn) in progress mode */}
+            <section aria-label={isProgress ? "Learning signature, aligned" : "Aligned personality fingerprint"}>
               <h4 className="flex items-center gap-1.5 text-sm font-semibold">
-                <Sparkles className="h-4 w-4 text-amber-500 dark:text-amber-400" aria-hidden />
-                Personality fingerprint, aligned
+                {isProgress ? (
+                  <TrendingUp className="h-4 w-4 text-emerald-500 dark:text-emerald-400" aria-hidden />
+                ) : (
+                  <Sparkles className="h-4 w-4 text-amber-500 dark:text-amber-400" aria-hidden />
+                )}
+                {isProgress ? "Learning signature — what training wrote" : "Personality fingerprint, aligned"}
               </h4>
               <div
                 ref={fingerprintRef}
-                data-testid="diff-fingerprint"
+                data-testid={isProgress ? "progress-fingerprint" : "diff-fingerprint"}
                 className="mt-2 overflow-hidden rounded-xl border border-border/60"
               >
-                <DiffFingerprintChart nameA={shown[0].name} nameB={shown[1].name} sa={stats.a} sb={stats.b} gap={gap} />
+                <DiffFingerprintChart
+                  nameA={shown[0].name}
+                  nameB={shown[1].name}
+                  sa={stats.a}
+                  sb={stats.b}
+                  gap={gap}
+                  mode={isProgress ? "progress" : "pair"}
+                  drift={
+                    isProgress && progress && driftTail
+                      ? { total: progress.totalDrift, tail: driftTail }
+                      : null
+                  }
+                />
               </div>
               <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                Both brains share one color scale, so cell intensity is directly comparable.{" "}
-                <span className="text-emerald-500 dark:text-emerald-400">Green</span> cells in the A/B
-                rows lean reward, <span className="text-rose-500 dark:text-rose-400">red</span> lean
-                punishment; in the Δ row green means{" "}
-                <span className="font-medium">A writes that channel stronger</span>, red means B does.
-                Faint outlined cells are unwritten.
+                {isProgress ? (
+                  <>
+                    Row A is &ldquo;{shown[0].name}&rdquo; as trained; row B is the newborn baseline
+                    — one shared color scale. In the Δ row,{" "}
+                    <span className="text-emerald-500 dark:text-emerald-400">green = strengthened by
+                    training</span>, <span className="text-rose-500 dark:text-rose-400">red =
+                    weakened</span>. Faint outlined cells are unwritten.
+                  </>
+                ) : (
+                  <>
+                    Both brains share one color scale, so cell intensity is directly comparable.{" "}
+                    <span className="text-emerald-500 dark:text-emerald-400">Green</span> cells in the A/B
+                    rows lean reward, <span className="text-rose-500 dark:text-rose-400">red</span> lean
+                    punishment; in the Δ row green means{" "}
+                    <span className="font-medium">A writes that channel stronger</span>, red means B does.
+                    Faint outlined cells are unwritten.
+                  </>
+                )}
               </p>
               {stats.a.kmCount === 0 || stats.b.kmCount === 0 ? (
                 <p
                   data-testid="diff-km-warning"
                   className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
                 >
-                  {stats.a.kmCount === 0 ? `“${shown[0].name}”` : `“${shown[1].name}”`} has no learned
-                  Kenyon→MBON weights in its snapshot — its fingerprint reads as flat.
+                  {isProgress
+                    ? `“${shown[0].name}” has no learned Kenyon→MBON weights in its snapshot — training wrote nothing measurable, so the signature reads as the newborn's own noise.`
+                    : `${stats.a.kmCount === 0 ? `“${shown[0].name}”` : `“${shown[1].name}”`} has no learned Kenyon→MBON weights in its snapshot — its fingerprint reads as flat.`}
                 </p>
               ) : null}
             </section>
@@ -923,7 +1443,9 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
 
             {/* 4 — stats deltas */}
             <section aria-label="Wiring statistic deltas" data-testid="diff-stats" className="space-y-2">
-              <h4 className="text-sm font-semibold">Wiring deltas</h4>
+              <h4 className="text-sm font-semibold">
+                {isProgress ? "What changed in training" : "Wiring deltas"}
+              </h4>
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 <StatTile icon={Network} label="Synapse budget">
                   <SideLine side="a">
@@ -935,51 +1457,84 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
                     {nums(stats.b.innate)} innate
                   </SideLine>
                   <p className="text-[11px] leading-snug text-muted-foreground">
-                    {totalDelta === 0
-                      ? "identical wiring budget (plastic sizes track motor layout)"
-                      : `Δ ${totalDelta > 0 ? "+" : ""}${nums(totalDelta)} synapses — plastic sizes track each brain's motor layout`}
+                    {isProgress
+                      ? "identical budget — the newborn shares this brain's architecture; only what's written inside the plastic synapses differs"
+                      : totalDelta === 0
+                        ? "identical wiring budget (plastic sizes track motor layout)"
+                        : `Δ ${totalDelta > 0 ? "+" : ""}${nums(totalDelta)} synapses — plastic sizes track each brain's motor layout`}
                   </p>
                 </StatTile>
 
-                <StatTile icon={Zap} label="Strongest channel">
-                  <SideLine side="a">
-                    {stats.a.strongest ? (
-                      <span
-                        className={
-                          stats.a.strongest.lean >= 0
-                            ? "text-emerald-600 dark:text-emerald-400"
-                            : "text-rose-600 dark:text-rose-400"
-                        }
-                      >
-                        {stats.a.strongest.label} · {fmtLean(stats.a.strongest.lean)} (
-                        {stats.a.strongest.lean >= 0 ? "reward" : "punishment"}-shaped)
-                      </span>
-                    ) : (
-                      "none — untrained"
-                    )}
-                  </SideLine>
-                  <SideLine side="b">
-                    {stats.b.strongest ? (
-                      <span
-                        className={
-                          stats.b.strongest.lean >= 0
-                            ? "text-emerald-600 dark:text-emerald-400"
-                            : "text-rose-600 dark:text-rose-400"
-                        }
-                      >
-                        {stats.b.strongest.label} · {fmtLean(stats.b.strongest.lean)} (
-                        {stats.b.strongest.lean >= 0 ? "reward" : "punishment"}-shaped)
-                      </span>
-                    ) : (
-                      "none — untrained"
-                    )}
-                  </SideLine>
-                  <p className="text-[11px] leading-snug text-muted-foreground">
-                    mean Kenyon→MBON weight per channel, signed by compartment valence
-                  </p>
+                <StatTile icon={Zap} label={isProgress ? "Strongest learned channel" : "Strongest channel"}>
+                  {isProgress && progress ? (
+                    <>
+                      <SideLine side="a">
+                        {progress.heaviest >= 0 ? (
+                          <span
+                            className={
+                              progress.heaviestDelta >= 0
+                                ? "text-emerald-600 dark:text-emerald-400"
+                                : "text-rose-600 dark:text-rose-400"
+                            }
+                          >
+                            M{progress.heaviest + 1} · {fmtLean(progress.heaviestDelta)} (
+                            {progress.heaviestDelta >= 0 ? "strengthened" : "weakened"} by training)
+                          </span>
+                        ) : (
+                          "none — untrained"
+                        )}
+                      </SideLine>
+                      <SideLine side="b">
+                        at birth: {fmtLean(stats.b.leans[progress.heaviest] ?? 0)} — near-flat
+                        newborn wiring
+                      </SideLine>
+                      <p className="text-[11px] leading-snug text-muted-foreground">
+                        biggest per-channel change vs the newborn baseline (mean Kenyon→MBON ×
+                        valence)
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <SideLine side="a">
+                        {stats.a.strongest ? (
+                          <span
+                            className={
+                              stats.a.strongest.lean >= 0
+                                ? "text-emerald-600 dark:text-emerald-400"
+                                : "text-rose-600 dark:text-rose-400"
+                            }
+                          >
+                            {stats.a.strongest.label} · {fmtLean(stats.a.strongest.lean)} (
+                            {stats.a.strongest.lean >= 0 ? "reward" : "punishment"}-shaped)
+                          </span>
+                        ) : (
+                          "none — untrained"
+                        )}
+                      </SideLine>
+                      <SideLine side="b">
+                        {stats.b.strongest ? (
+                          <span
+                            className={
+                              stats.b.strongest.lean >= 0
+                                ? "text-emerald-600 dark:text-emerald-400"
+                                : "text-rose-600 dark:text-rose-400"
+                            }
+                          >
+                            {stats.b.strongest.label} · {fmtLean(stats.b.strongest.lean)} (
+                            {stats.b.strongest.lean >= 0 ? "reward" : "punishment"}-shaped)
+                          </span>
+                        ) : (
+                          "none — untrained"
+                        )}
+                      </SideLine>
+                      <p className="text-[11px] leading-snug text-muted-foreground">
+                        mean Kenyon→MBON weight per channel, signed by compartment valence
+                      </p>
+                    </>
+                  )}
                 </StatTile>
 
-                <StatTile icon={Scale} label="Valence balance">
+                <StatTile icon={Scale} label={isProgress ? "Valence shift" : "Valence balance"}>
                   <SideLine side="a">
                     <span className={stats.a.balance >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}>
                       {fmtLean(stats.a.balance)}
@@ -1003,16 +1558,30 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
                   <span
                     className={cn(
                       "inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium",
-                      balanceVerdict.cls,
+                      (isProgress ? valenceShiftChip : balanceVerdict)?.cls,
                     )}
                   >
                     <Trophy className="h-3 w-3" aria-hidden />
-                    {balanceVerdict.text}
+                    {(isProgress ? valenceShiftChip : balanceVerdict)?.text}
                   </span>
                 </StatTile>
 
-                <StatTile icon={ArrowLeftRight} label="Channel agreement">
-                  {channelAgreement ? (
+                <StatTile icon={Sparkles} label={isProgress ? "Rewritten channels" : "Channel agreement"}>
+                  {isProgress && progress ? (
+                    <>
+                      <p className="text-sm font-semibold">
+                        {progress.rewritten}/{progress.n} channels rewritten beyond the newborn's
+                        ±{REWRITE_EPS.toFixed(2)} noise floor
+                      </p>
+                      <p className="text-[11px] leading-snug text-muted-foreground">
+                        a newborn's compartment leans sit within ±0.01 of zero — anything beyond
+                        that is learned
+                        {progress.flips > 0
+                          ? ` · ${progress.flips} flipped lean sign vs birth`
+                          : ""}
+                      </p>
+                    </>
+                  ) : channelAgreement ? (
                     <>
                       <p className="text-sm font-semibold">
                         {channelAgreement.agree}/{channelAgreement.n} channels lean the same way
@@ -1050,17 +1619,17 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
               <Button
                 variant="outline"
                 size="sm"
-                data-testid="diff-copy"
+                data-testid={isProgress ? "progress-copy" : "diff-copy"}
                 className="h-11 flex-1 gap-1.5 px-4"
                 onClick={() => void copyDiff()}
               >
                 <ClipboardCopy className="h-4 w-4" />
-                {exported === "text" ? "Copied ✓" : "Copy diff"}
+                {exported === "text" ? "Copied ✓" : isProgress ? "Copy progress" : "Copy diff"}
               </Button>
               <Button
                 variant="outline"
                 size="sm"
-                data-testid="diff-png"
+                data-testid={isProgress ? "progress-png" : "diff-png"}
                 className="h-11 flex-1 gap-1.5 px-4"
                 onClick={exportPng}
               >
@@ -1069,8 +1638,9 @@ export function BrainDiffDialog({ rows, open, onOpenChange }: BrainDiffDialogPro
               </Button>
             </div>
             <p className="text-[11px] leading-relaxed text-muted-foreground">
-              The diff copies as a plain-text report (falls back to a .txt download if the clipboard
-              is blocked). The PNG is a 2× raster of the aligned fingerprint above.
+              {isProgress
+                ? "The progress report copies as plain text (falls back to a .txt download if the clipboard is blocked). The PNG is a 2× raster of the learning signature above, drift headline included."
+                : "The diff copies as a plain-text report (falls back to a .txt download if the clipboard is blocked). The PNG is a 2× raster of the aligned fingerprint above."}
             </p>
           </motion.div>
         ) : null}

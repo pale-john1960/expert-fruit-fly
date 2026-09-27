@@ -98,6 +98,12 @@ import type {
   World,
 } from "./dino/game";
 import { EvolutionChart } from "./dino/EvolutionChart";
+import {
+  downloadTextFile,
+  sessionExportFilename,
+  toHistoryCsv,
+  toSessionMarkdown,
+} from "@/lib/session-export";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { Badge } from "@/components/ui/badge";
@@ -110,6 +116,13 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
@@ -128,7 +141,9 @@ import {
   ArrowLeft,
   Bird,
   ChevronDown,
+  Download,
   Eye,
+  FileText,
   Gamepad2,
   GitBranch,
   History,
@@ -1570,6 +1585,76 @@ export function DinoTrainer() {
     playSound("click");
   };
 
+  // --- session export (Task 12-b) --------------------------------------------
+  // Pure click-time work: snapshots the CURRENT React state (and the sim's
+  // duel tally, which only lives on the Sim object) and hands them to the
+  // pure helpers in @/lib/session-export. Never touches the 4Hz loop.
+  const exportSession = (kind: "md" | "csv") => {
+    const s = simRef.current;
+    if (!s || history.length === 0) {
+      toast.error("Nothing to export yet", {
+        description: "Finish a generation first — then this session has a story to share.",
+      });
+      return;
+    }
+    if (kind === "csv") {
+      const ok = downloadTextFile(
+        sessionExportFilename("dino", "csv"),
+        toHistoryCsv(history),
+        "text/csv"
+      );
+      if (ok) {
+        playSound("ding");
+        toast.success("History CSV downloaded", {
+          description: `${history.length} generations — best/avg per generation.`,
+        });
+      } else {
+        toast.error("Download blocked", {
+          description: "The browser refused the file download.",
+        });
+      }
+      return;
+    }
+    const duelRan = s.duelWins + s.duelLosses > 0;
+    const md = toSessionMarkdown({
+      task: "dino",
+      history,
+      unit: "pt",
+      stats: [
+        { label: "Generation", value: String(hud.gen) },
+        { label: "Best ever", value: `${hud.best} pt` },
+        {
+          label: "Avg last gen",
+          value: lastGenAvg === null ? "—" : `${Math.round(lastGenAvg)} pt`,
+        },
+        { label: "Population size", value: String(popSize) },
+        { label: "Mutation strength", value: mutStrength.toFixed(2) },
+      ],
+      duel: duelRan
+        ? { wins: s.duelWins, losses: s.duelLosses, bestHuman: s.duelBest }
+        : null,
+      duckDefense:
+        hud.birdsSeen > 0
+          ? { birdsSeen: hud.birdsSeen, birdsCleared: hud.birdsCleared }
+          : null,
+    });
+    const ok = downloadTextFile(
+      sessionExportFilename("dino", "md"),
+      md,
+      "text/markdown"
+    );
+    if (ok) {
+      playSound("ding");
+      toast.success("Markdown report downloaded", {
+        description: `Generation ${hud.gen} · best ever ${hud.best} pt — ready to share.`,
+      });
+    } else {
+      toast.error("Download blocked", {
+        description: "The browser refused the file download.",
+      });
+    }
+  };
+
   // duck-defense color band: rose < 33% ≤ amber < 66% ≤ emerald
   const duckRate =
     hud.birdsSeen > 0 ? hud.birdsCleared / Math.max(1, hud.birdsSeen) : 0;
@@ -2177,6 +2262,71 @@ export function DinoTrainer() {
                     <span className="sm:hidden">Save</span>
                   </Button>
                 </div>
+
+                {/* --- session export (Task 12-b) — shareable markdown report
+                      or history CSV; disabled until a generation finishes --- */}
+                <DropdownMenu
+                  onOpenChange={(open) => {
+                    if (open) playSound("click");
+                  }}
+                >
+                  <UITooltip>
+                    <TooltipTrigger asChild>
+                      {/* span wrapper: browsers fire no pointer events on a
+                          disabled <button>, so the "finish a generation
+                          first" tooltip needs a hoverable parent */}
+                      <span className="flex w-full">
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="outline"
+                            className="h-11 w-full gap-2 px-4"
+                            disabled={history.length === 0}
+                            data-testid="dino-export-trigger"
+                            aria-label="Export session"
+                          >
+                            <Download aria-hidden />
+                            <span>Export session</span>
+                            <ChevronDown
+                              className="ml-auto h-4 w-4 opacity-60"
+                              aria-hidden
+                            />
+                          </Button>
+                        </DropdownMenuTrigger>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">
+                      {history.length > 0
+                        ? "Share this session — markdown report or history CSV"
+                        : "Finish a generation first, then export"}
+                    </TooltipContent>
+                  </UITooltip>
+                  <DropdownMenuContent align="start" className="w-56">
+                    <DropdownMenuLabel>Export this session</DropdownMenuLabel>
+                    <DropdownMenuItem
+                      className="min-h-11 cursor-pointer"
+                      data-testid="dino-export-md"
+                      onSelect={() => exportSession("md")}
+                    >
+                      <FileText className="h-4 w-4" aria-hidden />
+                      Markdown report
+                      <span className="ml-auto text-[10px] text-muted-foreground">
+                        .md
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      className="min-h-11 cursor-pointer"
+                      data-testid="dino-export-csv"
+                      onSelect={() => exportSession("csv")}
+                    >
+                      <Download className="h-4 w-4" aria-hidden />
+                      History CSV
+                      <span className="ml-auto text-[10px] text-muted-foreground">
+                        .csv
+                      </span>
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
                 <p className="text-[11px] text-muted-foreground">
                   Saves the best-ever brain to the library (POST /api/brains).
                 </p>
